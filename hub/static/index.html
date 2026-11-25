@@ -1,0 +1,1158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hivemind</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%234f46e5'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#f5f6f8;--panel:#fff;--panel2:#f0f2f5;--line:#e2e5ea;--text:#16181d;--muted:#5b6475;
+  --accent:#4f46e5;--accent-fg:#fff;--ok:#0f7b3f;--warn:#a85a00;--err:#c01f1f;--info:#1d4ed8;--bar:#e7e9ee;
+  --okbg:#12a15022;--warnbg:#d9770630;--errbg:#dc262622;--infobg:#2563eb22;
+  --cpu:#4f46e5;--mem:#0284c7;--gpu:#9333ea;--disk:#d97706;--code:#0f1115;--codetext:#d6dae3;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:#0d0f13;--panel:#151820;--panel2:#1b1f29;--line:#2a3040;--text:#e6e8ee;--muted:#9aa3b6;
+  --accent:#818cf8;--accent-fg:#10121a;--ok:#4ade80;--warn:#fbbf24;--err:#f87171;--info:#7aa7ff;--bar:#232836;--shadow:none;--code:#0a0c10;
+  --cpu:#818cf8;--mem:#38bdf8;--gpu:#c084fc;--disk:#fbbf24;}}
+:root[data-theme=dark]{--bg:#0d0f13;--panel:#151820;--panel2:#1b1f29;--line:#2a3040;--text:#e6e8ee;--muted:#9aa3b6;
+  --accent:#818cf8;--accent-fg:#10121a;--ok:#4ade80;--warn:#fbbf24;--err:#f87171;--info:#7aa7ff;--bar:#232836;--shadow:none;--code:#0a0c10;
+  --cpu:#818cf8;--mem:#38bdf8;--gpu:#c084fc;--disk:#fbbf24;}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+body{overflow-x:hidden}
+button,input,select,textarea{font:inherit;color:inherit}
+.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+[hidden]{display:none!important}
+header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line)}
+.hbar{display:flex;align-items:center;gap:10px 14px;padding:10px 16px;flex-wrap:wrap;max-width:1400px;margin:0 auto}
+.brand{font-weight:700;font-size:16px;display:flex;align-items:center;gap:8px;white-space:nowrap}
+.logo{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,var(--accent),#06b6d4);flex:none}
+.stats{display:flex;gap:4px 14px;color:var(--muted);font-size:13px;flex-wrap:wrap}
+.stats b{color:var(--text)}
+.spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel2);padding:2px 10px;border-radius:20px;font-size:12px;white-space:nowrap}
+.pill.ok{color:var(--ok);background:var(--okbg);border-color:transparent}
+.pill.warn{color:var(--warn);background:var(--warnbg);border-color:transparent}
+.btn{white-space:nowrap;border:1px solid var(--line);background:var(--panel);padding:7px 12px;border-radius:8px;cursor:pointer;min-height:34px}
+.btn:hover{background:var(--panel2)}
+.btn:disabled{opacity:.5;cursor:default}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.danger{color:var(--err)}
+.btn.sm{padding:3px 9px;font-size:12px;min-height:28px}
+.nav{display:flex;gap:2px;padding:0 12px;max-width:1400px;margin:0 auto;overflow-x:auto}
+.nav button{padding:10px 16px;border:none;background:none;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;font-weight:600}
+.nav button[aria-selected=true]{color:var(--text);border-bottom-color:var(--accent)}
+.nav .n{font-weight:400;font-size:12px;margin-left:4px;color:var(--muted)}
+#banner{display:none;background:var(--errbg);color:var(--err);border-bottom:1px solid var(--line);padding:8px 16px;text-align:center;font-weight:600}
+#banner.show{display:block}
+main{padding:16px;max-width:1400px;margin:0 auto}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:22px 0 10px}
+h2:first-child{margin-top:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+.composer{padding:14px 16px;display:flex;flex-direction:column;gap:12px;border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+.composer .top{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}
+@media (max-width:600px){.composer .top{grid-template-columns:1fr}}
+.composer label.f{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
+.composer select,.composer input[type=text],.composer textarea,.set input,.login input,.filters select{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
+.composer textarea{min-height:96px;resize:vertical}
+.seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel2)}
+.seg label{flex:1;position:relative;cursor:pointer}
+.seg input{position:absolute;opacity:0;inset:0;cursor:pointer;margin:0}
+.seg span{display:block;padding:8px 12px;text-align:center;white-space:nowrap;font-size:13px;color:var(--muted)}
+.seg input:checked+span{background:var(--accent);color:var(--accent-fg);font-weight:600}
+.seg input:focus-visible+span{outline:2px solid var(--accent);outline-offset:-3px}
+details.adv summary{cursor:pointer;color:var(--muted);font-size:13px;width:fit-content;padding:2px 0}
+details.adv .inner{display:flex;flex-direction:column;gap:10px;margin-top:8px}
+.full{display:flex;gap:10px;align-items:flex-start;padding:9px 12px;border-radius:8px;border:1px solid var(--line);cursor:pointer;font-size:13px}
+.full input{margin-top:3px}
+.full.on{border-color:var(--err);background:var(--errbg);color:var(--err)}
+.full small{display:block;color:var(--muted)}.full.on small{color:var(--err)}
+.sendrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.hint{color:var(--muted);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,310px),1fr));gap:14px}
+.card{padding:14px 16px;cursor:pointer;display:flex;flex-direction:column;justify-content:flex-start;align-items:stretch;width:100%;text-align:left;transition:border-color .15s}
+.card:hover{border-color:var(--accent)}
+.card.off{background:var(--panel2)}
+.card.off .meters,.card.off svg{opacity:.45}
+.row{display:flex;align-items:center;gap:8px}
+.row.wrap{flex-wrap:wrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 22%,transparent)}
+.name{font-weight:650;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub{color:var(--muted);font-size:12px}
+.badge{font-size:11px;font-weight:600;padding:1px 8px;border-radius:20px;background:var(--infobg);color:var(--info);white-space:nowrap}
+.badge.leader{background:var(--okbg);color:var(--ok)}
+.meters{display:grid;grid-template-columns:34px 1fr 40px;gap:5px 8px;align-items:center;margin:10px 0;font-size:12px}
+.meter{height:7px;background:var(--bar);border-radius:4px;overflow:hidden}
+.meter i{display:block;height:100%;border-radius:4px}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.chip{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+.chip.err{background:var(--errbg);color:var(--err);border-color:transparent;font-weight:600}
+.chip.warn{background:var(--warnbg);color:var(--warn);border-color:transparent;font-weight:600}
+.chip.job{color:var(--accent);border-color:var(--accent)}
+.spark{width:100%;height:34px;display:block;margin-top:8px}
+.tablewrap{overflow-x:auto;max-width:100%}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+td{white-space:nowrap}
+td.sub{white-space:normal;min-width:120px}
+.two-col{margin-top:4px}
+tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
+tr.click:focus-visible{outline-offset:-2px}
+.st{font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap;display:inline-block}
+.st.queued,.st.starting{background:var(--panel2);color:var(--muted)}.st.running{background:var(--infobg);color:var(--info)}
+.st.done{background:var(--okbg);color:var(--ok)}.st.failed{background:var(--errbg);color:var(--err)}.st.cancelled{background:var(--warnbg);color:var(--warn)}
+.trunc{max-width:min(420px,50vw);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.filters{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.filters label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:3px;min-width:140px;flex:1;max-width:220px}
+.empty{color:var(--muted);padding:24px;text-align:center}
+.feed{max-height:300px;overflow:auto;padding:6px 0}
+.ev{display:grid;grid-template-columns:50px 52px 1fr;gap:8px;padding:5px 14px;font-size:13px;align-items:baseline}
+.ev .t{color:var(--muted);font-size:11px}
+.lvl{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--info)}
+.lvl.ok{color:var(--ok)}.lvl.warn{color:var(--warn)}.lvl.error{color:var(--err)}
+.alert{display:flex;gap:10px;align-items:baseline;padding:9px 14px;border-bottom:1px solid var(--line)}
+.alert:last-child{border-bottom:none}
+.two-col{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px;align-items:start}
+.iconbtn{padding:2px 8px;min-height:28px}
+.drawer{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;z-index:10}
+.drawer.open{display:block}
+.drawer .body{position:absolute;right:0;top:0;bottom:0;width:min(920px,100%);background:var(--bg);border-left:1px solid var(--line);display:flex;flex-direction:column}
+.drawer .head{padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center}
+.tabs{display:flex;gap:2px;padding:0 12px;background:var(--panel);border-bottom:1px solid var(--line);overflow-x:auto}
+.tab{padding:10px 14px;border:none;background:none;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap}
+.tab.on{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+.content{flex:1;overflow:auto;padding:16px}
+.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,220px),1fr));gap:10px;margin-bottom:18px}
+.kv>div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:0}
+.kv span.k{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.kv b{font-weight:550;word-break:break-word}
+pre.log{background:var(--code);color:var(--codetext);border-radius:10px;padding:14px;margin:0;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:65vh;overflow:auto}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:18px}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin-bottom:6px}
+.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.set{max-width:480px;display:flex;flex-direction:column;gap:14px}
+.set label{font-size:13px;display:flex;flex-direction:column;gap:4px}
+.login{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:var(--bg);z-index:30}
+.login.open{display:flex}
+.login .panel{padding:28px;width:min(360px,calc(100vw - 32px));display:flex;flex-direction:column;gap:12px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:15;padding:16px}
+.modal.open{display:flex}
+.modal .panel{width:min(900px,100%);max-height:90vh;display:flex;flex-direction:column}
+.mhead{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.mbody{padding:14px 16px;overflow:auto}
+.btn.primary.sysbtn{background:var(--err);border-color:var(--err);color:#fff}
+.badge.sys{background:var(--errbg);color:var(--err);letter-spacing:.04em}
+.adminbox{display:flex;flex-direction:column;gap:10px;padding:10px 12px;border:1px solid var(--err);border-radius:8px;background:color-mix(in srgb,var(--err) 6%,transparent)}
+.adminbox .warn{color:var(--err);font-size:12px;font-weight:600}
+.argrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr));gap:10px}
+.composer .adminbox select,.composer .adminbox input{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
+@media (max-width:420px){.seg span{padding:8px 6px;font-size:12px}}
+.prompt{background:var(--panel2);border-radius:8px;padding:10px 12px;white-space:pre-wrap;word-break:break-word;margin:8px 0 12px;font-size:13px;max-height:140px;overflow:auto}
+
+/* ---- Phase 2: projects, sessions, machine actions ---- */
+.pbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.pbar input[type=search]{flex:1;min-width:180px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 12px;font-size:16px}
+.pcard{padding:14px 16px;cursor:pointer;display:flex;flex-direction:column;gap:8px;min-width:0;transition:border-color .15s}
+.pcard:hover,.pcard:focus-visible{border-color:var(--accent)}
+.pcard .name{font-size:16px}
+.pcard.pin{border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+.brief2{color:var(--muted);font-size:13px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.live{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--ok)}
+.pulse{width:9px;height:9px;border-radius:50%;background:var(--ok);flex:none;animation:pulse 1.6s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 55%,transparent)}70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+@media (prefers-reduced-motion:reduce){.pulse{animation:none}}
+.chip.grp{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+.briefbox{padding:14px 16px;margin-bottom:14px;white-space:pre-wrap;word-break:break-word;font-size:14px}
+.briefbox .sub{display:block;margin-bottom:6px}
+.sec{margin:20px 0 8px;display:flex;align-items:center;gap:10px}
+.sec h2{margin:0}
+.srow{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:2px 10px;align-items:center;width:100%;text-align:left;padding:10px 14px;border:none;border-bottom:1px solid var(--line);background:none;cursor:pointer}
+.srow:last-child{border-bottom:none}
+.srow:hover{background:var(--panel2)}
+.srow .tt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:550}
+.srow .meta{grid-column:2/4;color:var(--muted);font-size:12px;display:flex;gap:4px 10px;flex-wrap:wrap}
+.tool{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:6px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);min-width:52px;text-align:center}
+.tool.claude{color:#c2410c}.tool.codex{color:#0f7b3f}.tool.t3{color:var(--info)}.tool.forge{color:var(--accent)}
+.sdot{width:9px;height:9px;border-radius:50%;display:inline-block;background:var(--muted);flex:none}
+.sdot.live{background:var(--ok);animation:pulse 1.6s infinite}.sdot.idle{background:var(--warn)}
+.list2 div.li{display:flex;gap:10px;padding:8px 14px;border-bottom:1px solid var(--line);align-items:baseline;font-size:13px}
+.list2 div.li:last-child{border-bottom:none}
+.list2 .mono{color:var(--muted);font-size:12px}
+.list2 .grow{flex:1;min-width:0;word-break:break-word}
+.pd .body{width:min(980px,100%)}
+.pd .head .name{max-width:100%}
+.hbtns{display:flex;gap:8px;flex-wrap:wrap}
+#sView{display:flex;flex-direction:column;flex:1;min-height:0}
+.sinfo{padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
+.trwrap{position:relative;flex:1;min-height:0;display:flex}
+.trscroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px 16px;display:flex;flex-direction:column;gap:10px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+.msg{max-width:min(720px,88%);padding:9px 13px;border-radius:14px;word-break:break-word;overflow-wrap:anywhere;white-space:pre-wrap;font-size:14px;line-height:1.5}
+.msg.user{align-self:flex-end;background:var(--accent);color:var(--accent-fg);border-bottom-right-radius:4px}
+.msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
+.msg.system{align-self:center;background:none;color:var(--muted);font-size:12px;max-width:100%}
+.msg .ts{display:block;font-size:10px;opacity:.65;margin-top:3px;white-space:normal}
+.msg pre.code{margin:6px 0;background:var(--code);color:var(--codetext);padding:8px 10px;border-radius:8px;font-size:12px;overflow-x:auto;white-space:pre;max-width:100%}
+.msg.user pre.code{background:rgba(0,0,0,.3)}
+.toolrow{display:flex;flex-direction:column;gap:4px;align-self:flex-start;max-width:min(720px,100%);width:100%}
+.tchip{border:1px solid var(--line);background:var(--panel2);border-radius:8px;font-size:12px;min-width:0}
+.tchip summary{cursor:pointer;padding:4px 10px;display:flex;gap:8px;align-items:baseline;list-style:none;min-width:0}
+.tchip summary::-webkit-details-marker{display:none}
+.tchip summary::before{content:"\25B8";color:var(--muted);flex:none}
+.tchip[open] summary::before{content:"\25BE"}
+.tchip .tn{font-weight:700;color:var(--accent);flex:none}
+.tchip .tl{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.tchip pre{margin:0;padding:8px 10px;border-top:1px solid var(--line);font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;font-family:ui-monospace,Consolas,monospace}
+.think{display:none;align-self:flex-start;max-width:min(720px,92%);font-style:italic;color:var(--muted);font-size:13px;border-left:3px solid var(--line);padding:2px 10px;white-space:pre-wrap;word-break:break-word}
+.trscroll.show-think .think{display:block}
+.jump{position:absolute;right:16px;bottom:10px;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+.pbox{padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px;flex:none}
+.pbox textarea{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;width:100%;min-height:44px;max-height:30vh;resize:none;font-size:16px}
+.pbox .brow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pbox .note{color:var(--warn);font-size:12px;flex:1;min-width:160px}
+.cdrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.cdrow label{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
+.mact{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
+.chip.ok{color:var(--ok);background:var(--okbg);border-color:transparent}
+.sched{display:flex;gap:8px 12px;align-items:center;flex-wrap:wrap;padding:8px 12px;margin-bottom:12px;font-size:13px}
+.pairurl{display:block;font-size:18px;font-weight:700;word-break:break-all;padding:14px;margin:10px 0;border-radius:10px;background:var(--panel2);border:1px solid var(--line);color:var(--accent)}
+.newtask{padding:12px 14px;display:flex;flex-direction:column;gap:10px;margin-top:8px}
+.newtask select,.newtask textarea{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%;font-size:16px}
+.newtask textarea{min-height:80px}
+@media (max-width:700px){
+  .pd .body,.drawer .body{width:100%;border-left:none}
+  .pd .body{top:var(--vvt,0);bottom:auto;height:var(--vvh,100dvh)}
+  .only-desk{display:none}
+  .msg,.toolrow{max-width:94%}
+  .toolrow{max-width:100%}
+  .sinfo,.pbox,.trscroll{padding-left:16px;padding-right:16px}
+}
+</style>
+</head>
+<body>
+<div class="login" id="login" role="dialog" aria-modal="true" aria-label="Sign in"><div class="panel">
+  <div class="brand"><span class="logo"></span>Hivemind</div>
+  <div class="sub">Enter the access token (<span class="mono">ui_token</span> in the hub's config.json).</div>
+  <input id="tok" type="password" placeholder="Access token" autocomplete="current-password" aria-label="Access token">
+  <button class="btn primary" id="loginBtn">Sign in</button>
+  <div class="sub" id="loginErr" style="color:var(--err)" role="alert"></div>
+</div></div>
+
+<header>
+  <div class="hbar">
+    <div class="brand"><span class="logo"></span>Hivemind</div>
+    <span class="pill" id="leaderPill">Leader: —</span>
+    <span class="sub" id="via"></span>
+    <div class="stats" id="stats"></div>
+    <div class="spacer"></div>
+    <button class="btn" id="addBtn">+ Add machine</button>
+    <button class="btn" id="themeBtn" aria-label="Toggle light/dark theme" title="Toggle theme">&#9680;</button>
+  </div>
+  <nav class="nav" role="tablist" aria-label="Sections" id="nav"></nav>
+</header>
+<div id="banner" role="alert"></div>
+
+<main>
+  <section id="v-projects" role="tabpanel" aria-label="Projects">
+    <div class="pbar">
+      <input type="search" id="pSearch" placeholder="Search projects" aria-label="Search projects" autocomplete="off">
+      <button class="btn primary" id="briefAll">Brief me (all)</button>
+    </div>
+    <div class="panel briefbox" id="briefAllBox" hidden></div>
+    <div class="grid" id="pgrid"><div class="panel empty">Loading projects…</div></div>
+  </section>
+
+  <section id="v-fleet" role="tabpanel" aria-label="Fleet" hidden>
+    <form class="panel composer" id="taskForm" autocomplete="off">
+      <div class="top">
+        <label class="f">Run on<select id="tNode"><option value="auto">Auto (best available)</option></select></label>
+        <div role="radiogroup" aria-label="Engine"><div class="seg" id="tEngine">
+          <label><input type="radio" name="eng" value="any"><span>Any</span></label>
+          <label><input type="radio" name="eng" value="claude" checked><span>Claude Code</span></label>
+          <label><input type="radio" name="eng" value="codex"><span>Codex</span></label>
+          <label><input type="radio" name="eng" value="shell"><span>PowerShell</span></label>
+          <label><input type="radio" name="eng" value="admin"><span>Admin</span></label>
+        </div></div>
+      </div>
+      <div class="adminbox" id="adminBox" hidden>
+        <div class="warn">Runs as SYSTEM (full administrator) on the chosen machine, without a UAC prompt.</div>
+        <label class="f">Action<select id="aMode"></select></label>
+        <div class="hint" id="aDesc"></div>
+        <div class="argrid" id="aArgs"></div>
+      </div>
+      <label class="f" id="promptBox"><span class="sr">Task</span><textarea id="tPrompt" placeholder="What should it do?  (Ctrl/Cmd+Enter to run)" aria-label="Task prompt"></textarea></label>
+      <details class="adv" id="advBox"><summary>Advanced</summary><div class="inner">
+        <label class="f">Working directory (optional; default is the machine's scratch folder)<input type="text" id="tCwd" class="mono" placeholder="C:\forge\repos\my-project"></label>
+        <label class="full" id="fullBox"><input type="checkbox" id="tFull"><span><b>Full access</b><small id="fullHint">Agent can change files and run commands without asking.</small></span></label>
+      </div></details>
+      <div class="sendrow"><button class="btn primary" type="submit" id="sendBtn">Run task</button><span class="hint" id="tMsg" role="status"></span></div>
+    </form>
+    <h2>Machines</h2>
+    <div class="grid" id="grid"></div>
+    <h2>Activity</h2>
+    <div class="panel feed" id="feed"></div>
+  </section>
+
+  <section id="v-jobs" role="tabpanel" aria-label="Jobs" hidden>
+    <div class="panel sched" id="sched" hidden></div>
+    <div class="filters">
+      <label>Machine<select id="fNode"><option value="">All</option></select></label>
+      <label>Status<select id="fStatus"><option value="">All</option><option>queued</option><option>starting</option><option>running</option><option>done</option><option>failed</option><option>cancelled</option></select></label>
+      <label>Engine<select id="fEngine"><option value="">All</option><option value="any">any</option><option value="claude">claude</option><option value="codex">codex</option><option value="shell">shell</option><option value="action">action (SYSTEM)</option><option value="admin">admin (SYSTEM)</option></select></label>
+      <label style="flex-direction:row;align-items:center;gap:6px;align-self:end;padding-bottom:8px"><input type="checkbox" id="fBriefs"> Show brief jobs</label>
+    </div>
+    <div class="panel tablewrap"><table>
+      <thead><tr><th>#</th><th>Machine</th><th>Engine</th><th>Task</th><th>Status</th><th>Age</th><th>Duration</th></tr></thead>
+      <tbody id="jobs"></tbody></table></div>
+  </section>
+
+  <section id="v-health" role="tabpanel" aria-label="Health" hidden>
+    <h2>Cluster</h2>
+    <div class="panel tablewrap"><table>
+      <thead><tr><th>Node</th><th>Priority</th><th>Role</th><th>Version</th><th>Healthy</th><th>Sync lag</th><th>Watchdog</th></tr></thead>
+      <tbody id="cluster"></tbody></table></div>
+    <div class="row wrap" id="fleetInfo" style="margin-top:8px" hidden></div>
+    <div class="hint" style="margin-top:6px">Lowest priority number leads. Use the arrows to change who takes over first.</div>
+    <div class="two-col">
+      <div><h2>Alerts</h2><div class="panel" id="alerts"></div></div>
+      <div><h2>Update rollout <span id="bundle" style="text-transform:none;letter-spacing:0"></span></h2>
+        <div class="panel tablewrap"><table><thead><tr><th>Node</th><th>Version</th><th>Status</th></tr></thead><tbody id="rollout"></tbody></table></div></div>
+    </div>
+    <h2>Agent lanes</h2>
+    <div class="panel tablewrap"><table>
+      <thead><tr><th>Node</th><th>User lane</th><th>System lane</th></tr></thead>
+      <tbody id="lanes"></tbody></table></div>
+    <div class="hint" style="margin-top:6px">The system lane (task ForgeSystemAgent, runs as SYSTEM) handles Admin jobs. The watchdog installs it after the 2.1 update.</div>
+  </section>
+</main>
+
+<div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Machine details"><div class="body">
+  <div class="head"><span class="dot" id="dDot"></span><div style="min-width:0"><div class="name" id="dName"></div><div class="sub" id="dSub"></div></div>
+    <div class="spacer"></div><button class="btn" id="dTask">Run task here</button><button class="btn" id="dClose" aria-label="Close details">&#10005;</button></div>
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <div class="content" id="dContent"></div>
+</div></div>
+
+<div class="drawer pd" id="pdrawer" role="dialog" aria-modal="true" aria-label="Project"><div class="body">
+  <div class="head">
+    <button class="btn" id="pBack" aria-label="Back">&#8592; <span class="only-desk">Back</span></button>
+    <div style="min-width:0;flex:1"><div class="name" id="pName"></div><div class="sub" id="pSub" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div></div>
+    <span id="pLive" class="live" hidden><span class="pulse"></span>Live</span>
+    <button class="btn only-desk" id="pClose" aria-label="Close">&#10005;</button>
+  </div>
+  <div class="content" id="pContent"></div>
+  <div id="sView" hidden>
+    <div class="sinfo" id="sInfo"></div>
+    <div class="trwrap"><div class="trscroll" id="trScroll" role="log" aria-live="polite" aria-label="Session transcript"></div>
+      <button class="btn sm primary jump" id="jumpBtn" hidden>&#8595; New messages</button></div>
+    <div class="pbox" id="pBox">
+      <textarea id="sPrompt" rows="1" placeholder="Send a follow-up to this session…" aria-label="Follow-up prompt"></textarea>
+      <div class="brow"><span class="note" id="sNote" role="status"></span>
+        <label class="hint" style="display:inline-flex;gap:5px;align-items:center" title="Let the agent edit files and run commands without asking"><input type="checkbox" id="sFull"> Full access</label>
+        <button class="btn danger" id="sTake" hidden>Take over anyway</button>
+        <button class="btn primary" id="sSend">Continue</button></div>
+    </div>
+  </div>
+</div></div>
+
+<div class="modal" id="pairModal" role="dialog" aria-modal="true" aria-label="Pair phone"><div class="panel">
+  <div class="mhead"><b id="pairTitle">Pair phone</b><div class="spacer"></div><button class="btn sm" id="pairClose" aria-label="Close">&#10005;</button></div>
+  <div class="mbody" id="pairBody"></div>
+</div></div>
+
+<div class="modal" id="jobModal" role="dialog" aria-modal="true" aria-label="Job output"><div class="panel">
+  <div class="mhead"><b id="jTitle"></b><span id="jStatus"></span><div class="spacer"></div>
+    <button class="btn danger sm" id="jCancel">Cancel job</button><button class="btn sm" id="jClose" aria-label="Close job">&#10005;</button></div>
+  <div class="mbody"><div class="sub" id="jMeta"></div><div class="prompt" id="jPrompt"></div><pre class="log" id="jOut"></pre></div>
+</div></div>
+
+<div class="modal" id="addModal" role="dialog" aria-modal="true" aria-label="Add a machine"><div class="panel">
+  <div class="mhead"><b>Add a machine</b><div class="spacer"></div><button class="btn sm" id="addClose" aria-label="Close">&#10005;</button></div>
+  <div class="mbody">
+    <p>On the Windows machine you want to enroll, open <b>PowerShell as administrator</b> and paste:</p>
+    <pre class="log" id="addCmd"></pre>
+    <p class="sub">It installs the agent and registers a boot task that runs as that user (no password stored). The machine appears here within ~30 s. Re-run the same command to update or repair an agent.</p>
+    <button class="btn" id="copyCmd">Copy command</button>
+  </div>
+</div></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const arr = x => Array.isArray(x) ? x : [];
+const ACTIVE = ['queued','starting','running'];
+let S = {nodes:[], jobs:[], events:[], cluster:{}}, H = {alerts:[], rollout:[]}, P = {list:[], ok:null, q:''};
+let openNode = null, openTab = 'overview', openJob = null, detail = null, view = 'projects';
+
+/* theme */
+try { const t = localStorage.getItem('forge-theme'); if (t) document.documentElement.dataset.theme = t; } catch {}
+$('#themeBtn').onclick = () => {
+  const cur = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  const nxt = cur === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = nxt;
+  try { localStorage.setItem('forge-theme', nxt); } catch {}
+};
+
+/* api */
+let bannerTimer = null;
+function banner(msg, ms) { const b = $('#banner'); b.textContent = msg || ''; b.classList.toggle('show', !!msg);
+  clearTimeout(bannerTimer); if (msg && ms) bannerTimer = setTimeout(() => banner(''), ms); }
+async function api(path, opts = {}) {
+  const r = await fetch(path, {credentials:'same-origin', headers:{'Content-Type':'application/json'}, ...opts});
+  if (r.status === 401) { $('#login').classList.add('open'); throw new Error('auth'); }
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    const e = new Error(typeof d.detail === 'string' ? d.detail : r.statusText); e.status = r.status; throw e;
+  }
+  const t = await r.text(); return t ? JSON.parse(t) : {};
+}
+$('#loginBtn').onclick = async () => {
+  try { await api('/api/login', {method:'POST', body:JSON.stringify({token:$('#tok').value})});
+        $('#login').classList.remove('open'); $('#loginErr').textContent = ''; refresh(); refreshHealth(); pollProjects(); refreshScheduler(); }
+  catch (e) { $('#loginErr').textContent = 'Wrong token'; }
+};
+$('#tok').onkeydown = e => { if (e.key === 'Enter') $('#loginBtn').click(); };
+
+/* formatting */
+const now = () => Date.now()/1000;
+const ago = ts => { if (!ts) return '—'; const s = Math.max(0, now() - ts);
+  return s < 60 ? Math.round(s)+'s' : s < 3600 ? Math.round(s/60)+'m' : s < 86400 ? Math.round(s/3600)+'h' : Math.round(s/86400)+'d'; };
+const dur = (a, b) => { if (!a) return '—'; const s = Math.round((b || now()) - a);
+  return s < 60 ? s+'s' : s < 3600 ? Math.floor(s/60)+'m '+(s%60)+'s' : Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m'; };
+const upt = s => s == null ? '—' : s < 3600 ? Math.round(s/60)+'m' : s < 86400 ? Math.round(s/3600)+'h' : Math.floor(s/86400)+'d '+Math.round(s%86400/3600)+'h';
+const clock = ts => ts ? new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '—';
+const pct = v => v == null || isNaN(v) ? '—' : Math.round(v)+'%';
+const num = v => v == null ? '—' : v;
+const meter = (label, v, color) => `<span class="sub">${label}</span><div class="meter" role="meter" aria-label="${label}" aria-valuenow="${Math.round(v||0)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${Math.min(100, Math.max(0, v||0))}%;background:var(${color})"></i></div><span class="sub mono">${pct(v)}</span>`;
+const short = s => esc(String(s||'').replace(/\(R\)|\(TM\)|CPU|@.*$/g,'').replace(/\s+/g,' ').trim()) || '—';
+const vnum = v => String(v||'').replace(/^v/,'').split(/[.\-+]/).map(x => parseInt(x,10)||0);
+const vcmp = (a, b) => { const x = vnum(a), y = vnum(b); for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i]||0) - (y[i]||0); if (d) return d; } return 0; };
+const vfmt = v => v ? 'v' + String(v).replace(/^v/,'') : '—';
+const hostOf = n => n?.info?.hostname || n?.id || '—';
+const nodeName = id => { if (id === 'auto') return 'auto'; const n = arr(S.nodes).find(x => x.id === id); return n ? hostOf(n) : (id || '—'); };
+
+function sparkPath(pts, key, w, h) {
+  if (pts.length < 2) return '';
+  const t0 = pts[0].ts, t1 = pts[pts.length-1].ts || t0+1;
+  return pts.map((p, i) => `${i ? 'L' : 'M'}${((p.ts - t0) / (t1 - t0 || 1) * w).toFixed(1)},${(h - (p[key] ?? 0) / 100 * h).toFixed(1)}`).join('');
+}
+function sparkSvg(pts, keys, h = 34) {
+  const w = 300; pts = arr(pts);
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="height:${h}px" aria-hidden="true">` +
+    keys.map(([k, c]) => `<path d="${sparkPath(pts, k, w, h-2)}" fill="none" stroke="var(${c})" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`).join('') + '</svg>';
+}
+function agentChips(agents) {
+  const c = {}; arr(agents).forEach(a => c[a.kind] = (c[a.kind]||0) + 1);
+  return Object.entries(c).map(([k, n]) => `<span class="chip">${esc(k)}${n > 1 ? ' ×'+n : ''}</span>`).join('');
+}
+
+/* cluster helpers */
+function leaderPeer() { const c = S.cluster || {}; return arr(c.peers).find(p => p.id === c.leader_id); }
+function targetVersion() { return H.bundle_version || leaderPeer()?.version || null; }
+function roleOf(id) { return arr((S.cluster||{}).peers).find(p => p.id === id)?.role || null; }
+function nodeChips(n) {
+  const out = [], tv = targetVersion(), av = n.info?.agent_version;
+  if (!n.online) out.push(`<span class="chip err">Offline</span>`);
+  if (n.disk_pct != null && n.disk_pct >= 90) out.push(`<span class="chip err">Disk ${Math.round(n.disk_pct)}% full</span>`);
+  if (n.online && av && tv && vcmp(av, tv) < 0) out.push(`<span class="chip warn">Update available (${esc(vfmt(av))} → ${esc(vfmt(tv))})</span>`);
+  return out.join('');
+}
+
+/* fleet */
+function renderGrid() {
+  const g = $('#grid'), nodes = arr(S.nodes);
+  if (!nodes.length) { g.innerHTML = `<div class="panel empty">No machines yet. Click <b>+ Add machine</b>.</div>`; return; }
+  g.innerHTML = nodes.map(n => {
+    const m = n.metrics || {}, i = n.info || {}, gpu = arr(m.gpu)[0], role = roleOf(n.id);
+    const wr = m.work_root ? `<div class="sub mono" style="margin-top:6px">Work drive ${esc(String(m.work_root).slice(0,2))} · ${m.work_root_free_gb != null ? Math.round(m.work_root_free_gb)+' GB free' : '—'}</div>` : '';
+    const svc = arr(m.services).map(x => `<span class="chip ${x.ok ? 'ok' : 'err'}" title="${x.ok ? 'running' : 'not responding'}">${esc(x.name)} ${x.ok ? '&#10003;' : '&#10007;'}</span>`).join('');
+    const t3 = t3Url(n.id);
+    const acts = n.online ? `<div class="mact">${t3 ? `<a class="btn sm" href="${esc(t3)}" target="_blank" rel="noopener" data-stop>Open T3</a>` : ''}<button type="button" class="btn sm" data-pair="${esc(n.id)}">Pair phone</button></div>` : '';
+    return `<div role="button" tabindex="0" class="panel card ${n.online ? '' : 'off'}" data-node="${esc(n.id)}" aria-label="Open ${esc(hostOf(n))} details">
+      <div class="row"><span class="dot ${n.online ? 'on' : ''}"></span><span class="name">${esc(hostOf(n))}</span>
+        ${role ? `<span class="badge ${role === 'leader' ? 'leader' : ''}">${esc(role)}</span>` : ''}
+        <span class="spacer"></span><span class="sub">${n.online ? 'Online · up '+upt(m.uptime_s) : 'Offline · seen '+ago(n.last_seen)+' ago'}</span></div>
+      <div class="sub">${short(i.cpu)} · ${num(i.ram_gb)} GB${gpu ? ' · '+esc(gpu.name) : ''}</div>
+      <div class="meters">${meter('CPU', m.cpu, '--cpu')}${meter('RAM', m.mem_pct, '--mem')}${meter('Disk', n.disk_pct, '--disk')}${gpu ? meter('GPU', gpu.util, '--gpu') : ''}</div>
+      ${wr}
+      <div class="chips">${nodeChips(n)}${svc}${agentChips(n.agents)}${n.active_jobs ? `<span class="chip job">${n.active_jobs} job${n.active_jobs>1?'s':''} running</span>` : ''}</div>
+      ${acts}
+      ${sparkSvg(n.spark, [['mem','--mem'],['cpu','--cpu']])}
+    </div>`;
+  }).join('');
+  g.querySelectorAll('.card').forEach(el => { el.onclick = () => openDrawer(el.dataset.node);
+    el.onkeydown = e => { if (e.target === el && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); el.click(); } }; });
+  g.querySelectorAll('[data-stop]').forEach(a => a.onclick = e => e.stopPropagation());
+  g.querySelectorAll('[data-pair]').forEach(b => b.onclick = e => { e.stopPropagation(); openPair(b.dataset.pair); });
+}
+function renderFeed() {
+  const ev = arr(S.events);
+  $('#feed').innerHTML = ev.length ? ev.map(e => `<div class="ev"><span class="t">${clock(e.ts)}</span><span class="lvl ${esc(e.level)}">${esc(e.level || 'info')}</span><span><b>${esc(e.node_id ? nodeName(e.node_id) : 'hub')}</b> ${esc(e.msg)}</span></div>`).join('') : '<div class="empty">Quiet so far.</div>';
+}
+function fillSelect(sel, opts, keep) {
+  const cur = sel.value;
+  sel.innerHTML = opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+  sel.value = opts.some(o => o[0] === cur) ? cur : keep;
+}
+function nodeOptions() {
+  const nodes = arr(S.nodes), adm = isAdmin();
+  const list = nodes.map(n => [n.id, hostOf(n) + (n.online ? '' : ' (offline)') + (adm && !n.system_lane?.online ? ' · system lane offline' : '')]);
+  if (!adm) return [['auto','Auto (best available)'], ...list];
+  // admin jobs never go to "auto": pick a machine, or (actions only) every online machine
+  return [['', 'Choose a machine…'], ...(adminMode() === 'custom' ? [] : [['__all__', 'All machines (online)']]), ...list];
+}
+function renderSelects() {
+  const nodes = arr(S.nodes);
+  fillSelect($('#tNode'), nodeOptions(), isAdmin() ? '' : 'auto');
+  fillSelect($('#fNode'), [['','All'], ...nodes.map(n => [n.id, hostOf(n)])], '');
+}
+
+/* jobs */
+const sysBadge = j => j && j.run_as === 'system' ? '<span class="badge sys" title="Runs as SYSTEM">SYSTEM</span> ' : '';
+function jobRow(j, showNode = true) {
+  const via = j.requested === 'auto' ? ' <span class="chip">auto</span>' : '';
+  return `<tr class="click" tabindex="0" data-job="${esc(j.id)}"><td class="mono sub">${esc(String(j.id).slice(-6))}</td>${showNode ? `<td>${esc(nodeName(j.node_id))}${via}</td>` : ''}<td>${sysBadge(j)}${j.engine === 'any' ? 'Any' : esc(j.action || j.engine)}${j.engine === 'any' && j.resolved_engine ? ' <span class="chip">' + esc(j.resolved_engine) + '</span>' : ''}${j.full_access ? ' <span class="chip warn">full access</span>' : ''}</td>
+    <td><div class="trunc">${esc(j.prompt)}</div>${j.status === 'queued' && j.wait_reason ? `<div class="sub trunc">&#8987; ${esc(j.wait_reason)}</div>` : ''}</td><td><span class="st ${esc(j.status)}">${esc(j.status)}</span></td>
+    <td class="sub">${ago(j.created)}</td><td class="sub">${j.started ? dur(j.started, j.finished) : '—'}</td></tr>`;
+}
+function bindJobRows(root) {
+  root.querySelectorAll('tr[data-job]').forEach(tr => {
+    tr.onclick = () => openJobModal(tr.dataset.job);
+    tr.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); tr.click(); } };
+  });
+}
+function renderJobs() {
+  const f = {n:$('#fNode').value, s:$('#fStatus').value, e:$('#fEngine').value};
+  const js = arr(S.jobs).filter(j => (!f.n || j.node_id === f.n) && (!f.s || j.status === f.s) && (!f.e || j.engine === f.e) && ($('#fBriefs').checked || j.source !== 'brief'));
+  $('#jobs').innerHTML = js.length ? js.map(j => jobRow(j)).join('') : `<tr><td colspan="7" class="empty">No matching jobs.</td></tr>`;
+  bindJobRows($('#jobs'));
+}
+
+/* health */
+function lastAction(n) {
+  const w = n?.metrics?.watchdog; if (!w) return '—';
+  const a = arr(w.actions).slice(-1)[0];
+  const t = a == null ? 'no actions' : (typeof a === 'string' ? a : (a.msg || a.action || JSON.stringify(a)));
+  return `${w.last_run ? ago(w.last_run)+' ago' : '—'} · ${esc(t)}`;
+}
+function renderHealth() {
+  const c = S.cluster || {}, peers = arr(c.peers).slice().sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
+  $('#cluster').innerHTML = peers.length ? peers.map((p, i) => {
+    const n = arr(S.nodes).find(x => x.id === p.id), nm = esc(nodeName(p.id));
+    return `<tr><td><b>${nm}</b>${p.id === c.viewing ? ' <span class="sub">(this hub)</span>' : ''}</td>
+      <td><span class="row" style="gap:4px"><span class="mono" style="min-width:18px">${num(p.priority)}</span>
+        <button class="btn sm iconbtn" data-prio="${esc(p.id)}" data-dir="-1" aria-label="Raise priority of ${nm}" ${i === 0 ? 'disabled' : ''}>&#9650;</button>
+        <button class="btn sm iconbtn" data-prio="${esc(p.id)}" data-dir="1" aria-label="Lower priority of ${nm}" ${i === peers.length-1 ? 'disabled' : ''}>&#9660;</button></span></td>
+      <td><span class="badge ${p.role === 'leader' ? 'leader' : ''}">${esc(p.role || '—')}</span></td>
+      <td class="mono">${esc(vfmt(p.version))}</td>
+      <td><span class="st ${p.healthy ? 'done' : 'failed'}">${p.healthy ? 'healthy' : 'unreachable'}</span></td>
+      <td class="mono">${p.lag_s != null ? Number(p.lag_s).toFixed(1)+'s' : '—'}</td>
+      <td class="sub">${n ? lastAction(n) : '—'}</td></tr>`;
+  }).join('') : `<tr><td colspan="7" class="empty">No cluster information.</td></tr>`;
+  $('#cluster').querySelectorAll('[data-prio]').forEach(b => b.onclick = () => movePeer(b.dataset.prio, +b.dataset.dir, peers));
+  const al = arr(H.alerts), lab = {error:'Error', warn:'Warning'}, cls = {error:'failed', warn:'cancelled'};
+  $('#alerts').innerHTML = al.length ? al.map(a => `<div class="alert"><span class="st ${cls[a.level] || 'running'}">${lab[a.level] || 'Info'}</span><span>${a.node_id ? '<b>'+esc(nodeName(a.node_id))+'</b> ' : ''}${esc(a.msg)}</span></div>`).join('')
+    : '<div class="empty">All clear. Nothing needs attention.</div>';
+  $('#bundle').textContent = H.bundle_version ? `· current ${vfmt(H.bundle_version)}` : '';
+  const ro = arr(H.rollout);
+  $('#rollout').innerHTML = ro.length ? ro.map(r => `<tr><td>${esc(nodeName(r.node_id))}</td><td class="mono">${esc(vfmt(r.version))}</td><td><span class="st ${/ok|current|done|updated/i.test(r.status) ? 'done' : /fail|error/i.test(r.status) ? 'failed' : 'running'}">${esc(r.status || '—')}</span></td></tr>`).join('')
+    : `<tr><td colspan="3" class="empty">No rollout data.</td></tr>`;
+  const bad = arr(c.bad_versions || H.bad_versions), lease = H.update_lease !== undefined ? H.update_lease : c.update_lease, fi = $('#fleetInfo');
+  const leaseTxt = lease === undefined ? '' : lease && lease.holder ? `<span class="pill warn">Update lease: ${esc(nodeName(lease.holder))}${lease.version ? ' &rarr; ' + esc(vfmt(lease.version)) : ''}</span>` : '<span class="pill">Update lease: free</span>';
+  fi.hidden = !bad.length && !leaseTxt;
+  fi.innerHTML = (bad.length ? `<span class="sub">Fleet-bad versions (never installed):</span>${bad.map(v => `<span class="chip err">${esc(vfmt(v))}</span>`).join('')}` : '') + leaseTxt;
+  const hn = arr(H.nodes);
+  const lane = (on, seen) => `<span class="st ${on ? 'done' : 'failed'}">${on ? 'online' : 'offline'}</span>${!on && seen ? ' <span class="sub">seen ' + ago(seen) + ' ago</span>' : (!seen ? ' <span class="sub">never</span>' : '')}`;
+  $('#lanes').innerHTML = hn.length ? hn.map(n => { const sl = n.system_lane || {}, sn = arr(S.nodes).find(x => x.id === n.id);
+    return `<tr><td>${esc(nodeName(n.id))}</td><td>${lane(n.online, sn?.last_seen)}</td><td>${lane(!!sl.online, sl.last_seen)}${sl.version ? ' <span class="sub mono">' + esc(vfmt(sl.version)) + '</span>' : ''}</td></tr>`; }).join('')
+    : `<tr><td colspan="3" class="empty">No machines.</td></tr>`;
+}
+async function movePeer(id, dir, peers) {
+  const i = peers.findIndex(p => p.id === id), o = peers[i+dir]; if (i < 0 || !o) return;
+  const a = peers[i].priority ?? i, b = o.priority ?? i+dir, url = x => '/api/peers/' + encodeURIComponent(x);
+  try {
+    if (a === b) await api(url(id), {method:'PATCH', body:JSON.stringify({priority: a + dir})});
+    else { await api(url(id), {method:'PATCH', body:JSON.stringify({priority: b})});
+           await api(url(o.id), {method:'PATCH', body:JSON.stringify({priority: a})}); }
+  } catch (e) { banner('Could not change priority: ' + e.message, 4000); }
+  refresh();
+}
+
+/* header + tabs */
+const TABS_TOP = [['projects','Projects'],['fleet','Fleet'],['jobs','Jobs'],['health','Health']];
+function renderNav() {
+  const act = arr(S.jobs).filter(j => ACTIVE.includes(j.status)).length, al = arr(H.alerts).filter(a => a.level !== 'info').length;
+  const live = arr(P.list).reduce((a, p) => a + (+p.live_sessions || 0), 0);
+  const cnt = {projects: live || '', fleet: arr(S.nodes).length, jobs: act || '', health: al || ''};
+  $('#nav').innerHTML = TABS_TOP.map(([k, l]) => `<button role="tab" id="tab-${k}" data-v="${k}" aria-selected="${k === view}" aria-controls="v-${k}">${l}${cnt[k] !== '' ? `<span class="n">${cnt[k]}</span>` : ''}</button>`).join('');
+  $('#nav').querySelectorAll('button').forEach(b => b.onclick = () => setView(b.dataset.v));
+}
+function setView(v) {
+  view = v; try { history.replaceState(null, '', '#' + v); } catch {}
+  TABS_TOP.forEach(([k]) => $('#v-' + k).hidden = k !== v);
+  renderNav();
+}
+function renderHeader() {
+  const c = S.cluster || {}, nodes = arr(S.nodes), on = nodes.filter(n => n.online).length, act = arr(S.jobs).filter(j => ACTIVE.includes(j.status)).length;
+  const lp = $('#leaderPill');
+  lp.textContent = 'Leader: ' + (c.leader_id ? nodeName(c.leader_id) : '—');
+  lp.className = 'pill ' + (c.leader_id ? 'ok' : 'warn');
+  $('#via').textContent = c.viewing && c.leader_id && c.viewing !== c.leader_id ? 'via ' + nodeName(c.viewing) : '';
+  $('#stats').innerHTML = `<span><b>${on}</b>/${nodes.length} online</span><span><b>${act}</b> active job${act === 1 ? '' : 's'}</span>`;
+}
+function render() { renderHeader(); renderNav(); renderGrid(); renderProjects(); renderFeed(); renderSelects(); renderJobs(); renderHealth(); }
+
+async function refresh() {
+  if (document.hidden) return;
+  try { S = Object.assign({nodes:[], jobs:[], events:[], cluster:{}}, await api('/api/state')); banner(''); render(); if (openNode) loadDetail(); }
+  catch (e) { if (e.status === 503) banner('No leader reachable — retrying'); else if (e instanceof TypeError) banner('Hub unreachable — retrying'); }
+}
+async function refreshHealth() {
+  if (document.hidden) return;
+  try { H = Object.assign({alerts:[], rollout:[]}, await api('/api/health')); renderNav(); renderHealth(); renderGrid(); } catch (e) {}
+}
+
+/* drawer */
+const TABS = [['overview','Overview'],['processes','Processes'],['agents','Agents'],['logs','Logs'],['jobs','Jobs'],['settings','Settings']];
+function openDrawer(id) { openNode = id; openTab = 'overview'; detail = null; $('#tabs').innerHTML = ''; $('#dContent').dataset.tab = ''; $('#drawer').classList.add('open'); $('#dContent').innerHTML = '<div class="empty">Loading…</div>'; $('#dClose').focus(); loadDetail(); }
+function closeDrawer() { openNode = null; $('#drawer').classList.remove('open'); }
+$('#dClose').onclick = closeDrawer;
+$('#drawer').onclick = e => { if (e.target.id === 'drawer') closeDrawer(); };
+$('#dTask').onclick = () => { const id = openNode; closeDrawer(); setView('fleet'); $('#tNode').value = id; $('#tPrompt').focus(); };
+async function loadDetail() { const id = openNode; try { const d = await api('/api/nodes/' + encodeURIComponent(id)); if (id === openNode) { detail = d; renderDetail(); } } catch (e) {} }
+
+let logSel = null;
+function renderDetail() {
+  const d = detail, i = d.info || {}, m = d.metrics || {};
+  $('#dDot').className = 'dot' + (d.online ? ' on' : '');
+  $('#dName').textContent = i.hostname || d.id;
+  $('#dSub').textContent = `${d.online ? 'Online' : 'Offline'} · last report ${ago(d.last_seen)} ago · ${d.addr || ''}`;
+  const tabs = $('#tabs');
+  tabs.innerHTML = TABS.map(([k, l]) => `<button class="tab ${k === openTab ? 'on' : ''}" role="tab" aria-selected="${k === openTab}" data-t="${k}">${l}</button>`).join('');
+  tabs.querySelectorAll('.tab').forEach(b => b.onclick = () => { openTab = b.dataset.t; renderDetail(); });
+  const c = $('#dContent');
+  if (openTab === 'settings') { if (c.dataset.tab !== 'settings') renderSettings(c, d); c.dataset.tab = 'settings'; return; }
+  c.dataset.tab = openTab;
+  const keepScroll = c.querySelector('pre.log')?.scrollTop;
+  let h = '';
+  if (openTab === 'overview') {
+    const disks = arr(m.disks).map(x => `${esc(x.name)} ${num(x.free_gb)}/${num(x.total_gb)} GB free`).join('<br>') || '—';
+    const gpus = arr(m.gpu).length ? m.gpu.map(g => `${esc(g.name)} · ${num(g.util)}% · ${num(g.mem_used_mb)}/${num(g.mem_total_mb)} MB · ${num(g.temp_c)}°C`).join('<br>') : esc(arr(i.gpus).join(', ') || '—');
+    const ips = arr(m.ips).map(x => `${esc(x.ip)} <span class="sub">${esc(x.iface)}</span>`).join('<br>') || '—';
+    const vers = Object.entries(i.versions||{}).map(([k, v]) => `${esc(k)} <span class="sub">${esc(v)}</span>`).join('<br>') || '—';
+    const bat = m.battery ? (m.battery.ac ? 'AC' : 'Battery') + ' · ' + num(m.battery.pct) + '%' : 'AC (no battery)';
+    h += `<div class="chips" style="margin:0 0 12px">${nodeChips(d)}</div>
+      <div class="chart"><div class="legend"><span><i style="background:var(--cpu)"></i>CPU</span><span><i style="background:var(--mem)"></i>RAM</span>${arr(m.gpu).length ? '<span><i style="background:var(--gpu)"></i>GPU</span>' : ''}<span class="spacer"></span><span>history</span></div>
+      ${sparkSvg(d.history, [['mem','--mem'],['cpu','--cpu'],...(arr(m.gpu).length ? [['gpu','--gpu']] : [])], 120)}</div>
+      <div class="kv">
+        <div><span class="k">CPU</span><b>${pct(m.cpu)}</b> <span class="sub">${esc(i.cpu||'')} · ${num(i.cores)} threads</span></div>
+        <div><span class="k">Memory</span><b>${num(m.mem_used_gb)} / ${num(m.mem_total_gb)} GB</b> <span class="sub">${pct(m.mem_pct)}</span></div>
+        <div><span class="k">GPU</span><b>${gpus}</b></div><div><span class="k">Disks</span><b>${disks}</b></div>
+        <div><span class="k">Work folder</span><b class="mono">${esc(m.work_root || '—')}</b> <span class="sub">${m.work_root_free_gb != null ? Math.round(m.work_root_free_gb)+' GB free' : ''}</span></div>
+        <div><span class="k">OS</span><b>${esc(i.os || '—')}</b></div><div><span class="k">Model</span><b>${esc(i.model || '—')}</b></div>
+        <div><span class="k">User</span><b>${esc(i.user || '—')}</b></div><div><span class="k">Uptime</span><b>${upt(m.uptime_s)}</b></div>
+        <div><span class="k">Power</span><b>${bat}</b></div>
+        <div><span class="k">Network</span><b>${ips}</b></div><div><span class="k">Tools</span><b>${vers}</b></div>
+        <div><span class="k">WSL</span><b>${esc(arr(i.wsl).join(', ') || '—')}</b></div>
+        <div><span class="k">Agent</span><b>${esc(vfmt(i.agent_version))} · ${num(i.max_jobs)} job slots · ${num(m.procs_total)} procs</b></div>
+        <div><span class="k">System lane</span><b>${d.system_lane?.online ? 'Online' : 'Offline'}</b> <span class="sub">${d.system_lane?.last_seen ? 'seen ' + ago(d.system_lane.last_seen) + ' ago' : 'never seen'}</span></div>
+        <div><span class="k">Watchdog</span><b>${lastAction(d)}</b></div>
+      </div>`;
+  } else if (openTab === 'processes') {
+    h += `<div class="panel tablewrap"><table><thead><tr><th>Process</th><th>PID</th><th>CPU</th><th>Memory</th></tr></thead><tbody>` +
+      arr(d.procs).map(p => `<tr><td>${esc(p.name)}</td><td class="mono sub">${esc(p.pid)}</td><td>${num(p.cpu)}%</td><td>${num(p.mem_mb)} MB</td></tr>`).join('') + `</tbody></table></div>`;
+  } else if (openTab === 'agents') {
+    h += arr(d.agents).length ? `<div class="panel tablewrap"><table><thead><tr><th>Kind</th><th>PID</th><th>Started</th><th>Command</th></tr></thead><tbody>` +
+      d.agents.map(a => `<tr><td><span class="chip">${esc(a.kind)}</span></td><td class="mono sub">${esc(a.pid)}</td><td class="sub">${a.started ? ago(Date.parse(a.started)/1000)+' ago' : (a.job ? 'job '+esc(String(a.job).slice(-6)) : '—')}</td><td class="mono sub"><div class="trunc">${esc(a.cmd)}</div></td></tr>`).join('') + `</tbody></table></div>`
+      : '<div class="empty">No agent processes running.</div>';
+  } else if (openTab === 'logs') {
+    const logs = arr(d.logs);
+    if (!logs.length) h += '<div class="empty">No logs reported.</div>';
+    else {
+      if (!logs.find(l => l.name === logSel)) logSel = logs[0].name;
+      const L = logs.find(l => l.name === logSel);
+      h += `<div class="row wrap" style="margin-bottom:10px">${logs.map(l => `<button class="btn sm ${l.name === logSel ? 'primary' : ''}" data-log="${esc(l.name)}">${esc(l.name)}</button>`).join('')}
+        <span class="spacer"></span><span class="sub">updated ${ago(L.ts)} ago</span></div><pre class="log mono">${esc(L.text)}</pre>`;
+    }
+  } else if (openTab === 'jobs') {
+    h += arr(d.jobs).length ? `<div class="panel tablewrap"><table><thead><tr><th>#</th><th>Engine</th><th>Task</th><th>Status</th><th>Age</th><th>Duration</th></tr></thead><tbody>${d.jobs.map(j => jobRow(j, false)).join('')}</tbody></table></div>`
+      : '<div class="empty">No jobs on this machine yet.</div>';
+  }
+  c.innerHTML = h;
+  c.querySelectorAll('[data-log]').forEach(b => b.onclick = () => { logSel = b.dataset.log; renderDetail(); const p = c.querySelector('pre.log'); if (p) p.scrollTop = p.scrollHeight; });
+  bindJobRows(c);
+  const pre = c.querySelector('pre.log'); if (pre) pre.scrollTop = keepScroll ?? pre.scrollHeight;
+}
+function renderSettings(c, d) {
+  const s = d.settings || {}, m = d.metrics || {};
+  c.innerHTML = `<form class="set" id="setForm">
+    <label>Work folder<input type="text" id="sRoot" class="mono" value="${esc(s.work_root || '')}" placeholder="${esc(m.work_root || 'Auto: drive with most free space')}">
+      <span class="hint">Leave empty to let the machine pick the drive with the most free space${m.work_root ? ' (now: ' + esc(m.work_root) + ')' : ''}.</span></label>
+    <label>Max parallel jobs<input type="number" id="sMax" min="1" max="32" value="${esc(s.max_jobs ?? '')}" placeholder="${esc(d.info?.max_jobs ?? 'default')}">
+      <span class="hint">Leave empty for the default.</span></label>
+    <div class="sendrow"><button class="btn primary" type="submit">Save</button><span class="hint" id="sMsg" role="status"></span></div></form>`;
+  $('#setForm').onsubmit = async e => {
+    e.preventDefault();
+    const mj = $('#sMax').value.trim();
+    const body = {work_root: $('#sRoot').value.trim() || null, max_jobs: mj === '' ? null : parseInt(mj, 10)};
+    try { await api(`/api/nodes/${encodeURIComponent(d.id)}/settings`, {method:'PUT', body:JSON.stringify(body)}); $('#sMsg').textContent = "Saved. Applies on the machine's next check-in."; }
+    catch (err) { $('#sMsg').textContent = 'Error: ' + err.message; }
+  };
+}
+
+/* composer */
+const engine = () => document.querySelector('input[name=eng]:checked')?.value || 'claude';
+function syncFull() { const on = $('#tFull').checked; $('#fullBox').classList.toggle('on', on);
+  $('#fullHint').textContent = on ? 'Warning: runs with no permission prompts or sandbox. Only use on machines and folders you trust.' : 'Agent can change files and run commands without asking.'; }
+$('#tFull').onchange = syncFull;
+/* admin lane (SYSTEM): allowlisted actions from /api/actions or custom PowerShell */
+let ACTIONS = null;
+const isAdmin = () => engine() === 'admin';
+const adminMode = () => $('#aMode').value || 'custom';
+const actionSpec = () => arr(ACTIONS?.actions).find(a => a.name === adminMode());
+async function loadActions() {
+  try { ACTIONS = await api('/api/actions'); } catch (e) { return; }
+  const sel = $('#aMode'), cur = sel.value;
+  sel.innerHTML = arr(ACTIONS.actions).map(a => `<option value="${esc(a.name)}">${esc(a.name)}${a.destructive ? ' (needs confirm)' : ''}</option>`).join('')
+    + '<option value="custom">Custom PowerShell (as SYSTEM)</option>';
+  sel.value = [...sel.options].some(o => o.value === cur) ? cur : sel.options[0].value;
+  renderActionArgs();
+}
+function renderActionArgs() {
+  const a = actionSpec(), custom = adminMode() === 'custom';
+  $('#promptBox').hidden = isAdmin() && !custom;
+  const off = ACTIONS && ACTIONS.admin_lane_enabled === false ? ' Admin lane is disabled on this hub (admin_lane_enabled=false); jobs will fail.' : '';
+  $('#aDesc').textContent = (custom ? 'Free-form PowerShell, run as SYSTEM. Always asks for confirmation.' : (a?.description || '') + (a?.destructive ? ' Asks for confirmation.' : '')) + off;
+  $('#aArgs').innerHTML = custom || !a ? '' : Object.entries(a.args || {}).map(([k, r]) => {
+    const lab = `${esc(r.label || k)}${r.required ? ' *' : ''}`, id = 'aArg-' + esc(k);
+    if (r.enum) return `<label class="f">${lab}<select id="${id}" data-arg="${esc(k)}">${r.required ? '' : '<option value="">(default)</option>'}${r.enum.map(v => `<option>${esc(v)}</option>`).join('')}</select></label>`;
+    if (r.type === 'int') return `<label class="f">${lab}<input type="number" id="${id}" data-arg="${esc(k)}" data-int="1" ${r.min != null ? `min="${r.min}"` : ''} ${r.max != null ? `max="${r.max}"` : ''} placeholder="${esc(r.default ?? '')}"></label>`;
+    return `<label class="f">${lab}<input type="text" class="mono" id="${id}" data-arg="${esc(k)}" autocomplete="off" spellcheck="false"></label>`;
+  }).join('');
+  if (isAdmin()) $('#tPrompt').placeholder = 'PowerShell to run as SYSTEM on the chosen machine';
+  renderSelects();
+}
+function collectArgs() {
+  const out = {};
+  $('#aArgs').querySelectorAll('[data-arg]').forEach(el => { const v = el.value.trim(); if (v === '') return; out[el.dataset.arg] = el.dataset.int ? Number(v) : v; });
+  return out;
+}
+function syncEngine() {
+  const adm = isAdmin();
+  $('#adminBox').hidden = !adm; $('#advBox').hidden = adm;
+  $('#sendBtn').textContent = adm ? 'Run as SYSTEM' : 'Run task';
+  $('#sendBtn').classList.toggle('sysbtn', adm);
+  if (!adm) { $('#promptBox').hidden = false; $('#tPrompt').placeholder = 'What should it do?  (Ctrl/Cmd+Enter to run)'; }
+  if (adm && !ACTIONS) loadActions(); else renderActionArgs();
+}
+document.querySelectorAll('input[name=eng]').forEach(r => r.onchange = syncEngine);
+$('#aMode').onchange = renderActionArgs;
+async function submitAdmin() {
+  const target = $('#tNode').value, custom = adminMode() === 'custom', a = actionSpec();
+  if (!target) { $('#tMsg').textContent = 'Choose a machine.'; $('#tNode').focus(); return; }
+  let base, label, needsConfirm;
+  if (custom) {
+    const script = $('#tPrompt').value.trim();
+    if (!script) { $('#tMsg').textContent = 'Write the PowerShell to run.'; $('#tPrompt').focus(); return; }
+    base = {engine:'admin', prompt:script}; label = 'custom PowerShell'; needsConfirm = true;
+  } else {
+    if (!a) { $('#tMsg').textContent = 'Actions not loaded yet.'; loadActions(); return; }
+    const args = collectArgs();
+    base = {engine:'action', action:a.name, args}; label = a.name + (Object.keys(args).length ? ' ' + JSON.stringify(args) : ''); needsConfirm = !!a.destructive;
+  }
+  const targets = target === '__all__' ? arr(S.nodes).filter(n => n.online).map(n => n.id) : [target];
+  if (!targets.length) { $('#tMsg').textContent = 'No online machines.'; return; }
+  if (needsConfirm && !confirm(`Run ${label} as SYSTEM on ${targets.map(nodeName).join(', ')}?`)) { $('#tMsg').textContent = 'Not sent.'; return; }
+  $('#sendBtn').disabled = true;
+  const ids = [], errs = [];
+  try {
+    for (const t of targets) {   // "All machines" = one job per online node
+      try { ids.push((await api('/api/jobs', {method:'POST', body:JSON.stringify({...base, node_id:t, confirm:needsConfirm, source:'ui'})})).id); }
+      catch (err) { errs.push(`${nodeName(t)}: ${err.message}`); }
+    }
+  } finally { $('#sendBtn').disabled = false; }
+  $('#tMsg').textContent = errs.length ? 'Error: ' + errs.join('; ') : (ids.length > 1 ? `Queued ${ids.length} jobs.` : 'Started.');
+  if (ids.length && custom) $('#tPrompt').value = '';
+  refresh();
+  if (ids.length === 1 && targets.length === 1) openJobModal(ids[0]);
+}
+async function submitTask() {
+  if (isAdmin()) return submitAdmin();
+  const body = {node_id:$('#tNode').value || 'auto', engine:engine(), prompt:$('#tPrompt').value.trim(), cwd:$('#tCwd').value.trim() || null, full_access:$('#tFull').checked};
+  if (!body.prompt) { $('#tMsg').textContent = 'Write what the task should do.'; $('#tPrompt').focus(); return; }
+  $('#sendBtn').disabled = true;
+  try { const r = await api('/api/jobs', {method:'POST', body:JSON.stringify(body)});
+        $('#tMsg').textContent = 'Started.'; $('#tPrompt').value = ''; refresh(); openJobModal(r.id); }
+  catch (err) { $('#tMsg').textContent = 'Error: ' + err.message; }
+  finally { $('#sendBtn').disabled = false; }
+}
+$('#taskForm').onsubmit = e => { e.preventDefault(); submitTask(); };
+$('#tPrompt').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitTask(); } };
+['fNode','fStatus','fEngine','fBriefs'].forEach(id => $('#'+id).onchange = renderJobs);
+
+/* job modal */
+let lastFocus = null;
+async function openJobModal(id) { lastFocus = document.activeElement; openJob = id; $('#jobModal').classList.add('open'); $('#jOut').textContent = 'Loading…'; $('#jClose').focus(); await loadJob(true); }
+async function loadJob(first) {
+  if (!openJob || (document.hidden && !first)) return;
+  const id = openJob, j = await api('/api/jobs/' + encodeURIComponent(id)).catch(() => null); if (!j || id !== openJob) return;
+  $('#jTitle').textContent = `Job ${String(j.id).slice(-6)} · ${j.action || j.engine} on ${nodeName(j.node_id)}${j.requested === 'auto' ? ' (auto)' : ''}`;
+  $('#jStatus').innerHTML = `${sysBadge(j)}<span class="st ${esc(j.status)}">${esc(j.status)}</span>`;
+  $('#jMeta').innerHTML = `created ${ago(j.created)} ago · ${j.started ? 'ran ' + dur(j.started, j.finished) : 'waiting for machine'}${j.exit_code != null ? ' · exit ' + esc(j.exit_code) : ''}${j.cwd ? ' · ' + esc(j.cwd) : ''}${j.full_access ? ' · <b style="color:var(--err)">full access</b>' : ''}`;
+  $('#jPrompt').textContent = j.prompt || '';
+  const pre = $('#jOut'), atBottom = first || pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
+  pre.textContent = j.output || '(no output yet)';
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
+  $('#jCancel').style.display = ACTIVE.includes(j.status) ? '' : 'none';
+}
+function closeJob() { openJob = null; $('#jobModal').classList.remove('open'); lastFocus?.focus?.(); }
+$('#jClose').onclick = closeJob;
+$('#jobModal').onclick = e => { if (e.target.id === 'jobModal') closeJob(); };
+$('#jCancel').onclick = async () => { try { await api(`/api/jobs/${encodeURIComponent(openJob)}/cancel`, {method:'POST'}); } catch (e) {} loadJob(); refresh(); };
+
+/* enroll */
+$('#addBtn').onclick = async () => { try { const r = await api('/api/enroll'); $('#addCmd').textContent = r.command || ''; $('#copyCmd').textContent = 'Copy command'; $('#addModal').classList.add('open'); $('#addClose').focus(); } catch (e) { banner('Could not load install command: ' + e.message, 4000); } };
+$('#addClose').onclick = () => $('#addModal').classList.remove('open');
+$('#addModal').onclick = e => { if (e.target.id === 'addModal') $('#addClose').click(); };
+$('#copyCmd').onclick = () => navigator.clipboard?.writeText($('#addCmd').textContent).then(() => $('#copyCmd').textContent = 'Copied');
+document.addEventListener('keydown', e => { if (e.key !== 'Escape') return;
+  if ($('#addModal').classList.contains('open')) $('#addClose').click();
+  else if ($('#pairModal').classList.contains('open')) closePair();
+  else if (openJob) closeJob();
+  else if (openNode) closeDrawer();
+  else if (pOpen) $('#pBack').click(); });
+
+/* ======================= Phase 2: projects, sessions, pairing, scheduler =======================
+   Every field below may be missing (mixed-version fleet): render "—" or hide, never throw. */
+const enc = encodeURIComponent;
+const TOOLS = {claude:'Claude', codex:'Codex', t3:'T3', forge:'Forge'};
+const toolLbl = t => TOOLS[t] || String(t || '?');
+const tsec = v => { if (v == null || v === '') return null; if (typeof v === 'number') return v > 1e12 ? v / 1000 : v; const d = Date.parse(v); return isNaN(d) ? null : d / 1000; };
+const agoT = v => { const t = tsec(v); return t ? ago(t) + ' ago' : '—'; };
+const truthy = v => v === true || v === 1 || v === '1';
+const oneLine = (t, n = 140) => { const l = String(t ?? '').split('\n').map(x => x.trim()).find(Boolean) || ''; return l.length > n ? l.slice(0, n - 1) + '…' : l; };
+function t3Url(id) {
+  const peer = arr((S.cluster || {}).peers).find(p => p.id === id), n = arr(S.nodes).find(x => x.id === id);
+  let host = ''; try { if (peer && peer.url) host = new URL(peer.url).hostname; } catch {}
+  host = host || (n && n.addr) || '';
+  return host && /^[\w.\-:\[\]]+$/.test(host) ? `http://${host}:3773` : '';
+}
+function copyText(t) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(t);
+  return new Promise((res, rej) => { const a = document.createElement('textarea'); a.value = t; a.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(a); a.select(); let ok = false; try { ok = document.execCommand('copy'); } catch {} a.remove(); ok ? res() : rej(); });
+}
+const settle = (btn, txt, ms = 1500) => { const o = btn.textContent; btn.textContent = txt; setTimeout(() => btn.textContent = o, ms); };
+
+/* ---------- Projects list ---------- */
+let pOpen = null, PD = null, sess = null, pScreen = 'project', briefAllOk = null, briefAllRetry = 0;
+let T = {key: null, cursor: null, n: 0, busy: false, lastRow: null, lastNew: 0, stick: true, msg: '', jobId: null};
+let showThink = false;
+const plainBrief = t => String(t || '').split('\n').map(l => l.replace(/^\s*[-*•]\s*/, '').trim()).filter(Boolean).join(' · ');
+function projMatch(p, q) {
+  return !q || [p.name, p.group_name, p.brief && p.brief.text, ...arr(p.branches), ...arr(p.machines).map(nodeName)].join(' ').toLowerCase().includes(q);
+}
+function renderProjects() {
+  const g = $('#pgrid'); if (!g) return;
+  let h;
+  if (P.ok === false) h = `<div class="panel empty">This hub doesn't offer Projects yet (needs v2.2.0). Fleet, Jobs and Health work as before.</div>`;
+  else if (P.ok === null) h = `<div class="panel empty">Loading projects…</div>`;
+  else {
+    const q = P.q.trim().toLowerCase(), list = arr(P.list).filter(p => projMatch(p, q));
+    h = list.length ? list.map(p => {
+      const live = +p.live_sessions || 0, ahead = +p.ahead || 0, br = plainBrief(p.brief && p.brief.text);
+      return `<div role="button" tabindex="0" class="panel pcard ${truthy(p.pinned) ? 'pin' : ''}" data-pid="${esc(p.id)}" aria-label="Open project ${esc(p.name || 'Untitled')}">
+        <div class="row"><span class="name">${truthy(p.pinned) ? '&#9733; ' : ''}${esc(p.name || 'Untitled')}</span><span class="spacer"></span>
+          ${live ? `<span class="live"><span class="pulse"></span>${live} live</span>` : ''}</div>
+        <div class="chips" style="margin:0">${p.group_name ? `<span class="chip grp">${esc(p.group_name)}</span>` : ''}${arr(p.machines).map(m => `<span class="chip">${esc(nodeName(m))}</span>`).join('')}${truthy(p.dirty_any) ? '<span class="chip warn">uncommitted</span>' : ''}${ahead > 0 ? `<span class="chip warn">&#8593;${ahead} ahead</span>` : ''}</div>
+        <div class="brief2">${br ? esc(br) : '<span class="sub">No brief yet</span>'}</div>
+        <div class="sub">${p.last_activity ? 'Active ' + agoT(p.last_activity) : 'No activity'}${p.sessions_24h != null ? ' · ' + esc(p.sessions_24h) + ' session' + (+p.sessions_24h === 1 ? '' : 's') + ' today' : ''}</div></div>`;
+    }).join('') : `<div class="panel empty">${q ? 'No projects match your search.' : 'No projects yet. They appear as soon as a machine reports a session.'}</div>`;
+  }
+  if (g._h === h) return; g._h = h; g.innerHTML = h;
+  g.querySelectorAll('.pcard').forEach(el => { el.onclick = () => openProject(el.dataset.pid);
+    el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); } }; });
+}
+$('#pSearch').oninput = e => { P.q = e.target.value; renderProjects(); };
+async function pollProjects() {
+  if (document.hidden || (P.ok === false && now() < (P.retry || 0))) return;
+  try { P.list = arr(await api('/api/projects')); P.ok = true; }
+  catch (e) { if (e.status === 404 || e.status === 405) { P.ok = false; P.retry = now() + 60; } else if (P.ok === null) return; }
+  renderProjects(); renderNav();
+  if (view === 'projects') loadBriefAll();
+  if (pOpen) loadProject();
+}
+async function loadBriefAll() {
+  const box = $('#briefAllBox'); if (briefAllOk === false && now() < briefAllRetry) return;
+  try { const b = await api('/api/brief/all'); briefAllOk = true;
+    if (b && b.text) { box.hidden = false; box.innerHTML = `<span class="sub">Roll-up across all active projects · ${agoT(b.ts)}${b.model ? ' · ' + esc(b.model) : ''}</span>${esc(b.text)}`; } else box.hidden = true; }
+  catch (e) { if (e.status === 404 || e.status === 405) { briefAllOk = false; briefAllRetry = now() + 60; } box.hidden = true; }
+}
+$('#briefAll').onclick = async e => {
+  const b = e.currentTarget; b.disabled = true;
+  try { await api('/api/brief/all', {method:'POST', body:'{}'}); banner('Roll-up requested. It will appear here shortly.', 4000); setTimeout(loadBriefAll, 4000); setTimeout(loadBriefAll, 12000); }
+  catch (err) { banner('Could not request brief: ' + err.message, 4000); }
+  finally { setTimeout(() => b.disabled = false, 2500); }
+};
+
+/* ---------- Project view ---------- */
+function showScreen() { $('#pContent').hidden = pScreen !== 'project'; $('#sView').hidden = pScreen !== 'session'; }
+function openProject(id) {
+  pOpen = id; PD = null; sess = null; pScreen = 'project'; T.key = null;
+  const row = arr(P.list).find(p => p.id === id) || {};
+  $('#pName').textContent = row.name || 'Project'; $('#pSub').textContent = ''; $('#pLive').hidden = true;
+  $('#pContent').innerHTML = '<div class="empty">Loading…</div>'; showScreen();
+  $('#pdrawer').classList.add('open'); $('#pBack').focus(); loadProject();
+}
+function closeProject() { pOpen = null; PD = null; sess = null; T.key = null; $('#pdrawer').classList.remove('open'); }
+$('#pClose').onclick = closeProject;
+$('#pdrawer').onclick = e => { if (e.target.id === 'pdrawer') closeProject(); };
+$('#pBack').onclick = () => { if (pScreen === 'session') closeSession(); else closeProject(); };
+async function loadProject() {
+  const id = pOpen; if (!id || document.hidden) return;
+  try { const d = await api('/api/projects/' + enc(id)); if (id !== pOpen) return; PD = d;
+    if (sess) { const s = arr(d.sessions).find(x => x.tool === sess.tool && x.session_id === sess.session_id); if (s) { Object.assign(sess, s); syncPrompt(); updateLive(); } }
+    else renderProject(); }
+  catch (e) { if (id === pOpen && !PD) $('#pContent').innerHTML = `<div class="panel empty">Could not load this project${e.message ? ' (' + esc(e.message) + ')' : ''}.</div>`; }
+}
+function renderProject() {
+  const d = PD, c = $('#pContent'); if (!d || pScreen !== 'project') return;
+  const ae = document.activeElement;
+  if (ae && c.contains(ae) && /^(TEXTAREA|SELECT|INPUT)$/.test(ae.tagName)) return;   // don't wipe what the user is typing
+  const keep = c.scrollTop, ses = arr(d.sessions), live = ses.filter(s => s.state === 'live').length;
+  $('#pName').textContent = (truthy(d.pinned) ? '★ ' : '') + (d.name || 'Project');
+  $('#pSub').textContent = [d.group_name, arr(d.machines).map(nodeName).join(', ')].filter(Boolean).join(' · ');
+  $('#pLive').hidden = !live;
+  const brs = arr(d.briefs), br = d.brief || brs[0];
+  const ntOpen = !!c.querySelector('#ntForm:not([hidden])');
+  const sRow = (s, i) => `<button type="button" class="srow" data-si="${i}" aria-label="Open session ${esc(oneLine(s.title, 60) || 'untitled')}">
+      <span class="tool ${esc(s.tool)}">${esc(toolLbl(s.tool))}</span><span class="tt">${esc(oneLine(s.title) || '(untitled)')}</span>
+      <span class="row" style="gap:6px"><span class="sdot ${esc(s.state || '')}" title="${esc(s.state || '')}"></span><span class="sub">${s.state === 'live' ? 'live' : agoT(s.last_activity)}</span></span>
+      <span class="meta"><span>${esc(nodeName(s.node_id))}</span>${s.git_branch ? `<span class="mono">${esc(s.git_branch)}</span>` : ''}${s.messages != null ? `<span>${esc(s.messages)} msgs</span>` : ''}${s.state === 'live' ? '' : `<span>${esc(s.state || '')}</span>`}${truthy(s.remote_control) ? '<span>remote</span>' : ''}</span></button>`;
+  c.innerHTML = `<div class="hbtns" style="margin-bottom:14px">
+      <button class="btn sm" id="pPin">${truthy(d.pinned) ? 'Unpin' : 'Pin'}</button><button class="btn sm" id="pRen">Rename</button><button class="btn sm" id="pGrp">Group</button>
+      <button class="btn sm" id="pNew">New task here</button><button class="btn sm primary" id="pBrief">Brief me</button></div>
+    <div class="panel newtask" id="ntForm" ${ntOpen ? '' : 'hidden'}></div>
+    ${br && br.text ? `<div class="panel briefbox"><span class="sub">Latest brief · ${agoT(br.ts)}${br.model ? ' · ' + esc(br.model) : ''}</span>${esc(br.text)}</div>` : '<div class="panel briefbox"><span class="sub">No brief yet. Press Brief me for a quick summary.</span></div>'}
+    ${brs.length > 1 ? `<details class="adv" style="margin-bottom:8px"><summary>Brief history (${brs.length})</summary><div class="inner">${brs.map(b => `<div class="panel briefbox" style="margin:0"><span class="sub">${agoT(b.ts)}${b.model ? ' · ' + esc(b.model) : ''}</span>${esc(b.text)}</div>`).join('')}</div></details>` : ''}
+    <div class="sec"><h2>Sessions (${ses.length})</h2>${live ? `<span class="live"><span class="pulse"></span>${live} live</span>` : ''}</div>
+    <div class="panel">${ses.length ? ses.map(sRow).join('') : '<div class="empty">No sessions yet.</div>'}</div>
+    ${arr(d.commits).length ? `<div class="sec"><h2>Commits</h2></div><div class="panel list2">${arr(d.commits).slice(0, 15).map(k => `<div class="li"><span class="mono">${esc(String(k.sha || '').slice(0, 7))}</span><span class="grow">${esc(k.subject)}</span><span class="sub">${esc(k.author || '')} · ${agoT(k.ts)}</span></div>`).join('')}</div>` : ''}
+    ${arr(d.repos).length ? `<div class="sec"><h2>Repos</h2></div><div class="panel list2">${arr(d.repos).map(r => `<div class="li"><b>${esc(nodeName(r.node_id))}</b><span class="grow mono">${esc(r.branch || '—')} <span class="sub">${esc(r.cwd || '')}</span></span>${truthy(r.dirty) ? '<span class="chip warn">uncommitted</span>' : '<span class="chip ok">clean</span>'}${+r.ahead ? `<span class="chip">&#8593;${esc(r.ahead)}</span>` : ''}${+r.behind ? `<span class="chip">&#8595;${esc(r.behind)}</span>` : ''}</div>`).join('')}</div>` : ''}`;
+  c.scrollTop = keep;
+  if (ntOpen) fillNewTask();
+  c.querySelectorAll('[data-si]').forEach(b => b.onclick = () => { const s = ses[+b.dataset.si]; if (s.tool === 'forge') openJobModal(s.session_id); else openSession(s); });
+  const patch = async body => { try { await api('/api/projects/' + enc(d.id), {method:'PATCH', body:JSON.stringify(body)}); } catch (e) { banner('Could not save: ' + e.message, 4000); } await loadProject(); pollProjects(); };
+  $('#pPin').onclick = () => patch({pinned: truthy(d.pinned) ? 0 : 1});
+  $('#pRen').onclick = () => { const v = prompt('Project name', d.name || ''); if (v && v.trim()) patch({name: v.trim()}); };
+  $('#pGrp').onclick = () => { const v = prompt('Group (empty to clear)', d.group_name || ''); if (v !== null) patch({group_name: v.trim() || null}); };
+  $('#pBrief').onclick = async e => { const b = e.currentTarget; b.disabled = true;
+    try { await api(`/api/projects/${enc(d.id)}/brief`, {method:'POST', body:'{}'}); b.textContent = 'Requested'; setTimeout(loadProject, 4000); setTimeout(loadProject, 12000); setTimeout(loadProject, 30000); }
+    catch (err) { b.disabled = false; banner('Could not request brief: ' + err.message, 4000); } };
+  $('#pNew').onclick = () => { const f = $('#ntForm'); f.hidden = !f.hidden; if (!f.hidden) { fillNewTask(); $('#ntText').focus(); } };
+}
+function fillNewTask() {
+  const d = PD, f = $('#ntForm'); if (!d || !f || f.dataset.ready) return; f.dataset.ready = '1';
+  const ids = [...new Set([...arr(d.repos).map(r => r.node_id), ...arr(d.machines)])].filter(Boolean);
+  f.innerHTML = `<label class="f sub">Machine<select id="ntNode">${ids.map(n => `<option value="${esc(n)}">${esc(nodeName(n))}</option>`).join('') || '<option value="auto">Auto</option>'}</select></label>
+    <label class="f sub">Engine<select id="ntEng"><option value="any">Any</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label>
+    <textarea id="ntText" placeholder="What should it do in this project?" aria-label="Task"></textarea>
+    <div class="row"><button class="btn primary" id="ntGo">Run task</button><span class="hint" id="ntMsg" role="status"></span></div>`;
+  $('#ntGo').onclick = async () => {
+    const node = $('#ntNode').value, prompt = $('#ntText').value.trim(); if (!prompt) { $('#ntMsg').textContent = 'Write what the task should do.'; return; }
+    const cwd = (arr(d.repos).find(r => r.node_id === node) || arr(d.sessions).find(s => s.node_id === node) || {}).cwd || null;
+    try { const r = await api('/api/jobs', {method:'POST', body:JSON.stringify({node_id: node, engine: $('#ntEng').value, prompt, cwd, full_access: false, project_id: d.id, source: 'ui'})});
+      $('#ntText').value = ''; $('#ntMsg').textContent = 'Started.'; refresh(); openJobModal(r.id); }
+    catch (err) { $('#ntMsg').textContent = 'Error: ' + err.message; }
+  };
+}
+
+/* ---------- Session view ---------- */
+function openSession(s) {
+  sess = Object.assign({}, s); pScreen = 'session'; showScreen();
+  T = {key: sess.tool + '/' + sess.session_id, cursor: null, n: 0, busy: false, lastRow: null, lastNew: 0, stick: true, msg: '', jobId: null};
+  $('#pName').textContent = oneLine(sess.title, 80) || 'Session'; $('#pSub').textContent = `${toolLbl(sess.tool)} · ${nodeName(sess.node_id)}`;
+  $('#trScroll').innerHTML = '<div class="msg system">Loading transcript…</div>'; $('#jumpBtn').hidden = true;
+  $('#trScroll').classList.toggle('show-think', showThink); $('#sPrompt').value = ''; autosize();
+  const t3 = t3Url(sess.node_id);
+  $('#sInfo').innerHTML = `<div class="row wrap"><span class="tool ${esc(sess.tool)}">${esc(toolLbl(sess.tool))}</span><span class="chip">${esc(nodeName(sess.node_id))}</span>
+      ${sess.git_branch ? `<span class="chip mono">${esc(sess.git_branch)}</span>` : ''}${sess.model ? `<span class="chip">${esc(sess.model)}</span>` : ''}<span class="spacer"></span><span class="live" id="sLive"></span></div>
+    ${sess.cwd ? `<div class="sub mono" style="word-break:break-all">${esc(sess.cwd)}</div>` : ''}
+    <div class="hbtns">${t3 ? `<a class="btn sm" href="${esc(t3)}" target="_blank" rel="noopener">Open in T3</a>` : ''}${truthy(sess.remote_control) ? '<a class="btn sm" href="https://claude.ai/code" target="_blank" rel="noopener">Open in claude.ai</a>' : ''}
+      <label class="hint" style="display:inline-flex;gap:6px;align-items:center;margin-left:auto"><input type="checkbox" id="sThink" ${showThink ? 'checked' : ''}> Show thinking</label></div>`;
+  $('#sThink').onchange = e => { showThink = e.target.checked; $('#trScroll').classList.toggle('show-think', showThink); };
+  syncPrompt(); updateLive(); watchSession(); pollTranscript();
+}
+function closeSession() { sess = null; T.key = null; pScreen = 'project'; showScreen(); $('#pLive').hidden = true; renderProject(); }
+function updateLive() {
+  if (!sess) return;
+  const el = $('#sLive'), live = sess.state === 'live', fresh = Date.now() - T.lastNew < 20000;
+  if (el) el.innerHTML = live || fresh ? `<span class="pulse"></span>Live` : `<span class="sdot ${esc(sess.state || '')}"></span>${esc(sess.state || 'unknown')}`;
+  $('#pLive').hidden = true;
+}
+function syncPrompt() {
+  if (!sess) return;
+  const can = sess.tool === 'claude' || sess.tool === 'codex', term = sess.state === 'live' && !!sess.pid;
+  const base = !can ? `Continuing ${toolLbl(sess.tool)} sessions from here isn't supported. Use Open in T3.` : term ? `This session is open in a terminal on ${nodeName(sess.node_id)}. Continue is off so two writers don't clash.` : '';
+  const n = $('#sNote'); n.textContent = T.msg || base;
+  if (T.jobId) { n.appendChild(document.createTextNode(' ')); const a = document.createElement('a'); a.href = '#'; a.textContent = 'View job'; a.onclick = e => { e.preventDefault(); openJobModal(T.jobId); }; n.appendChild(a); }
+  $('#sSend').disabled = !can || term; $('#sTake').hidden = !(can && term); $('#sPrompt').disabled = !can;
+  $('#sPrompt').placeholder = can ? (term ? 'Type a follow-up, then Take over anyway…' : 'Send a follow-up to this session…') : 'Not available for this session type';
+}
+function autosize() { const t = $('#sPrompt'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, innerHeight * .3) + 'px'; }
+$('#sPrompt').oninput = autosize;
+$('#sPrompt').onfocus = () => setTimeout(() => { if (T.stick) toBottom(); }, 300);
+$('#sPrompt').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); (sess && sess.state === 'live' && sess.pid ? $('#sTake') : $('#sSend')).click(); } };
+$('#sSend').onclick = () => sendContinue(false);
+$('#sTake').onclick = () => sendContinue(true);
+async function sendContinue(force) {
+  if (!sess) return;
+  const text = $('#sPrompt').value.trim(); if (!text) { $('#sPrompt').focus(); return; }
+  if (force && !confirm(`This session is live in a terminal on ${nodeName(sess.node_id)}. Take over and send anyway? Both writers may conflict.`)) return;
+  const body = {node_id: sess.node_id, engine: sess.tool, prompt: text, cwd: sess.cwd || null, full_access: $('#sFull').checked, resume: {tool: sess.tool, session_id: sess.session_id}, project_id: pOpen, source: 'ui'};
+  if (force) body.force = true;
+  $('#sSend').disabled = $('#sTake').disabled = true;
+  try { const r = await api('/api/jobs', {method:'POST', body:JSON.stringify(body)}); $('#sPrompt').value = ''; autosize(); T.msg = 'Sent. The reply streams in below.'; T.jobId = r && r.id; setTimeout(pollTranscript, 1500); }
+  catch (e) { T.jobId = null; if (e.status === 409) { sess.state = 'live'; sess.pid = sess.pid || 1; T.msg = ''; } else T.msg = 'Could not send: ' + e.message; }
+  $('#sTake').disabled = false; syncPrompt();
+}
+async function watchSession() {
+  if (!sess || document.hidden) return;
+  try { await api(`/api/sessions/${enc(sess.tool)}/${enc(sess.session_id)}/watch`, {method:'POST', body:'{}'}); } catch (e) {}
+}
+const atBottom = () => { const t = $('#trScroll'); return t.scrollHeight - t.scrollTop - t.clientHeight < 60; };
+const toBottom = () => { const t = $('#trScroll'); t.scrollTop = t.scrollHeight; $('#jumpBtn').hidden = true; };
+$('#trScroll').onscroll = () => { T.stick = atBottom(); if (T.stick) $('#jumpBtn').hidden = true; };
+$('#jumpBtn').onclick = () => { toBottom(); T.stick = true; };
+async function pollTranscript() {
+  if (!sess || document.hidden || T.busy) return;
+  const key = T.key, s = sess; T.busy = true;
+  try {
+    const r = await api(`/api/sessions/${enc(s.tool)}/${enc(s.session_id)}/transcript${T.cursor != null ? '?since=' + enc(T.cursor) : ''}`);
+    if (key === T.key) applyTranscript(r);
+  } catch (e) { if (key === T.key && !T.n) $('#trScroll').innerHTML = '<div class="msg system">Waiting for the machine to send this transcript…</div>'; }
+  finally { T.busy = false; }
+}
+function applyTranscript(r) {
+  const evs = Array.isArray(r) ? r : arr(r && r.events), cur = r && !Array.isArray(r) ? (r.cursor ?? r.next) : null;
+  if (r && r.session && sess) { Object.assign(sess, r.session); syncPrompt(); }
+  const tr = $('#trScroll'), stick = T.stick;
+  if (cur == null) {                         // hub gave no cursor: always replace
+    if (evs.length === T.n && T.n) { updateLive(); return; }
+    tr.innerHTML = ''; T.n = 0; T.lastRow = null;
+  } else if (r.reset) { tr.innerHTML = ''; T.n = 0; T.lastRow = null; }
+  if (cur != null) T.cursor = cur;
+  if (!T.n && !evs.length) { tr.innerHTML = `<div class="msg system">${r && r.done ? 'No messages in this session.' : 'Waiting for the machine to send this transcript…'}</div>`; updateLive(); return; }
+  if (!T.n && evs.length) tr.innerHTML = '';
+  if (evs.length) { appendEvents(evs); T.n += evs.length; T.lastNew = Date.now(); if (T.n > 1500) pruneTranscript(); }
+  updateLive();
+  if (evs.length) { if (stick) toBottom(); else $('#jumpBtn').hidden = false; }
+}
+function pruneTranscript() { const tr = $('#trScroll'); while (tr.children.length > 900) tr.removeChild(tr.firstChild); T.lastRow = null; T.n = 900; }
+function fmtText(t) {
+  return String(t ?? '').split('```').map((part, i) => {
+    if (i % 2) return `<pre class="code mono">${esc(part.replace(/^[\w+#.-]*\n/, '').replace(/\n+$/, ''))}</pre>`;
+    return esc(part.replace(/^\n+|\n+$/g, ''));
+  }).join('');
+}
+function appendEvents(evs) {
+  const tr = $('#trScroll'), add = html => { const w = document.createElement('div'); w.innerHTML = html; const el = w.firstElementChild; tr.appendChild(el); return el; };
+  evs.forEach(e => {
+    if (!e || typeof e !== 'object') return;
+    const role = e.role, kind = e.kind || 'text', text = String(e.text ?? '');
+    if (kind === 'thinking') { if (text) add(`<div class="think">${esc(text)}</div>`); return; }
+    if (role === 'tool' || kind === 'tool_call' || kind === 'tool_result') {
+      const nm = e.tool_name || (kind === 'tool_result' ? 'result' : 'tool');
+      const chip = `<details class="tchip"><summary><span class="tn">${kind === 'tool_result' && e.tool_name ? '&rarr; ' : ''}${esc(nm)}</span><span class="tl">${esc(oneLine(text)) || '&nbsp;'}</span></summary>${text ? `<pre>${esc(text)}</pre>` : ''}</details>`;
+      if (!T.lastRow || !T.lastRow.isConnected) T.lastRow = add('<div class="toolrow"></div>');
+      const w = document.createElement('div'); w.innerHTML = chip; T.lastRow.appendChild(w.firstElementChild); return;
+    }
+    if (!text.trim()) return;
+    T.lastRow = null;
+    const cls = role === 'user' ? 'user' : role === 'assistant' ? 'assistant' : 'system';
+    add(`<div class="msg ${cls}">${fmtText(text)}${cls === 'system' ? '' : `<span class="ts">${e.ts ? clock(tsec(e.ts)) : ''}</span>`}</div>`);
+  });
+}
+
+/* ---------- Pair phone (t3 pair as a user-lane shell job) ---------- */
+let pairJob = null, pairTimer = null;
+function closePair() { pairJob = null; clearTimeout(pairTimer); $('#pairModal').classList.remove('open'); }
+$('#pairClose').onclick = closePair;
+$('#pairModal').onclick = e => { if (e.target.id === 'pairModal') closePair(); };
+async function openPair(nid) {
+  $('#pairTitle').textContent = 'Pair phone · ' + nodeName(nid);
+  $('#pairBody').innerHTML = '<div class="empty">Asking the machine for a pairing link…</div>'; $('#pairModal').classList.add('open'); $('#pairClose').focus();
+  try {
+    const r = await api('/api/jobs', {method:'POST', body:JSON.stringify({node_id: nid, engine: 'shell', lane: 'user', prompt: 't3 pair --ttl 10m', full_access: false, source: 'ui'})});
+    pairJob = r.id; pairPoll(r.id, 0);
+  } catch (e) { $('#pairBody').innerHTML = `<div class="empty">Could not start pairing: ${esc(e.message)}</div>`; }
+}
+async function pairPoll(id, tries) {
+  if (id !== pairJob) return;
+  const j = await api('/api/jobs/' + enc(id)).catch(() => null); if (id !== pairJob) return;
+  const out = String(j && j.output || ''), m = out.match(/https?:\/\/[^\s"'<>)]+/), done = j && ['done', 'failed', 'cancelled'].includes(j.status);
+  if (m) {
+    const url = m[0];
+    $('#pairBody').innerHTML = `<p class="sub">Open this link on your phone (it must reach the machine over LAN or Tailscale). Valid about 10 minutes, from ${clock(now())}.</p>
+      <a class="pairurl mono" href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a>
+      <div class="row"><button class="btn primary" id="pairCopy">Copy link</button><a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Open</a></div>`;
+    $('#pairCopy').onclick = e => copyText(url).then(() => settle(e.target, 'Copied'), () => settle(e.target, 'Copy failed'));
+  } else if (done || tries > 40) {
+    $('#pairBody').innerHTML = `<p>${j && j.status === 'failed' ? 'Pairing failed.' : 'No pairing link in the output.'} Is T3 installed and running on this machine?</p>${out ? `<pre class="log">${esc(out)}</pre>` : ''}`;
+  } else { pairTimer = setTimeout(() => pairPoll(id, tries + 1), 1500); }
+}
+
+/* ---------- Scheduler strip (Jobs tab) ---------- */
+let SCH = null, schOk = null, schRetry = 0;
+async function refreshScheduler() {
+  if (document.hidden || (schOk === false && now() < schRetry)) return;
+  try { SCH = await api('/api/scheduler'); schOk = true; }
+  catch (e) { if (e.status === 404 || e.status === 405) { schOk = false; schRetry = now() + 60; SCH = null; } else return; }
+  renderSched();
+}
+function renderSched() {
+  const el = $('#sched'); if (!el) return;
+  const cds = Object.entries((SCH && SCH.cooldowns) || {}).map(([k, v]) => [k, tsec(v && typeof v === 'object' ? v.until : v), v && v.reason]).filter(x => x[1] && x[1] > now());
+  const q = SCH && +SCH.queue_depth || 0;
+  el.hidden = !cds.length && !q; if (el.hidden) return;
+  el.innerHTML = `<b>Scheduler</b>${q ? `<span class="chip">${q} queued</span>` : ''}` + cds.map(([k, u, why]) =>
+    `<span class="chip warn" title="${esc(why || '')}">${esc(k)} cooling down until ${clock(u)}</span><button class="btn sm" data-cd="${esc(k)}">Clear ${esc(k)}</button>`).join('');
+  el.querySelectorAll('[data-cd]').forEach(b => b.onclick = async () => {
+    try { await api('/api/scheduler/cooldowns/' + enc(b.dataset.cd), {method:'DELETE'}); } catch (e) { banner('Could not clear: ' + e.message, 4000); }
+    refreshScheduler(); refresh(); });
+}
+
+/* keep the session pane above the on-screen keyboard */
+function fitVV() {
+  const vv = window.visualViewport, r = document.documentElement.style;
+  r.setProperty('--vvh', (vv ? vv.height : innerHeight) + 'px'); r.setProperty('--vvt', (vv ? vv.offsetTop : 0) + 'px');
+  if (pScreen === 'session' && T.stick) toBottom();
+}
+if (window.visualViewport) { visualViewport.addEventListener('resize', fitVV); visualViewport.addEventListener('scroll', fitVV); }
+addEventListener('resize', fitVV); fitVV();
+
+/* boot + polling (all pause while the tab is hidden) */
+const startView = (location.hash || '').slice(1);
+view = TABS_TOP.some(t => t[0] === startView) ? startView : 'projects';
+setView(view); syncFull(); syncEngine();
+addEventListener('hashchange', () => { const v = location.hash.slice(1); if (v !== view && TABS_TOP.some(t => t[0] === v)) setView(v); });
+refresh(); refreshHealth(); pollProjects(); refreshScheduler();
+setInterval(refresh, 4000);
+setInterval(refreshHealth, 10000);
+setInterval(() => loadJob(false), 2000);
+setInterval(pollProjects, 6000);
+setInterval(pollTranscript, 2000);
+setInterval(watchSession, 10000);
+setInterval(refreshScheduler, 8000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(); refreshHealth(); loadJob(false); pollProjects(); pollTranscript(); watchSession(); refreshScheduler(); } });
+</script>
+</body>
+</html>

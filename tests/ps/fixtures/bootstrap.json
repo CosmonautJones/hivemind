@@ -1,0 +1,12 @@
+{
+  "ui_token": "ui-FAKE-test-token",
+  "agent_token": "agent-FAKE-test-token",
+  "cluster_token": "cluster-FAKE-test-token",
+  "bundle_version": "SET-BY-TEST",
+  "bundle_sha256": "SET-BY-TEST",
+  "peers": [
+    { "id": "atlas", "priority": 2, "urls": ["http://atlas.example.ts.net:8787", "http://100.64.0.2:8787"], "version": "2.0.0", "role": "standby" },
+    { "id": "forge-01", "priority": 1, "urls": ["http://forge-01.example.ts.net:8787", "http://100.64.0.1:8787", "http://192.168.1.10:8787"], "version": "2.0.0", "role": "leader" },
+    { "id": "nova", "priority": 3, "urls": ["http://nova.example.ts.net:8787"], "version": "2.0.0", "role": "standby" }
+  ]
+}

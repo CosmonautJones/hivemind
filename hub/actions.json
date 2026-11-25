@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "note": "Single source of truth for system-lane maintenance actions. The hub validates jobs against it (hub/app.py) and the SYSTEM agent re-validates before running (agent/actions.ps1). Arg schema: type string|int, required, pattern (full match, case-sensitive), enum, min/max (int), max_len (string), default, not_in. Strings never contain control characters.",
+  "actions": [
+    {
+      "name": "winget_install",
+      "description": "Install a package with winget (silent, agreements accepted).",
+      "destructive": false,
+      "args": {
+        "id": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9.\\-_]*$", "max_len": 128, "label": "Package id (e.g. Git.Git)"},
+        "scope": {"type": "string", "required": false, "enum": ["machine", "user"], "label": "Scope"}
+      }
+    },
+    {
+      "name": "winget_upgrade",
+      "description": "Upgrade one winget package, or all packages when no id is given.",
+      "destructive": false,
+      "args": {
+        "id": {"type": "string", "required": false, "pattern": "^[A-Za-z0-9][A-Za-z0-9.\\-_]*$", "max_len": 128, "label": "Package id (empty = all)"}
+      }
+    },
+    {
+      "name": "npm_global_install",
+      "description": "npm install -g <package> (machine-wide when run as SYSTEM).",
+      "destructive": false,
+      "args": {
+        "package": {"type": "string", "required": true, "pattern": "^(@[a-z0-9][a-z0-9\\-_.]*/)?[a-z0-9][a-z0-9\\-_.]*(@[A-Za-z0-9.\\-_]+)?$", "max_len": 214, "label": "Package (e.g. @anthropic-ai/claude-code@latest)"}
+      }
+    },
+    {
+      "name": "restart_task",
+      "description": "Stop and start a scheduled task.",
+      "destructive": false,
+      "args": {
+        "name": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9 _\\-]+$", "max_len": 128, "label": "Task name"}
+      }
+    },
+    {
+      "name": "restart_service",
+      "description": "Restart a Windows service.",
+      "destructive": false,
+      "args": {
+        "name": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9 _\\-]+$", "max_len": 128, "label": "Service name"}
+      }
+    },
+    {
+      "name": "reboot",
+      "description": "Reboot the machine after a delay (shutdown /r).",
+      "destructive": true,
+      "args": {
+        "delay_s": {"type": "int", "required": false, "min": 0, "max": 3600, "default": 60, "label": "Delay (seconds)"}
+      }
+    },
+    {
+      "name": "ensure_task",
+      "description": "Register (or update) a scheduled task that starts at startup/logon, and start it. User tasks run as the node's configured user (S4U).",
+      "destructive": true,
+      "args": {
+        "name": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9 _\\-]+$", "max_len": 128, "not_in": ["ForgeHub", "ForgeAgent", "ForgeWatchdog", "ForgeSystemAgent"], "label": "Task name"},
+        "command": {"type": "string", "required": true, "pattern": "^[^\"]+$", "max_len": 260, "label": "Program (path or exe name)"},
+        "args": {"type": "string", "required": false, "max_len": 2000, "label": "Arguments"},
+        "run_as": {"type": "string", "required": true, "enum": ["system", "user"], "label": "Run as"},
+        "trigger": {"type": "string", "required": true, "enum": ["startup", "logon"], "label": "Trigger"}
+      }
+    }
+  ]
+}

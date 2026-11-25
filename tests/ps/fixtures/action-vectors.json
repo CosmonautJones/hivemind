@@ -1,0 +1,43 @@
+{
+  "note": "Shared by tests/test_admin.py (hub validator) and tests/ps/run-tests.ps1 (agent validator): both must agree.",
+  "valid": [
+    {"action": "winget_install", "args": {"id": "Git.Git"}, "expect": {"id": "Git.Git"}},
+    {"action": "winget_install", "args": {"id": "Python.Python.3_12-x", "scope": "machine"}, "expect": {"id": "Python.Python.3_12-x", "scope": "machine"}},
+    {"action": "winget_upgrade", "args": {}, "expect": {}},
+    {"action": "winget_upgrade", "args": {"id": ""}, "expect": {}},
+    {"action": "npm_global_install", "args": {"package": "@anthropic-ai/claude-code@2.1.0"}, "expect": {"package": "@anthropic-ai/claude-code@2.1.0"}},
+    {"action": "restart_task", "args": {"name": "T3 Code Server"}, "expect": {"name": "T3 Code Server"}},
+    {"action": "restart_service", "args": {"name": "wuauserv"}, "expect": {"name": "wuauserv"}},
+    {"action": "reboot", "args": {}, "expect": {"delay_s": 60}},
+    {"action": "reboot", "args": {"delay_s": 3600}, "expect": {"delay_s": 3600}},
+    {"action": "ensure_task", "args": {"name": "T3Code", "command": "C:\\Program Files\\nodejs\\node.exe", "args": "C:\\t3\\server.js --port 3773", "run_as": "user", "trigger": "logon"},
+     "expect": {"name": "T3Code", "command": "C:\\Program Files\\nodejs\\node.exe", "args": "C:\\t3\\server.js --port 3773", "run_as": "user", "trigger": "logon"}}
+  ],
+  "invalid": [
+    {"action": "nope", "args": {}},
+    {"action": "winget_install", "args": {}},
+    {"action": "winget_install", "args": {"id": "Git.Git & calc"}},
+    {"action": "winget_install", "args": {"id": "Git.Git\"; calc"}},
+    {"action": "winget_install", "args": {"id": "Git.Git", "scope": "Machine"}},
+    {"action": "winget_install", "args": {"id": "Git.Git", "silent": false}},
+    {"action": "winget_install", "args": {"Id": "Git.Git"}},
+    {"action": "winget_upgrade", "args": {"id": "--all"}},
+    {"action": "npm_global_install", "args": {"package": "Left-Pad"}},
+    {"action": "npm_global_install", "args": {"package": "x;calc"}},
+    {"action": "npm_global_install", "args": {"package": "--global"}},
+    {"action": "npm_global_install", "args": {"package": "@-x/y"}},
+    {"action": "winget_install", "args": {"id": "-h"}},
+    {"action": "npm_global_install", "args": {"package": "--prefix=C:\\evil"}},
+    {"action": "restart_task", "args": {"name": "..\\x"}},
+    {"action": "restart_task", "args": {"name": "x\ny"}},
+    {"action": "restart_service", "args": {"name": "svc$(calc)"}},
+    {"action": "reboot", "args": {"delay_s": 3601}},
+    {"action": "reboot", "args": {"delay_s": "10"}},
+    {"action": "reboot", "args": {"delay_s": true}},
+    {"action": "ensure_task", "args": {"name": "FORGEAGENT", "command": "x.exe", "run_as": "system", "trigger": "startup"}},
+    {"action": "ensure_task", "args": {"name": "T", "command": "x.exe", "run_as": "SYSTEM", "trigger": "startup"}},
+    {"action": "ensure_task", "args": {"name": "T", "command": "a\" & calc", "run_as": "system", "trigger": "startup"}},
+    {"action": "ensure_task", "args": {"name": "T", "command": "x.exe", "args": "a\tb", "run_as": "system", "trigger": "startup"}},
+    {"action": "ensure_task", "args": {"name": "T", "command": "x.exe", "run_as": "system"}}
+  ]
+}
