@@ -1,12 +1,12 @@
 # SYSTEM-lane smoke test, run as the CURRENT user (never elevated, never SYSTEM): the worker started with
-# -Child -Lane system reports a minimal body to a fake hub on 18800-18899, runs an allowlisted action in dry-run
+# -Child -Lane system reports a minimal body to a fake hub on 19000-19099, runs an allowlisted action in dry-run
 # mode (agent-config action_dry_run), refuses an action whose args the hub would have rejected, runs a harmless
 # admin script, refuses a user-lane job, writes data\agent-system.log and sys-<id> job dirs, and never rewrites
 # agent-config.json. Everything lives in a scratch dir.
-# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\agent-system-smoke.ps1 [-Port 18851]
-param([string]$Scratch = (Join-Path ([IO.Path]::GetTempPath()) "forge-sys-smoke-$([guid]::NewGuid().ToString('n').Substring(0,8))"), [int]$Port = 18851)
+# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\agent-system-smoke.ps1 [-Port 19053]
+param([string]$Scratch = (Join-Path ([IO.Path]::GetTempPath()) "forge-sys-smoke-$([guid]::NewGuid().ToString('n').Substring(0,8))"), [int]$Port = 19053)
 $ErrorActionPreference = 'Stop'
-if ($Port -lt 18800 -or $Port -gt 18899) { throw 'test servers use ports 18800-18899 only' }
+if ($Port -lt 19000 -or $Port -gt 19099) { throw 'test servers use ports 19000-19099 only' }
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $data = Join-Path $Scratch 'data'; $wr = Join-Path $Scratch 'work'; $log = Join-Path $Scratch 'posts.jsonl'
 New-Item -ItemType Directory -Force $data, $wr | Out-Null
@@ -17,7 +17,7 @@ $cfg = @{ node_id = 'smoke-node'; local_hub = "http://127.0.0.1:$Port"; hub_urls
 $cfgPath = Join-Path $data 'agent-config.json'
 [IO.File]::WriteAllText($cfgPath, (ConvertTo-Json -InputObject $cfg), $enc)
 $cfgBefore = [IO.File]::ReadAllText($cfgPath)
-$py = (Get-Command python.exe -ErrorAction Stop).Source
+$py = if ($env:FORGE_TEST_PYTHON) { $env:FORGE_TEST_PYTHON } else { (Get-Command python.exe -ErrorAction Stop).Source }
 $srv = Start-Process -FilePath $py -ArgumentList '-I', "`"$(Join-Path $PSScriptRoot 'fake_system_hub.py')`"", $Port, "`"$wr`"", "`"$log`"" -PassThru -WindowStyle Hidden
 $agent = $null
 function Get-Posts { if (Test-Path $log) { @(Get-Content $log | ConvertFrom-Json) } else { @() } }
@@ -36,7 +36,7 @@ try {
     $keys = @($r0.PSObject.Properties.Name | Sort-Object)
     $checks = [ordered]@{
         'reports carry lane=system + agent token'           = ($reports.Count -ge 2 -and $r0.lane -eq 'system' -and $reports[0].token -eq 'smoke-token')
-        'report body is minimal (no metrics/procs/logs)'    = (($keys -join ',') -eq 'agent_version,boot,bundle_version,capacity,lane,node_id,running')
+        'report body is minimal (no metrics/procs/logs)'    = (($keys -join ',') -eq 'agent_time,agent_version,boot,bundle_version,capacity,lane,node_id,running')
         'capacity never above 1'                            = (@($reports | Where-Object { $_.body.capacity -gt 1 }).Count -eq 0)
         'action dry-run printed the winget argv'            = ($actText -match [regex]::Escape('> winget install --id Git.Git -e --silent --accept-source-agreements --accept-package-agreements') -and $actText -match 'dry run: not executed')
         'action job done, exit 0'                           = ($act -and $act.body.status -eq 'done' -and $act.body.exit_code -eq 0)

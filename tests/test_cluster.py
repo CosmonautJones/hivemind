@@ -154,7 +154,8 @@ def test_sync_pages_until_caught_up(fleet, monkeypatch):
 def test_sync_requires_cluster_token(fleet):
     assert fleet.client("a").get("/cluster/sync?since=0", headers=AGENT).status_code == 401
     body = fleet.client("a").get("/cluster/sync?since=-1", headers=Fleet.cluster).json()
-    assert set(body["tables"]) == {"peers", "nodes", "jobs", "events", "settings"}
+    assert {"peers", "nodes", "jobs", "events", "settings"} <= set(body["tables"])      # Phase 2 adds more tables
+    assert {"projects", "project_alias", "sessions", "repos", "briefs", "cooldowns", "bad_versions", "leases"}         <= set(body["tables"]) and "transcripts" not in body["tables"]
 
 
 # ---------------------------------------------------------------- forwarding

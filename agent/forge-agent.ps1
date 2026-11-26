@@ -17,6 +17,19 @@
 #                 agent-config.json. Disabled per node with agent-config.json "allow_admin": false;
 #                 "action_dry_run": true prints action commands instead of running them (tests).
 #
+# 2.2 (SPEC-phase2, user lane only):
+#   - session index: every 30 s, metadata of Claude Code / Codex sessions (agent\sessions.ps1) -> POST /api/agent/sessions;
+#     every 5 min git status + last commits of known repos -> POST /api/agent/commits.
+#   - live transcripts: report response `watch: [{tool, session_id, since}]` -> POST /api/agent/transcript.
+#   - resume jobs (job.resume = {tool, session_id}), engine `ollama` (agent\ollama-job.ps1, REST to 127.0.0.1:11434),
+#     job.model for claude/codex/ollama.
+#   - keep-alive services (agent\services.ps1; replaces the 2.1.2 T3 autostart) -> metrics.services.
+#   Hub endpoints that answer 404 (older hubs) are retried every 10 min.
+#   Jobs: default cwd <work_root>\scratch\<jobid>; claude --permission-mode acceptEdits / codex --sandbox workspace-write
+#   unless full_access; job.timeout_s (default 7200) kills the process tree; running jobs are persisted to
+#   data\running.json (system lane: running-system.json) and re-attached by a restarted worker; every report carries
+#   running (job ids) + agent_time (epoch s). Agent status lines of brief jobs start with '[forge] ' (hub brief filter).
+#
 # Dot-source for tests without side effects:  . .\forge-agent.ps1 -NoRun
 param(
     [string]$ConfigPath = (Join-Path $env:ProgramData 'Forge\data\agent-config.json'),
@@ -25,8 +38,13 @@ param(
     [switch]$NoRun
 )
 
-$AgentVersion = '2.1.4'
+$AgentVersion = '2.2.0'
 $LocalHub = 'http://127.0.0.1:8787'
+
+# 2.2 helpers (functions only). Missing when this file is run on its own (GET /agent/v2/forge-agent.ps1):
+# then sessions/transcripts/services are simply off.
+$Has22Helpers = $true
+foreach ($h in 'sessions.ps1', 'services.ps1') { $hp = Join-Path $PSScriptRoot $h; if (Test-Path -LiteralPath $hp) { . $hp } else { $Has22Helpers = $false } }
 
 # ======================= pure helpers (unit-tested) =======================
 
@@ -121,11 +139,186 @@ function Test-AllowAdmin($Config) {
 
 function Test-SafeJobId([string]$Id) { $Id -match '^[A-Za-z0-9_-]{1,64}$' }
 
+# Values that end up on a cmd.exe command line must be boring.
+function Test-SafeSessionId([string]$Id) { "$Id" -match '^[A-Za-z0-9][A-Za-z0-9-]{7,63}$' }
+function Test-SafeModelName([string]$Name) { "$Name" -match '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$' }
+function Test-SafeLocalUrl([string]$Url) { "$Url" -match '^https?://[A-Za-z0-9.\-]+(:\d{1,5})?/?$' }
+
+# The cmd.exe inner command for a user-lane job (the caller appends the output redirect).
+# Returns @{inner; write ('prompt'|'ps1'); redirect ('out' = stdout+stderr -> out.log | 'err' = the runner
+# writes out.log itself, cmd output -> err.log); resume_id} or @{error}.
+#   claude:        [clear API key env] "claude" -p [--resume <id>] --permission-mode <mode> --output-format text [--model m] < prompt
+#                  mode = acceptEdits (full_access: bypassPermissions)
+#   codex:         "codex" exec --skip-git-repo-check <sandbox> [-m m] [resume <id>] - < prompt
+#                  sandbox = --sandbox workspace-write (full_access: --dangerously-bypass-approvals-and-sandbox)
+#                  (exec options must precede `resume`: `codex exec resume` rejects --sandbox)
+#   shell:         powershell.exe -File task.ps1
+#   ollama:        powershell.exe -File agent\ollama-job.ps1 -PromptFile .. -Model .. -BaseUrl .. -OutFile ..
+#                  text jobs only (job.kind missing = text, for hubs that do not send kind)
+function Get-JobCommand {
+    param($Job, [hashtable]$Tools = @{}, $Config, [string]$PromptFile, [string]$JobDir, [string]$AgentDir, [string]$OutFile)
+    $engine = [string]$Job.engine
+    $rid = $null
+    $resume = $Job.resume
+    if ($resume) {
+        $rtool = [string]$resume.tool; $rid = [string]$resume.session_id
+        if (-not $engine) { $engine = $rtool }
+        if ($rtool -and $rtool -ne $engine) { return @{ error = "resume tool '$rtool' does not match engine '$engine'" } }
+        if (@('claude', 'codex') -notcontains $engine) { return @{ error = "engine '$engine' cannot resume sessions" } }
+        if (-not (Test-SafeSessionId $rid)) { return @{ error = 'bad resume session id' } }
+        $rid = $rid.ToLowerInvariant()
+    }
+    $model = [string]$Job.model
+    if ($model -and -not (Test-SafeModelName $model)) { return @{ error = "bad model name '$model'" } }
+    $missing = @{ error = "engine '$engine' is not installed on this machine" }
+    switch ($engine) {
+        'claude' {
+            if (-not $Tools['claude']) { return $missing }
+            $mode = if ($Job.full_access) { 'bypassPermissions' } else { 'acceptEdits' }
+            # Use the claude.ai subscription login unless this node opts into API-key billing.
+            $auth = if ($Config -and $Config.claude_use_api_key) { '' } else { 'set "ANTHROPIC_API_KEY=" && set "ANTHROPIC_AUTH_TOKEN=" && ' }
+            $res = if ($rid) { " --resume $rid" } else { '' }
+            $m = if ($model) { " --model $model" } else { '' }
+            return @{ inner = "$auth`"$($Tools['claude'])`" -p$res --permission-mode $mode --output-format text$m < `"$PromptFile`""; write = 'prompt'; redirect = 'out'; resume_id = $rid }
+        }
+        'codex' {
+            if (-not $Tools['codex']) { return $missing }
+            $sb = if ($Job.full_access) { '--dangerously-bypass-approvals-and-sandbox' } else { '--sandbox workspace-write' }
+            $m = if ($model) { " -m $model" } else { '' }
+            $sub = if ($rid) { " resume $rid" } else { '' }
+            return @{ inner = "`"$($Tools['codex'])`" exec --skip-git-repo-check $sb$m$sub - < `"$PromptFile`""; write = 'prompt'; redirect = 'out'; resume_id = $rid }
+        }
+        'shell' {
+            return @{ inner = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $JobDir 'task.ps1')`""; write = 'ps1'; redirect = 'out' }
+        }
+        'ollama' {
+            $kind = "$($Job.kind)"
+            if ($kind -and $kind -ne 'text') { return @{ error = "engine 'ollama' runs text jobs only (job kind '$kind')" } }
+            $url =if ($Config -and $Config.ollama_url) { [string]$Config.ollama_url } else { 'http://127.0.0.1:11434' }
+            if (-not $Tools['ollama'] -and -not ($Config -and $Config.ollama_url)) { return $missing }
+            if (-not (Test-SafeLocalUrl $url)) { return @{ error = "bad ollama_url '$url'" } }
+            $mdl = if ($model) { $model } elseif ($Config -and $Config.ollama_model -and (Test-SafeModelName ([string]$Config.ollama_model))) { [string]$Config.ollama_model } else { 'qwen2.5:14b' }
+            $to = if ($Config -and $Config.ollama_timeout_s) { " -TimeoutSec $([int]$Config.ollama_timeout_s)" } else { '' }
+            return @{ inner = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $AgentDir 'ollama-job.ps1')`" -PromptFile `"$PromptFile`" -Model $mdl -BaseUrl $($url.TrimEnd('/')) -OutFile `"$OutFile`"$to"
+                      write = 'prompt'; redirect = 'err' }
+        }
+    }
+    $missing
+}
+
 # Report body for the SYSTEM lane: deliberately minimal (no metrics/procs/logs).
+# running = ids of the jobs this lane is running (re-attached ones included); agent_time = epoch seconds (float).
 function New-SystemLaneReport {
-    param([string]$NodeId, [int]$Capacity, [int]$Running, [bool]$Boot, [string]$AgentVersion, [string]$BundleVersion)
-    @{ node_id = $NodeId; lane = 'system'; capacity = $Capacity; running = $Running; boot = $Boot
-       agent_version = $AgentVersion; bundle_version = $BundleVersion }
+    param([string]$NodeId, [int]$Capacity, [string[]]$Running = @(), [bool]$Boot, [string]$AgentVersion, [string]$BundleVersion, [double]$AgentTime = 0)
+    @{ node_id = $NodeId; lane = 'system'; capacity = $Capacity; running = @($Running | Where-Object { $_ }); boot = $Boot
+       agent_version = $AgentVersion; bundle_version = $BundleVersion; agent_time = $AgentTime }
+}
+
+function Get-AgentEpoch { [Math]::Round([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0, 3) }
+
+# Agent status lines in a job's output. Brief jobs (source 'brief') get the '[forge] ' prefix the hub's brief
+# noise filter drops, so the stored brief is the model's text only (no node name / scratch path).
+function Format-AgentJobLine($Job, [string]$NodeId, [string]$Text) {
+    $tag = if ($Job -and "$($Job.source)" -eq 'brief') { '[forge] ' } else { '' }
+    "$tag[$NodeId] $Text`n"
+}
+
+# job.timeout_s (seconds, > 0) or the default (2 h).
+function Get-JobTimeoutSec($Job, [int]$Default = 7200) {
+    $t = 0.0
+    if ($Job -and $null -ne $Job.timeout_s -and [double]::TryParse("$($Job.timeout_s)", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$t) -and $t -ge 1) { return [int][Math]::Min($t, [int]::MaxValue) }
+    $Default
+}
+
+function Test-JobTimedOut([double]$Started, [double]$Now, [int]$TimeoutSec) { ($TimeoutSec -gt 0) -and ($Started -gt 0) -and (($Now - $Started) -ge $TimeoutSec) }
+
+# Job dir under <work_root>\jobs: <id> (user lane) or sys-<id> (system lane).
+function Get-JobDirName([string]$Id, [string]$Lane = 'user') { if ($Lane -eq 'system') { "sys-$Id" } else { $Id } }
+
+# data\running.json (user lane) / data\running-system.json: what a restarted worker needs to re-attach to its
+# still-running jobs. No paths are stored: they are derived from the job id, so an edited file cannot point the
+# agent at other files.
+function ConvertTo-RunningRecords([hashtable]$Running) {
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($id in @($Running.Keys | Sort-Object)) {
+        $r = $Running[$id]
+        $out.Add([ordered]@{ id = [string]$id; pid = [int]$r.pid; engine = [string]$r.engine; offset = [long]$r.offset; erroffset = [long]$r.erroffset
+                             has_err = [bool]$r.err; started = [double]$r.started; timeout_s = [int]$r.timeout_s; source = [string]$r.source
+                             resume_tool = [string]$r.resume_tool; resume_id = [string]$r.resume_id; cancelled = [bool]$r.cancelled })
+    }
+    , $out.ToArray()
+}
+
+# Records + live processes (@{pid -> @{pid; cmd}}) -> @{attach = records whose process still runs THIS job; gone = the rest}.
+# "Still runs this job" = same pid AND its command line names the job's own dir (guards pid reuse and edited files).
+function Select-ReattachJobs {
+    param([object[]]$Records = @(), [hashtable]$Procs = @{}, [string]$JobsDir, [string]$Lane = 'user')
+    $attach = New-Object System.Collections.Generic.List[object]; $gone = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($r in @($Records)) {
+        if (-not $r -or -not (Test-SafeJobId ([string]$r.id)) -or $seen.ContainsKey([string]$r.id)) { continue }
+        $seen[[string]$r.id] = $true
+        $p = $null; if ($r.pid) { $p = $Procs[[int]$r.pid] }
+        $dir = (Join-Path $JobsDir (Get-JobDirName ([string]$r.id) $Lane)) + '\'
+        if ($p -and "$($p.cmd)".IndexOf($dir, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $attach.Add($r) } else { $gone.Add($r) }
+    }
+    @{ attach = $attach.ToArray(); gone = $gone.ToArray() }
+}
+
+# ---- live transcripts (SPEC C), factored out of the main loop so it can be tested with a stubbed sender ----
+function New-TranscriptState { @{ names = @{}; missing = @{}; last = @{}; rot = 0 } }
+
+# Up to Take watches per cycle, rotating through the list so a 5th+ watched session is served too.
+function Select-RotatingWatches([object[]]$Watches = @(), [int]$Offset = 0, [int]$Take = 4) {
+    $ws = @($Watches | Where-Object { $_ }); $n = $ws.Count
+    if ($n -eq 0) { return @{ items = @(); next = 0 } }
+    $o = $Offset % $n; if ($o -lt 0) { $o += $n }
+    $k = [Math]::Min($Take, $n)
+    $items = @(for ($i = 0; $i -lt $k; $i++) { $ws[($o + $i) % $n] })
+    @{ items = $items; next = (($o + $k) % $n) }
+}
+
+# The since to read from. The hub echoes the cursor of the last batch it stored; if a watch still carries the
+# since of a batch we already POSTed (stale watch list, hub switch), continue after that batch: never resend it.
+function Resolve-TranscriptSince($Watch, [hashtable]$Last) {
+    $s = $Watch.since
+    if ($null -eq $s -or "$s" -eq '') { return $null }
+    $l = $Last[([string]$Watch.session_id).ToLowerInvariant()]
+    if ($l -and "$($l.since)" -eq "$s" -and "$($l.cursor)" -ne "$s") { return $l.cursor }
+    $s
+}
+
+# One transcript cycle: <= 4 watched sessions, <= 200 events each, one first-call tail per cycle, nothing posted
+# when nothing changed, 'session not found' at most once per 60 s per session. Send: {param($Path, $Body)} -> $true on success.
+function Invoke-TranscriptStep {
+    param([object[]]$Watches = @(), [hashtable]$TxState, [hashtable]$SessState, [string]$NodeId, [double]$Now, [scriptblock]$Send)
+    $sel = Select-RotatingWatches -Watches $Watches -Offset ([int]$TxState.rot)
+    $TxState.rot = $sel.next
+    if ($TxState.last.Count -gt 200) { $TxState.last.Clear() }
+    if ($TxState.missing.Count -gt 200) { $TxState.missing.Clear() }
+    $tailDone = $false
+    foreach ($w in @($sel.items)) {
+        $sid = ([string]$w.session_id).ToLowerInvariant(); $tool = [string]$w.tool
+        if (-not $sid) { continue }
+        $since = Resolve-TranscriptSince $w $TxState.last
+        if ($null -eq $since) { if ($tailDone) { continue }; $tailDone = $true }   # first-call tails are the expensive part
+        $m = Find-SessionMeta $SessState $tool $sid
+        if (-not $m) {
+            if (-not $TxState.missing[$sid] -or ($Now - $TxState.missing[$sid]) -ge 60) {
+                $TxState.missing[$sid] = $Now
+                $null = & $Send '/api/agent/transcript' ([ordered]@{ node_id = $NodeId; tool = $tool; session_id = $sid; cursor = $null; events = @(); done = $true; error = 'session not found on this node' })
+            }
+            continue
+        }
+        if (-not $TxState.names.ContainsKey($sid)) { $TxState.names[$sid] = @{} }
+        $b = Get-TranscriptBatch -Tool $m.tool -Path $m.path -Since $since -ToolNames $TxState.names[$sid]
+        Limit-ToolNames $TxState.names[$sid]
+        if ($null -ne $since -and "$since" -eq "$($b.cursor)" -and @($b.events).Count -eq 0) { continue }
+        $st = Get-SessionState -LastWrite $m.mtime -Now $Now -ProcAlive ($null -ne $m.pid)   # pid from the last index cycle
+        $ok = & $Send '/api/agent/transcript' ([ordered]@{ node_id = $NodeId; tool = $m.tool; session_id = $sid; cursor = $b.cursor
+                                                         events = @($b.events); done = [bool]$b.at_end; state = $st })
+        if ($ok) { $TxState.last[$sid] = @{ since = "$since"; cursor = $b.cursor } }
+    }
 }
 
 if ($NoRun) { return }
@@ -225,6 +418,11 @@ function Set-WorkRoot {
             Save-AgentConfig @{ work_root_auto = $root }
             $cfg | Add-Member -NotePropertyName work_root_auto -NotePropertyValue $root -Force
         }
+        # the SYSTEM watchdog prunes <work_root>\jobs dirs older than 14 days; it reads the effective root from here
+        if ("$($cfg.work_root_current)" -ne $root) {
+            Save-AgentConfig @{ work_root_current = $root }
+            if (-not $IsSystemLane) { $cfg | Add-Member -NotePropertyName work_root_current -NotePropertyValue $root -Force }
+        }
         $script:WorkRoot = $root
         $script:JobsDir = Join-Path $root 'jobs'
         $script:ScratchDir = Join-Path $root 'scratch'
@@ -281,7 +479,7 @@ function Resolve-Tool([string]$Name) {
     if ($cfg.tools -and $cfg.tools.$Name) { return $cfg.tools.$Name }
     $c = Get-Command -Name "$Name.exe", "$Name.cmd" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $c) {
-        foreach ($p in @("$env:USERPROFILE\.local\bin\$Name.exe", "$env:APPDATA\npm\$Name.cmd", "$env:LOCALAPPDATA\Programs\Ollama\$Name.exe")) {
+        foreach ($p in @("$env:USERPROFILE\.local\bin\$Name.exe", "$env:USERPROFILE\.local\bin\$Name.cmd", "$env:APPDATA\npm\$Name.cmd", "$env:LOCALAPPDATA\Programs\Ollama\$Name.exe")) {
             if (Test-Path $p) { return $p }
         }
         return $null
@@ -290,7 +488,7 @@ function Resolve-Tool([string]$Name) {
 }
 $Tools = @{}
 if (-not $IsSystemLane) {
-    foreach ($t in 'claude', 'codex', 'node', 'python', 'ollama', 'git', 'nvidia-smi') { $p = Resolve-Tool $t; if ($p) { $Tools[$t] = $p } }
+    foreach ($t in 'claude', 'codex', 'node', 'python', 'ollama', 'git', 'nvidia-smi', 't3') { $p = Resolve-Tool $t; if ($p) { $Tools[$t] = $p } }
 }
 
 function Get-Info {
@@ -342,6 +540,7 @@ function Get-Metrics {
         work_root = $script:WorkRoot; work_root_free_gb = (Get-WorkRootFreeGb)
         watchdog = (Read-JsonFile (Join-Path $DataDir 'watchdog.json'))
         hub_url = $script:Hub; bundle_version = $StartBundle
+        services = $(if ($Has22Helpers) { Get-ServiceMetrics $script:ServiceStatus } else { @() })
     }
 }
 
@@ -413,8 +612,24 @@ function Get-Logs {
 # ---------------- jobs ----------------
 $script:Running = @{}
 
+$script:JobAttempt = @{}
 function Update-ForgeJob($Id, [hashtable]$Body) {
-    try { Send-Hub "/api/agent/jobs/$Id/update" $Body | Out-Null } catch { Write-AgentLog "job $Id update failed: $($_.Exception.Message)" }
+    # Fencing (hub 2.2.1+): say who we are and which dispatch attempt we hold, so a requeued job's stale copy
+    # (e.g. a laptop that slept) cannot overwrite the new holder's result.
+    $Id = [string]$Id
+    $Body.node_id = $NodeId
+    if ($script:JobAttempt.ContainsKey($Id)) { $Body.attempt = $script:JobAttempt[$Id] }
+    try { Send-Hub "/api/agent/jobs/$Id/update" $Body | Out-Null }
+    catch {
+        $code = $null; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -eq 409) {
+            # job reassigned / already final on the hub: our copy is stale -> stop it and forget it
+            Write-AgentLog "job $Id rejected by hub (409, reassigned or final); stopping local copy"
+            $r = $script:Running[$Id]
+            if ($r -and $r.proc -and -not $r.proc.HasExited) { $r.cancelled = $true; & taskkill.exe /T /F /PID $r.proc.Id 2>$null | Out-Null }
+            $script:Running.Remove($Id); $script:JobAttempt.Remove($Id)
+        } else { Write-AgentLog "job $Id update failed: $($_.Exception.Message)" }
+    }
 }
 
 function Protect-SystemJobDir([string]$Dir) {
@@ -471,7 +686,9 @@ function Start-SystemJob($Job) {
         $p = Start-Process -FilePath powershell.exe -ArgumentList $argLine -WorkingDirectory $dir -NoNewWindow -PassThru `
             -RedirectStandardOutput $out -RedirectStandardError $err
         $null = $p.Handle
-        $script:Running[$id] = @{ proc = $p; out = $out; offset = [long]0; err = $err; erroffset = [long]0; engine = $Job.engine; cancelled = $false }
+        $script:Running[$id] = @{ proc = $p; pid = $p.Id; out = $out; offset = [long]0; err = $err; erroffset = [long]0; engine = [string]$Job.engine; cancelled = $false
+                                  started = (Get-AgentEpoch); timeout_s = (Get-JobTimeoutSec $Job); source = [string]$Job.source; timed_out = $false }
+        Save-RunningJobs
         $who = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         Update-ForgeJob $id @{ status = 'running'; pid = $p.Id; append = "[$NodeId] $what started as $who`n" }
         Write-AgentLog "job $id started ($what, pid $($p.Id), dir $dir)"
@@ -482,50 +699,51 @@ function Start-SystemJob($Job) {
 
 function Start-ForgeJob($Job) {
     $id  = [string]$Job.id
+    if ($null -ne $Job.attempt) { $script:JobAttempt[$id] = $Job.attempt }
     if (-not (Test-JobLane $Job $Lane)) {
         Update-ForgeJob $id @{ status = 'failed'; exit_code = -1; append = "[$NodeId] job refused: engine '$($Job.engine)' (run_as '$($Job.run_as)') does not run in the $Lane lane`n" }
         Write-AgentLog "job $id refused: wrong lane ($($Job.engine))"; return
     }
     if ($IsSystemLane) { Start-SystemJob $Job; return }
+    if (-not (Test-SafeJobId $id)) { Update-ForgeJob $id @{ status = 'failed'; exit_code = -1; append = "[$NodeId] bad job id`n" }; return }
     $dir = Join-Path $script:JobsDir $id; New-Item -ItemType Directory -Force $dir | Out-Null
-    $out = Join-Path $dir 'out.log'; $promptFile = Join-Path $dir 'prompt.txt'
-    $cwd = if ($Job.cwd -and (Test-Path -LiteralPath $Job.cwd)) { $Job.cwd } else { $script:ScratchDir }
-    $inner = $null
-    switch ($Job.engine) {
-        'claude' {
-            if ($Tools['claude']) {
-                [IO.File]::WriteAllText($promptFile, $Job.prompt, $Utf8)
-                $mode = if ($Job.full_access) { 'bypassPermissions' } else { 'default' }
-                # Use the claude.ai subscription login unless this node opts into API-key billing.
-                $auth = if ($cfg.claude_use_api_key) { '' } else { 'set "ANTHROPIC_API_KEY=" && set "ANTHROPIC_AUTH_TOKEN=" && ' }
-                $inner = "$auth`"$($Tools['claude'])`" -p --permission-mode $mode --output-format text < `"$promptFile`""
-            }
-        }
-        'codex' {
-            if ($Tools['codex']) {
-                [IO.File]::WriteAllText($promptFile, $Job.prompt, $Utf8)
-                $sb = if ($Job.full_access) { '--dangerously-bypass-approvals-and-sandbox' } else { '--sandbox read-only' }
-                $inner = "`"$($Tools['codex'])`" exec --skip-git-repo-check $sb - < `"$promptFile`""
-            }
-        }
-        'shell' {
-            $ps1 = Join-Path $dir 'task.ps1'
-            [IO.File]::WriteAllText($ps1, $Job.prompt, (New-Object Text.UTF8Encoding($true)))
-            $inner = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ps1`""
-        }
+    $out = Join-Path $dir 'out.log'; $err = Join-Path $dir 'err.log'; $promptFile = Join-Path $dir 'prompt.txt'
+    $cwd = if ($Job.cwd -and (Test-Path -LiteralPath $Job.cwd)) { $Job.cwd } else { $null }
+    if (-not $cwd -and $Has22Helpers -and $Job.resume -and $Job.resume.session_id) {
+        # resume needs the session's own cwd (claude looks sessions up per project dir)
+        $m = Find-SessionMeta $script:SessState ([string]$Job.resume.tool) ([string]$Job.resume.session_id)
+        if ($m -and $m.cwd -and (Test-Path -LiteralPath $m.cwd)) { $cwd = $m.cwd }
     }
-    if (-not $inner) {
-        Update-ForgeJob $id @{ status = 'failed'; exit_code = -1; append = "[$NodeId] engine '$($Job.engine)' is not installed on this machine`n" }
+    if (-not $cwd) {
+        # each job gets its own folder <work_root>\scratch\<jobid> (jobs never share a scratch dir)
+        $cwd = Join-Path $script:ScratchDir $id
+        try { New-Item -ItemType Directory -Force $cwd -ErrorAction Stop | Out-Null }
+        catch { Update-ForgeJob $id @{ status = 'failed'; exit_code = -1; append = (Format-AgentJobLine $Job $NodeId "cannot create $cwd : $($_.Exception.Message)") }; return }
+    }
+    $cmd = Get-JobCommand -Job $Job -Tools $Tools -Config $cfg -PromptFile $promptFile -JobDir $dir -AgentDir $PSScriptRoot -OutFile $out
+    if ($cmd.error) {
+        Update-ForgeJob $id @{ status = 'failed'; exit_code = -1; append = (Format-AgentJobLine $Job $NodeId $cmd.error) }
         return
     }
+    if ($cmd.write -eq 'ps1') { [IO.File]::WriteAllText((Join-Path $dir 'task.ps1'), [string]$Job.prompt, (New-Object Text.UTF8Encoding($true))) }
+    else { [IO.File]::WriteAllText($promptFile, [string]$Job.prompt, $Utf8) }
+    $redir = if ($cmd.redirect -eq 'err') { $err } else { $out }
+    $timeout = Get-JobTimeoutSec $Job
     try {
-        $p = Start-Process -FilePath cmd.exe -ArgumentList "/s /c `"$inner > `"$out`" 2>&1`"" -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
+        # TODO(Phase 3): jobs currently run with the agent's FULL admin token: the ForgeAgent task is S4U, and S4U
+        # tasks are not UAC-filtered even with RunLevel Limited. Phase 3 launches jobs with a SAFER normal-user token.
+        $p = Start-Process -FilePath cmd.exe -ArgumentList "/s /c `"$($cmd.inner) > `"$redir`" 2>&1`"" -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
         $null = $p.Handle   # keep the handle so ExitCode is available later
-        $script:Running[$id] = @{ proc = $p; out = $out; offset = [long]0; engine = $Job.engine; cancelled = $false }
-        Update-ForgeJob $id @{ status = 'running'; pid = $p.Id; append = "[$NodeId] $($Job.engine) started in $cwd$(if ($Job.full_access) { ' (full access)' })`n" }
-        Write-AgentLog "job $id started ($($Job.engine), pid $($p.Id), cwd $cwd)"
+        $script:Running[$id] = @{ proc = $p; pid = $p.Id; out = $out; offset = [long]0; err = $(if ($cmd.redirect -eq 'err') { $err } else { $null }); erroffset = [long]0
+                                  engine = [string]$Job.engine; cancelled = $false; resume_tool = $(if ($cmd.resume_id) { [string]$Job.resume.tool } else { $null }); resume_id = $cmd.resume_id
+                                  started = (Get-AgentEpoch); timeout_s = $timeout; source = [string]$Job.source; timed_out = $false }
+        Save-RunningJobs
+        $what = if ($cmd.resume_id) { "$($Job.engine) resume $($cmd.resume_id)" } else { "$($Job.engine)" }
+        if ($Job.model) { $what += " (model $($Job.model))" }
+        Update-ForgeJob $id @{ status = 'running'; pid = $p.Id; append = (Format-AgentJobLine $Job $NodeId "$what started in $cwd$(if ($Job.full_access) { ' (full access)' })") }
+        Write-AgentLog "job $id started ($($Job.engine), pid $($p.Id), cwd $cwd, timeout $timeout s)"
     } catch {
-        Update-ForgeJob $id @{ status = 'failed'; exit_code = -1; append = "[$NodeId] failed to start: $($_.Exception.Message)`n" }
+        Update-ForgeJob $id @{ status = 'failed'; exit_code = -1; append = (Format-AgentJobLine $Job $NodeId "failed to start: $($_.Exception.Message)") }
     }
 }
 
@@ -544,30 +762,101 @@ function Read-NewOutput($R, [string]$PathKey = 'out', [string]$OffsetKey = 'offs
     } finally { $fs.Close() }
 }
 
+function Get-ProcExitCode($Proc) { try { $c = $Proc.ExitCode; if ($null -eq $c) { -1 } else { [int]$c } } catch { -1 } }
+
 function Step-ForgeJobs {
+    $dirty = $false
+    $now = Get-AgentEpoch
     foreach ($id in @($script:Running.Keys)) {
         $r = $script:Running[$id]
+        $o1 = $r.offset; $o2 = $r.erroffset
         $text = (Read-NewOutput $r) + (Read-NewOutput $r 'err' 'erroffset')
+        if (-not $r.proc.HasExited -and -not $r.timed_out -and -not $r.cancelled -and (Test-JobTimedOut $r.started $now $r.timeout_s)) {
+            # job.timeout_s (default 2 h): kill the whole process tree; reported as failed once it is gone
+            $r.timed_out = $true; $dirty = $true
+            & taskkill.exe /T /F /PID $r.pid 2>$null | Out-Null
+            Write-AgentLog "job $id timed out after $($r.timeout_s) s; killed process tree (pid $($r.pid))"
+            try { $null = $r.proc.WaitForExit(5000) } catch {}
+        }
         if ($r.proc.HasExited) {
             $text += (Read-NewOutput $r) + (Read-NewOutput $r 'err' 'erroffset')
-            $code = $r.proc.ExitCode
-            $status = if ($r.cancelled) { 'cancelled' } elseif ($code -eq 0) { 'done' } else { 'failed' }
+            $code = Get-ProcExitCode $r.proc
+            $status = if ($r.cancelled) { 'cancelled' } elseif ($r.timed_out) { 'failed' } elseif ($code -eq 0) { 'done' } else { 'failed' }
+            if ($r.timed_out) { $text += "`n" + (Format-AgentJobLine @{ source = $r.source } $NodeId "job timed out after $($r.timeout_s) s (job.timeout_s); process tree killed") }
             Update-ForgeJob $id @{ status = $status; exit_code = $code; append = $text }
             Write-AgentLog "job $id $status (exit $code)"
-            $script:Running.Remove($id)
+            $script:Running.Remove($id); $dirty = $true
+            if ($r.resume_id -and $script:SessState.force) {
+                # SPEC D: rescan the resumed session right away (and resend it even if unchanged)
+                $script:SessState.force[$r.resume_id] = $true
+                $script:NextSessScan = [datetime]::MinValue
+            }
         } elseif ($text) {
             Update-ForgeJob $id @{ append = $text }
         }
+        if ($r.offset -ne $o1 -or $r.erroffset -ne $o2) { $dirty = $true }
     }
+    if ($dirty) { Save-RunningJobs }
 }
 
 function Stop-ForgeJob($Id) {
     $r = $script:Running[[string]$Id]
     if ($r -and -not $r.proc.HasExited) {
         $r.cancelled = $true
-        & taskkill.exe /T /F /PID $r.proc.Id 2>$null | Out-Null
+        & taskkill.exe /T /F /PID $r.pid 2>$null | Out-Null
         Write-AgentLog "job $Id cancelled"
+        Save-RunningJobs
     }
+}
+
+# ---------- orphan safety: running jobs survive a worker restart ----------
+$RunningPath = Join-Path $DataDir $(if ($IsSystemLane) { 'running-system.json' } else { 'running.json' })
+
+function Save-RunningJobs {
+    try { Write-JsonFile $RunningPath ([ordered]@{ lane = $Lane; saved = (Get-AgentEpoch); jobs = (ConvertTo-RunningRecords $script:Running) }) }
+    catch { Write-AgentLog "could not save $RunningPath : $($_.Exception.Message)" }
+}
+
+# At worker start: re-attach to jobs whose process is still alive (output continues from the saved offset); jobs
+# whose process is gone are reported failed with whatever output is left. Both happen before the first (boot) report,
+# whose `running` list tells the hub which jobs survived.
+function Restore-RunningJobs {
+    $saved = Read-JsonFile $RunningPath
+    $recs = @(); if ($saved -and $saved.jobs) { $recs = @($saved.jobs | Where-Object { $_ }) }
+    if ($saved -and "$($saved.lane)" -and "$($saved.lane)" -ne $Lane) { $recs = @() }
+    if (-not $recs.Count) { return }
+    $procs = @{}
+    foreach ($rec in $recs) {
+        if (-not $rec.pid) { continue }
+        $cp = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$rec.pid)" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cp) { $procs[[int]$cp.ProcessId] = @{ pid = [int]$cp.ProcessId; cmd = "$($cp.CommandLine)" } }
+    }
+    $plan = Select-ReattachJobs -Records $recs -Procs $procs -JobsDir $script:JobsDir -Lane $Lane
+    $attachIds = @{}; foreach ($a in @($plan.attach)) { if ($a) { $attachIds[[string]$a.id] = $true } }
+    foreach ($rec in @($plan.attach) + @($plan.gone)) {
+        if (-not $rec) { continue }
+        $id = [string]$rec.id
+        $dir = Join-Path $script:JobsDir (Get-JobDirName $id $Lane)
+        $errName = if ($IsSystemLane -or $rec.has_err) { 'err.log' } else { $null }
+        $r = @{ proc = $null; pid = [int]$rec.pid; out = (Join-Path $dir 'out.log'); offset = [long]$rec.offset; err = $(if ($errName) { Join-Path $dir $errName } else { $null })
+                erroffset = [long]$rec.erroffset; engine = [string]$rec.engine; cancelled = [bool]$rec.cancelled; started = [double]$rec.started
+                timeout_s = $(if ([int]$rec.timeout_s -gt 0) { [int]$rec.timeout_s } else { 7200 }); source = [string]$rec.source; timed_out = $false
+                resume_tool = $(if ($rec.resume_tool) { [string]$rec.resume_tool } else { $null }); resume_id = $(if ($rec.resume_id) { [string]$rec.resume_id } else { $null }) }
+        $attached = $false
+        if ($attachIds.ContainsKey($id)) {
+            try { $r.proc = [Diagnostics.Process]::GetProcessById([int]$rec.pid); $null = $r.proc.Handle; $attached = $true } catch { $attached = $false }
+        }
+        if ($attached) {
+            $script:Running[$id] = $r
+            Write-AgentLog "job $id re-attached after agent restart (pid $($r.pid), output offset $($r.offset))"
+        } else {
+            $text = ''; try { $text = (Read-NewOutput $r) + (Read-NewOutput $r 'err' 'erroffset') } catch {}
+            $st = if ($r.cancelled) { 'cancelled' } else { 'failed' }
+            Update-ForgeJob $id @{ status = $st; exit_code = -1; append = $text + "`n" + (Format-AgentJobLine @{ source = $r.source } $NodeId 'agent restarted while this job ran; its process is gone (exit code unknown)') }
+            Write-AgentLog "job $id ended while the agent was down (pid $($r.pid)); reported $st"
+        }
+    }
+    Save-RunningJobs
 }
 
 function Apply-HubResponse($Resp) {
@@ -584,6 +873,116 @@ function Apply-HubResponse($Resp) {
     }
 }
 
+# ---------------- 2.2: sessions, transcripts, commits, services (user lane) ----------------
+$script:SessState = if ($Has22Helpers) { New-SessionIndexState } else { @{ files = @{}; sent = @{}; git = @{}; force = @{}; last_full = 0.0 } }
+$script:Watches = @()
+$script:TxState = New-TranscriptState
+$script:ServiceStatus = @{}; $script:SvcRuntime = @{}
+$script:EndpointDown = @{}
+$script:T3Support = $null; $script:T3Checked = $false
+$script:CommitsCursor = 0
+$SessEnabled = $Has22Helpers -and (-not $IsSystemLane) -and ($cfg.sessions_enabled -ne $false)
+$ClaudeHome = if ($cfg.claude_home) { [string]$cfg.claude_home } else { Join-Path $env:USERPROFILE '.claude' }
+$ClaudeRoot = Join-Path $ClaudeHome 'projects'
+$ClaudePidDir = Join-Path $ClaudeHome 'sessions'
+$CodexRoot = if ($cfg.codex_sessions_dir) { [string]$cfg.codex_sessions_dir } else { Join-Path $env:USERPROFILE '.codex\sessions' }
+$SessIntervalS = if ($cfg.sessions_interval_s) { [int]$cfg.sessions_interval_s } else { 30 }
+$CommitsIntervalS = if ($cfg.commits_interval_s) { [int]$cfg.commits_interval_s } else { 300 }
+$ServicesIntervalS = if ($cfg.services_interval_s) { [int]$cfg.services_interval_s } else { 60 }
+$WatchdogDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'watchdog'
+$script:NextSessScan = [datetime]::MinValue; $script:NextCommits = (Get-Date).AddSeconds(20); $script:NextServices = [datetime]::MinValue
+
+# POST to a 2.2 endpoint; an older hub answers 404/405 -> stop trying that path for 10 min.
+# Returns @{resp} on success, $null on failure.
+function Send-HubOptional([string]$Path, $Body) {
+    $until = $script:EndpointDown[$Path]
+    if ($until -and (Get-Date) -lt $until) { return $null }
+    try { return @{ resp = (Send-Hub $Path $Body) } } catch {
+        $code = $null; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -eq 404 -or $code -eq 405) { $script:EndpointDown[$Path] = (Get-Date).AddMinutes(10); Write-AgentLog "hub has no $Path (HTTP $code); retrying in 10 min" }
+        else { Write-AgentLog "$Path failed: $($_.Exception.Message)" }
+        $null
+    }
+}
+
+# t3 sessions are not collected yet, so t3 is reported 'unsupported' whenever the CLI is installed (never
+# 'available' just because a newer `t3 project --help` lists a `list` subcommand).
+# TODO: implement `t3 project list --json` + `t3 thread list --project <id> --json` -> tool='t3' sessions, then report
+# 'available' when Test-T3ListSupport (sessions.ps1) passes.
+function Get-T3Support {
+    if ($script:T3Checked) { return $script:T3Support }
+    $script:T3Checked = $true
+    $script:T3Support = if ($Tools['t3']) { 'unsupported' } else { $null }
+    if ($script:T3Support) { Write-AgentLog "t3 session listing: $($script:T3Support) (thread collection not implemented)" }
+    $script:T3Support
+}
+
+function Step-SessionIndex {
+    $now = ConvertTo-EpochFromDate (Get-Date)
+    $procs = Get-AiCliProcesses
+    $pidMap = Read-ClaudePidMap $ClaudePidDir
+    $cyc = Invoke-SessionIndexCycle -State $script:SessState -NodeId $NodeId -ClaudeRoot $ClaudeRoot -CodexRoot $CodexRoot `
+        -GitExe $Tools['git'] -Procs $procs -PidMap $pidMap -Now $now
+    if (@($cyc.sessions).Count -or @($cyc.removed).Count -or $cyc.full) {
+        $body = [ordered]@{ node_id = $NodeId; sessions = @($cyc.sessions); removed = @($cyc.removed) }
+        $t3 = Get-T3Support; if ($t3) { $body.t3 = $t3 }
+        if (Send-HubOptional '/api/agent/sessions' $body) { Confirm-SessionsSent $script:SessState $cyc $now }
+    }
+}
+
+function Step-Commits {
+    if (-not $Tools['git']) { return }
+    $cwds = Get-KnownRepoCwds $script:SessState
+    if (-not @($cwds).Count) { return }
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $repos = New-Object System.Collections.Generic.List[object]
+    $n = @($cwds).Count
+    for ($i = 0; $i -lt $n -and $repos.Count -lt 20 -and $sw.ElapsedMilliseconds -lt 3000; $i++) {
+        $cwd = $cwds[($script:CommitsCursor + $i) % $n]
+        $rep = Get-RepoReport $Tools['git'] $cwd $script:SessState.git[$cwd].remote
+        if ($rep) { $repos.Add($rep) }
+    }
+    $script:CommitsCursor = ($script:CommitsCursor + $i) % [Math]::Max(1, $n)
+    if ($repos.Count) { $null = Send-HubOptional '/api/agent/commits' ([ordered]@{ node_id = $NodeId; repos = $repos.ToArray() }) }
+}
+
+# SPEC C (Invoke-TranscriptStep above): up to 4 watched sessions per cycle (rotating), <= 200 events each.
+function Step-Transcripts {
+    Invoke-TranscriptStep -Watches @($script:Watches) -TxState $script:TxState -SessState $script:SessState -NodeId $NodeId `
+        -Now (ConvertTo-EpochFromDate (Get-Date)) -Send { param($P, $B) [bool](Send-HubOptional $P $B) }
+}
+
+function Step-Services {
+    $now = ConvertTo-EpochFromDate (Get-Date)
+    $defs = Get-ForgeServices $cfg
+    foreach ($k in @($script:ServiceStatus.Keys)) { if (-not (@($defs) | Where-Object { $_.name -eq $k })) { $script:ServiceStatus.Remove($k) } }
+    foreach ($s in @($defs)) {
+        $rt = $script:SvcRuntime[$s.name]
+        if (-not $rt) { $rt = @{ last_start = 0.0; fails = 0 }; $script:SvcRuntime[$s.name] = $rt }
+        $ok = $false
+        if ($s.check) {
+            $path = if ([IO.Path]::IsPathRooted($s.check)) { $s.check } else { Join-Path $WatchdogDir $s.check }
+            if (-not (Test-Path -LiteralPath $path)) { $script:ServiceStatus.Remove($s.name); continue }
+            try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $path | Out-Null; $code = $LASTEXITCODE } catch { $code = -1; Write-AgentLog "service $($s.name) check failed: $($_.Exception.Message)" }
+            if ($code -eq 20) { $script:ServiceStatus.Remove($s.name); continue }   # not set up here
+            if ($code -eq 10) { Write-AgentLog "service $($s.name): started by $($s.check)" }
+            $ok = ($code -eq 0)
+        } else {
+            if (-not $s.health) { continue }
+            if ($s.when_tool -and -not $Tools[$s.when_tool]) { $script:ServiceStatus.Remove($s.name); continue }
+            $ok = Test-ServiceHealth $s.health
+            $cmd = Split-ServiceCommand $s.start $Tools
+            $dec = Get-ServiceDecision -ToolPresent $true -Healthy $ok -CanStart ([bool]$cmd) -Now $now -LastStart $rt.last_start -Fails $rt.fails
+            if ($dec -eq 'ok') { $rt.fails = 0 }
+            elseif ($dec -eq 'start') {
+                $rt.last_start = $now; $rt.fails++
+                try { $null = Start-ForgeServiceProcess $cmd.exe $cmd.args $s.env; Write-AgentLog "service $($s.name): unhealthy, started $($cmd.exe) $($cmd.args) (attempt $($rt.fails))" }
+                catch { Write-AgentLog "service $($s.name): start failed: $($_.Exception.Message)" }
+            }
+        }
+        if (Update-ServiceStatus $script:ServiceStatus $s.name $ok $now) { Write-AgentLog "service $($s.name): $(if ($ok) { 'ok' } else { 'not ok' })" }
+    }
+}
+
 # ---------------- main loop ----------------
 Set-WorkRoot
 # the SYSTEM lane's ensure_task(run_as=user) needs the node's user; the user lane knows who it is
@@ -592,16 +991,20 @@ if (-not $IsSystemLane -and -not $cfg.user -and $env:USERNAME) {
     Save-AgentConfig @{ user = $me }
     $cfg | Add-Member -NotePropertyName user -NotePropertyValue $me -Force
 }
+try { Restore-RunningJobs } catch { Write-AgentLog "re-attach of running jobs failed: $($_.Exception.Message)" }
 Write-AgentLog "agent $AgentVersion starting ($Lane lane as $([Security.Principal.WindowsIdentity]::GetCurrent().Name)): node=$NodeId bundle=$StartBundle hubs=$($script:HubUrls -join ',') work_root=$($script:WorkRoot) tools=$(@($Tools.Keys) -join ',')$(if ($IsSystemLane) { " allow_admin=$(Test-AllowAdmin $cfg) catalog=$([bool]$script:ActionCatalog)" })"
 $lastInfo = [datetime]::MinValue; $lastLogs = [datetime]::MinValue; $lastBeat = Get-Date; $lastVer = Get-Date; $boot = $true
 while ($true) {
     try {
         $cap = if ($script:Draining) { 0 } else { [Math]::Max(0, $script:MaxJobs - $script:Running.Count) }
+        # running = ids still running here (re-attached jobs included): on boot the hub fails only the others
+        $runIds = [string[]]@($script:Running.Keys)
         if ($IsSystemLane) {
-            $body = New-SystemLaneReport -NodeId $NodeId -Capacity $cap -Running $script:Running.Count -Boot $boot -AgentVersion $AgentVersion -BundleVersion $StartBundle
+            $body = New-SystemLaneReport -NodeId $NodeId -Capacity $cap -Running $runIds -Boot $boot -AgentVersion $AgentVersion -BundleVersion $StartBundle -AgentTime (Get-AgentEpoch)
         } else {
             $body = @{ node_id = $NodeId; metrics = (Get-Metrics); procs = (Get-TopProcs); agents = (Get-Agents)
-                       capacity = $cap; boot = $boot; agent_version = $AgentVersion; bundle_version = $StartBundle }
+                       capacity = $cap; boot = $boot; agent_version = $AgentVersion; bundle_version = $StartBundle
+                       running = @($runIds); agent_time = (Get-AgentEpoch) }
             if (((Get-Date) - $lastInfo).TotalSeconds -ge 600) { $body.info = Get-Info; $lastInfo = Get-Date }
             if (((Get-Date) - $lastLogs).TotalSeconds -ge 20) { $body.logs = Get-Logs; $lastLogs = Get-Date }
         }
@@ -611,21 +1014,35 @@ while ($true) {
         Apply-HubResponse $resp
         foreach ($j in @($resp.jobs)) { if ($j) { Start-ForgeJob $j } }
         foreach ($c in @($resp.cancel)) { if ($c) { Stop-ForgeJob $c } }
+        if (-not $IsSystemLane) { $script:Watches = @($resp.watch | Where-Object { $_ }) }
     } catch {
         Write-AgentLog "report failed: $($_.Exception.Message)"
+        # the watch list (and its cursors) came with the last successful report; reusing it would resend batches
+        $script:Watches = @()
     }
     try { Step-ForgeJobs } catch { Write-AgentLog "job step failed: $($_.Exception.Message)" }
 
+    if ($SessEnabled) {
+        if ((Get-Date) -ge $script:NextSessScan) {
+            $script:NextSessScan = (Get-Date).AddSeconds($SessIntervalS)
+            try { Step-SessionIndex } catch { Write-AgentLog "session index failed: $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)" }
+        }
+        if (@($script:Watches).Count) { try { Step-Transcripts } catch { Write-AgentLog "transcript step failed: $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)" } }
+        if ((Get-Date) -ge $script:NextCommits) {
+            $script:NextCommits = (Get-Date).AddSeconds($CommitsIntervalS)
+            try { Step-Commits } catch { Write-AgentLog "commits step failed: $($_.Exception.Message)" }
+        }
+    }
+    # Keep-alive services (T3 via start-t3.ps1, ollama serve); SPEC H. Opt out of T3 with "t3_autostart": false.
+    if ($Has22Helpers -and -not $IsSystemLane -and (Get-Date) -ge $script:NextServices) {
+        $script:NextServices = (Get-Date).AddSeconds($ServicesIntervalS)
+        try { Step-Services } catch { Write-AgentLog "services step failed: $($_.Exception.Message)" }
+    }
+
     # heartbeat (the watchdog restarts us if agent.log goes stale for 2 min)
     if (((Get-Date) - $lastBeat).TotalSeconds -ge 60) {
-        Write-AgentLog "alive: hub=$($script:Hub) running=$($script:Running.Count) max_jobs=$($script:MaxJobs)"
+        Write-AgentLog "alive: hub=$($script:Hub) running=$($script:Running.Count) max_jobs=$($script:MaxJobs) sessions=$($script:SessState.files.Count) watches=$(@($script:Watches).Count)"
         $lastBeat = Get-Date
-        # Keep this user's T3 Code server up (its own task only fires at logon; we run at boot as the user).
-        # start-t3.ps1 is a no-op when T3 is running or not set up. Opt out with agent-config "t3_autostart": false.
-        if (-not $IsSystemLane -and $cfg.t3_autostart -ne $false) {
-            $t3s = Join-Path (Split-Path $PSScriptRoot -Parent) 'watchdog\start-t3.ps1'
-            if (Test-Path $t3s) { try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $t3s | Out-Null } catch { Write-AgentLog "t3 autostart failed: $($_.Exception.Message)" } }
-        }
     }
     # bundle updated by the watchdog -> stop taking jobs, exit when idle; supervisor relaunches new code
     if ($StartBundle -and ((Get-Date) - $lastVer).TotalSeconds -ge 30) {

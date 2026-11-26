@@ -4,7 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hivemind</title>
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#151820" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Hivemind">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%234f46e5'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%234f46e5'/%3E%3Cstop offset='1' stop-color='%2306b6d4'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='180' height='180' rx='40' fill='url(%23g)'/%3E%3Cpath d='M90 38l45 26v52l-45 26-45-26V64z' fill='none' stroke='%23fff' stroke-width='12' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="manifest" id="manifestLink" href="data:application/manifest+json,%7B%22name%22%3A%22Hivemind%22%2C%22short_name%22%3A%22Hivemind%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23f5f6f8%22%2C%22theme_color%22%3A%22%234f46e5%22%7D">
 <style>
 :root{
   --bg:#f5f6f8;--panel:#fff;--panel2:#f0f2f5;--line:#e2e5ea;--text:#16181d;--muted:#5b6475;
@@ -216,8 +224,6 @@ pre.log{background:var(--code);color:var(--codetext);border-radius:10px;padding:
 .jump{position:absolute;right:16px;bottom:10px;box-shadow:0 2px 8px rgba(0,0,0,.25)}
 .pbox{padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px;flex:none}
 .pbox textarea{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;width:100%;min-height:44px;max-height:30vh;resize:none;font-size:16px}
-.pbox .brow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.pbox .note{color:var(--warn);font-size:12px;flex:1;min-width:160px}
 .cdrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 .cdrow label{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
 .mact{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
@@ -228,6 +234,34 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
 .newtask{padding:12px 14px;display:flex;flex-direction:column;gap:10px;margin-top:8px}
 .newtask select,.newtask textarea{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%;font-size:16px}
 .newtask textarea{min-height:80px}
+/* ---- Hivemind: status sentence, "..." menus, task cards, alert actions ---- */
+.hstatus{display:inline-flex;align-items:center;gap:7px;border:none;background:none;padding:4px 2px;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted);min-height:30px}
+.hstatus .dot{width:10px;height:10px}
+.hstatus.ok{color:var(--ok)}.hstatus.ok .dot{background:var(--ok)}
+.hstatus.warn{color:var(--warn)}.hstatus.warn .dot{background:var(--warn)}
+.hstatus.err{color:var(--err)}.hstatus.err .dot{background:var(--err)}
+.menu{position:relative;display:inline-flex}
+.mpop{position:absolute;right:0;top:calc(100% + 4px);z-index:20;min-width:220px;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.18);padding:6px;display:flex;flex-direction:column;gap:2px}
+.mpop.up{top:auto;bottom:calc(100% + 4px)}
+.mpop .mi{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:none;background:none;padding:9px 10px;border-radius:7px;cursor:pointer;font-size:14px;color:var(--text);text-decoration:none;min-height:38px}
+.mpop .mi:hover,.mpop .mi:focus-visible{background:var(--panel2)}
+.mpop .ml{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;padding:6px 10px 2px}
+.mpop .seg{margin:2px 4px 4px}
+.mbtn{min-width:38px;font-weight:700;letter-spacing:.08em}
+.jcards{display:none;flex-direction:column;gap:8px}
+.jcard{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 10px;align-items:center;padding:11px 14px;cursor:pointer;width:100%;text-align:left}
+.jcard .tt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:550}
+.jcard .sub{grid-column:2}
+.jdot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+.jdot.running,.jdot.starting{background:var(--info)}.jdot.failed{background:var(--err)}.jdot.done{background:var(--ok)}.jdot.cancelled{background:var(--warn)}
+@media (max-width:600px){.jobtable{display:none}.jcards{display:flex}}
+.alert .why{flex:1;min-width:0}
+.alert .act{flex:none}
+.st.healing{background:var(--okbg);color:var(--ok)}
+.pbox .crow{display:flex;gap:8px;align-items:flex-end}
+.pbox .crow textarea{flex:1;min-width:0}
+.pbox .note{color:var(--muted);font-size:12px}
+.pbox .note.warn{color:var(--warn)}
 @media (max-width:700px){
   .pd .body,.drawer .body{width:100%;border-left:none}
   .pd .body{top:var(--vvt,0);bottom:auto;height:var(--vvh,100dvh)}
@@ -250,12 +284,20 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
 <header>
   <div class="hbar">
     <div class="brand"><span class="logo"></span>Hivemind</div>
-    <span class="pill" id="leaderPill">Leader: —</span>
-    <span class="sub" id="via"></span>
-    <div class="stats" id="stats"></div>
+    <button type="button" class="hstatus" id="hStatus" title="Open Health"><span class="dot"></span><span id="hStatusTxt">Checking…</span></button>
     <div class="spacer"></div>
-    <button class="btn" id="addBtn">+ Add machine</button>
-    <button class="btn" id="themeBtn" aria-label="Toggle light/dark theme" title="Toggle theme">&#9680;</button>
+    <div class="menu" id="hMenu">
+      <button type="button" class="btn mbtn" id="hMenuBtn" aria-haspopup="true" aria-expanded="false" aria-controls="hMenuPop" aria-label="More">&middot;&middot;&middot;</button>
+      <div class="mpop" id="hMenuPop" role="menu" hidden>
+        <button type="button" class="mi" role="menuitem" id="addBtn">+ Add machine</button>
+        <div class="ml" id="themeLbl">Theme</div>
+        <div class="seg" role="radiogroup" aria-labelledby="themeLbl" id="themeSeg">
+          <label><input type="radio" name="theme" value="auto"><span>Auto</span></label>
+          <label><input type="radio" name="theme" value="light"><span>Light</span></label>
+          <label><input type="radio" name="theme" value="dark"><span>Dark</span></label>
+        </div>
+      </div>
+    </div>
   </div>
   <nav class="nav" role="tablist" aria-label="Sections" id="nav"></nav>
 </header>
@@ -274,9 +316,9 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
   <section id="v-fleet" role="tabpanel" aria-label="Fleet" hidden>
     <form class="panel composer" id="taskForm" autocomplete="off">
       <div class="top">
-        <label class="f">Run on<select id="tNode"><option value="auto">Auto (best available)</option></select></label>
-        <div role="radiogroup" aria-label="Engine"><div class="seg" id="tEngine">
-          <label><input type="radio" name="eng" value="any"><span>Any</span></label>
+        <label class="f">Run on<select id="tNode"><option value="auto">Any free machine</option></select></label>
+        <div role="radiogroup" aria-label="With"><div class="seg" id="tEngine">
+          <label><input type="radio" name="eng" value="any"><span>Best fit</span></label>
           <label><input type="radio" name="eng" value="claude" checked><span>Claude Code</span></label>
           <label><input type="radio" name="eng" value="codex"><span>Codex</span></label>
           <label><input type="radio" name="eng" value="shell"><span>PowerShell</span></label>
@@ -284,7 +326,7 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
         </div></div>
       </div>
       <div class="adminbox" id="adminBox" hidden>
-        <div class="warn">Runs as SYSTEM (full administrator) on the chosen machine, without a UAC prompt.</div>
+        <div class="warn">Runs with admin rights (full administrator) on the chosen machine, without a UAC prompt.</div>
         <label class="f">Action<select id="aMode"></select></label>
         <div class="hint" id="aDesc"></div>
         <div class="argrid" id="aArgs"></div>
@@ -302,23 +344,24 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
     <div class="panel feed" id="feed"></div>
   </section>
 
-  <section id="v-jobs" role="tabpanel" aria-label="Jobs" hidden>
+  <section id="v-jobs" role="tabpanel" aria-label="Tasks" hidden>
     <div class="panel sched" id="sched" hidden></div>
     <div class="filters">
       <label>Machine<select id="fNode"><option value="">All</option></select></label>
       <label>Status<select id="fStatus"><option value="">All</option><option>queued</option><option>starting</option><option>running</option><option>done</option><option>failed</option><option>cancelled</option></select></label>
-      <label>Engine<select id="fEngine"><option value="">All</option><option value="any">any</option><option value="claude">claude</option><option value="codex">codex</option><option value="shell">shell</option><option value="action">action (SYSTEM)</option><option value="admin">admin (SYSTEM)</option></select></label>
-      <label style="flex-direction:row;align-items:center;gap:6px;align-self:end;padding-bottom:8px"><input type="checkbox" id="fBriefs"> Show brief jobs</label>
+      <label>With<select id="fEngine"><option value="">All</option><option value="any">Best fit</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="ollama">Ollama</option><option value="shell">PowerShell</option><option value="action">action (admin rights)</option><option value="admin">admin (admin rights)</option></select></label>
+      <label style="flex-direction:row;align-items:center;gap:6px;align-self:end;padding-bottom:8px"><input type="checkbox" id="fBriefs"> Show brief tasks</label>
     </div>
-    <div class="panel tablewrap"><table>
-      <thead><tr><th>#</th><th>Machine</th><th>Engine</th><th>Task</th><th>Status</th><th>Age</th><th>Duration</th></tr></thead>
+    <div class="panel tablewrap jobtable"><table>
+      <thead><tr><th>#</th><th>Machine</th><th>With</th><th>Task</th><th>Status</th><th>Age</th><th>Duration</th></tr></thead>
       <tbody id="jobs"></tbody></table></div>
+    <div class="jcards" id="jobCards"></div>
   </section>
 
   <section id="v-health" role="tabpanel" aria-label="Health" hidden>
     <h2>Cluster</h2>
     <div class="panel tablewrap"><table>
-      <thead><tr><th>Node</th><th>Priority</th><th>Role</th><th>Version</th><th>Healthy</th><th>Sync lag</th><th>Watchdog</th></tr></thead>
+      <thead><tr><th>Node</th><th>Priority</th><th>Role</th><th>Version</th><th>Healthy</th><th>Sync lag</th><th>Auto-repair</th></tr></thead>
       <tbody id="cluster"></tbody></table></div>
     <div class="row wrap" id="fleetInfo" style="margin-top:8px" hidden></div>
     <div class="hint" style="margin-top:6px">Lowest priority number leads. Use the arrows to change who takes over first.</div>
@@ -327,11 +370,11 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
       <div><h2>Update rollout <span id="bundle" style="text-transform:none;letter-spacing:0"></span></h2>
         <div class="panel tablewrap"><table><thead><tr><th>Node</th><th>Version</th><th>Status</th></tr></thead><tbody id="rollout"></tbody></table></div></div>
     </div>
-    <h2>Agent lanes</h2>
+    <h2>Agents</h2>
     <div class="panel tablewrap"><table>
-      <thead><tr><th>Node</th><th>User lane</th><th>System lane</th></tr></thead>
+      <thead><tr><th>Node</th><th>Agent</th><th>Admin helper</th></tr></thead>
       <tbody id="lanes"></tbody></table></div>
-    <div class="hint" style="margin-top:6px">The system lane (task ForgeSystemAgent, runs as SYSTEM) handles Admin jobs. The watchdog installs it after the 2.1 update.</div>
+    <div class="hint" style="margin-top:6px">The admin helper (task ForgeSystemAgent, runs with admin rights) handles Admin tasks. Auto-repair installs it after the 2.1 update.</div>
   </section>
 </main>
 
@@ -355,23 +398,32 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
     <div class="trwrap"><div class="trscroll" id="trScroll" role="log" aria-live="polite" aria-label="Session transcript"></div>
       <button class="btn sm primary jump" id="jumpBtn" hidden>&#8595; New messages</button></div>
     <div class="pbox" id="pBox">
-      <textarea id="sPrompt" rows="1" placeholder="Send a follow-up to this session…" aria-label="Follow-up prompt"></textarea>
-      <div class="brow"><span class="note" id="sNote" role="status"></span>
-        <label class="hint" style="display:inline-flex;gap:5px;align-items:center" title="Let the agent edit files and run commands without asking"><input type="checkbox" id="sFull"> Full access</label>
-        <button class="btn danger" id="sTake" hidden>Take over anyway</button>
-        <button class="btn primary" id="sSend">Continue</button></div>
+      <div class="note" id="sNote" role="status"></div>
+      <div class="crow">
+        <textarea id="sPrompt" rows="1" placeholder="Send a follow-up to this session…" aria-label="Follow-up prompt"></textarea>
+        <span class="chip warn" id="sFullChip" hidden>full access</span>
+        <div class="menu" id="sMenu">
+          <button type="button" class="btn mbtn" id="sMenuBtn" aria-haspopup="true" aria-expanded="false" aria-controls="sMenuPop" aria-label="Session options">&middot;&middot;&middot;</button>
+          <div class="mpop up" id="sMenuPop" role="menu" hidden>
+            <label class="mi" title="Let the agent edit files and run commands without asking"><input type="checkbox" id="sFull"> Full access</label>
+            <label class="mi"><input type="checkbox" id="sThink"> Show thinking</label>
+            <span id="sLinks"></span>
+          </div>
+        </div>
+        <button class="btn primary" id="sSend">Continue here</button>
+      </div>
     </div>
   </div>
 </div></div>
 
-<div class="modal" id="pairModal" role="dialog" aria-modal="true" aria-label="Pair phone"><div class="panel">
-  <div class="mhead"><b id="pairTitle">Pair phone</b><div class="spacer"></div><button class="btn sm" id="pairClose" aria-label="Close">&#10005;</button></div>
+<div class="modal" id="pairModal" role="dialog" aria-modal="true" aria-label="Connect phone to T3"><div class="panel">
+  <div class="mhead"><b id="pairTitle">Connect phone to T3</b><div class="spacer"></div><button class="btn sm" id="pairClose" aria-label="Close">&#10005;</button></div>
   <div class="mbody" id="pairBody"></div>
 </div></div>
 
-<div class="modal" id="jobModal" role="dialog" aria-modal="true" aria-label="Job output"><div class="panel">
+<div class="modal" id="jobModal" role="dialog" aria-modal="true" aria-label="Task output"><div class="panel">
   <div class="mhead"><b id="jTitle"></b><span id="jStatus"></span><div class="spacer"></div>
-    <button class="btn danger sm" id="jCancel">Cancel job</button><button class="btn sm" id="jClose" aria-label="Close job">&#10005;</button></div>
+    <button class="btn danger sm" id="jCancel">Cancel task</button><button class="btn sm" id="jClose" aria-label="Close task">&#10005;</button></div>
   <div class="mbody"><div class="sub" id="jMeta"></div><div class="prompt" id="jPrompt"></div><pre class="log" id="jOut"></pre></div>
 </div></div>
 
@@ -389,17 +441,106 @@ a.btn{text-decoration:none;color:inherit;display:inline-flex;align-items:center}
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const arr = x => Array.isArray(x) ? x : [];
+/* @pure-begin: DOM-free logic, unit tested by tests/js/ui_logic.test.mjs (keep it free of $ / document / window) */
+const UI = (() => {
+  const list = x => Array.isArray(x) ? x : [];
+  const isLoopHost = h => /^(127\.|localhost$|::1$|\[::1\]$|0\.0\.0\.0$)/i.test(String(h || ''));
+  const hostOfUrl = u => { try { return new URL(String(u)).hostname; } catch (e) { return ''; } };
+  /* host for "Open T3": peer urls first (hub >= 2.2 sends `urls`, older ones `url`), then the report address,
+     then the node's own non-loopback IPs. Loopback only helps a browser on that same machine, so skip it. */
+  function pickT3Host(peer, addr, ips) {
+    const cands = [...list(peer && peer.urls).map(hostOfUrl), peer && peer.url ? hostOfUrl(peer.url) : '', addr || '',
+                   ...list(ips).map(x => x && x.ip).filter(ip => ip && !/^169\.254\./.test(ip))];
+    const h = cands.find(x => x && !isLoopHost(x)) || '';
+    return /^[\w.\-:\[\]]+$/.test(h) ? h : '';
+  }
+  const isAnyJob = j => !!j && (j.engine === 'any' || j.req_engine === 'any');
+  const engineMatch = (j, e) => !e || (e === 'any' ? isAnyJob(j) : j.engine === e);
+  const rolloutClass = s => /ok|current|done|updated/i.test(s) ? 'done' : /fail|error|unreachable|offline/i.test(s) ? 'failed'
+    : /missing/i.test(s) ? 'cancelled' : 'running';
+  /* a rollout is in progress when someone holds the "one at a time" lease or a peer is still updating */
+  const rolloutActive = h => !!(h && ((h.update_lease && h.update_lease.holder) || list(h.rollout).some(r => /updating/i.test(r && r.status))));
+  const kindOf = a => { const k = String((a && a.kind) || '');
+    return /bad/.test(k) ? 'badver' : /offline/.test(k) ? 'offline' : /disk/.test(k) ? 'disk' : /version|behind/.test(k) ? 'version'
+      : /watchdog/.test(k) ? 'watchdog' : /hub_down/.test(k) ? 'hub' : k; };
+  const selfHealing = (a, active) => !!active && kindOf(a) === 'version';
+  const needsYou = h => { const act = rolloutActive(h);
+    return list(h && h.alerts).filter(a => a && (a.level === 'warn' || a.level === 'error') && !selfHealing(a, act)); };
+  /* header sentence: "All good – N of M machines on" or "N need you" */
+  function statusLine(nodes, h, ok) {
+    if (ok === false) return {cls: 'err', text: 'Hub unreachable'};
+    if (!h) return {cls: '', text: 'Checking…'};
+    const ns = list(nodes), on = ns.filter(n => n && n.online).length, need = needsYou(h);
+    if (!need.length) return {cls: 'ok', text: `All good – ${on} of ${ns.length} machine${ns.length === 1 ? '' : 's'} on`};
+    return {cls: need.some(a => a.level === 'error') ? 'err' : 'warn', text: `${need.length} need${need.length === 1 ? 's' : ''} you`};
+  }
+  /* plain-language alert row: {label, cls, reason, action:'details'|null} */
+  function alertView(a, active, name, pct) {
+    const n = name || 'A machine', k = kindOf(a);
+    if (k === 'offline') return {label: 'Offline', cls: 'failed', reason: `${n} is off or can't be reached.`, action: 'details'};
+    if (k === 'disk') return {label: 'Disk', cls: 'cancelled', reason: `${n} is running out of disk space${pct != null ? ` (${Math.round(pct)}% full)` : ''}.`, action: 'details'};
+    if (k === 'version') return selfHealing(a, active) ? {label: 'Fixing itself', cls: 'healing', reason: `${n} is getting the latest version.`, action: null}
+      : {label: 'Update', cls: 'cancelled', reason: `${n} is on an older version.`, action: 'details'};
+    if (k === 'watchdog') return {label: 'Auto-repair', cls: 'cancelled', reason: `Auto-repair hasn't run on ${n} lately.`, action: 'details'};
+    if (k === 'hub') return {label: 'Hub', cls: 'failed', reason: `The hub on ${n} can't be reached.`, action: 'details'};
+    if (k === 'badver') return {label: 'Rolled back', cls: 'failed', reason: String((a && a.msg) || 'A version was rolled back and will not be installed.')
+      .replace(/is marked fleet-bad \(a canary rolled it back\); watchdogs will not install it/, 'was rolled back on a test machine and will not be installed.'), action: null};
+    return {label: a && a.level === 'error' ? 'Error' : 'Warning', cls: a && a.level === 'error' ? 'failed' : 'cancelled', reason: String((a && a.msg) || ''), action: a && a.node_id ? 'details' : null};
+  }
+  /* Transcript cursor: the hub's seq numbers restart at 1 after a hub restart / leader change (memory only), so a
+     cursor that goes DOWN means "start over". Returns {mode:'replace'|'append'|'reset', events, cursor}. */
+  function transcriptStep(prev, r) {
+    const evs = Array.isArray(r) ? r : list(r && r.events), cur = r && !Array.isArray(r) ? (r.cursor ?? r.next ?? null) : null;
+    if (cur == null) return {mode: 'replace', events: evs, cursor: null};
+    const c = Number(cur);
+    if ((r && r.reset) || (prev != null && c < Number(prev))) return {mode: 'reset', events: [], cursor: null};
+    const fresh = prev == null ? evs : evs.filter(e => !(e && typeof e.seq === 'number' && e.seq <= Number(prev)));
+    return {mode: 'append', events: fresh, cursor: c};
+  }
+  const CARD_ORDER = {failed: 0, running: 1, starting: 1, queued: 2};
+  const sortCards = js => list(js).map((j, i) => [j, i]).sort((a, b) => ((CARD_ORDER[a[0].status] ?? 3) - (CARD_ORDER[b[0].status] ?? 3)) || a[1] - b[1]).map(x => x[0]);
+  const unwrapBrief = raw => raw && typeof raw === 'object' && Object.prototype.hasOwnProperty.call(raw, 'brief') ? raw.brief : raw;
+  return {isLoopHost, pickT3Host, isAnyJob, engineMatch, rolloutClass, rolloutActive, selfHealing, needsYou, statusLine, alertView, transcriptStep, sortCards, unwrapBrief};
+})();
+/* @pure-end */
 const ACTIVE = ['queued','starting','running'];
 let S = {nodes:[], jobs:[], events:[], cluster:{}}, H = {alerts:[], rollout:[]}, P = {list:[], ok:null, q:''};
 let openNode = null, openTab = 'overview', openJob = null, detail = null, view = 'projects';
 
-/* theme */
-try { const t = localStorage.getItem('forge-theme'); if (t) document.documentElement.dataset.theme = t; } catch {}
-$('#themeBtn').onclick = () => {
-  const cur = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-  const nxt = cur === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = nxt;
-  try { localStorage.setItem('forge-theme', nxt); } catch {}
-};
+/* theme: Auto (follow the device) / Light / Dark */
+function applyTheme(t) {
+  const de = document.documentElement;
+  if (t === 'light' || t === 'dark') de.dataset.theme = t; else delete de.dataset.theme;
+  document.querySelectorAll('input[name=theme]').forEach(r => r.checked = r.value === (t === 'light' || t === 'dark' ? t : 'auto'));
+}
+let themePref = 'auto';
+try { themePref = localStorage.getItem('forge-theme') || 'auto'; } catch {}
+applyTheme(themePref);
+document.querySelectorAll('input[name=theme]').forEach(r => r.onchange = () => {
+  applyTheme(r.value);
+  try { if (r.value === 'auto') localStorage.removeItem('forge-theme'); else localStorage.setItem('forge-theme', r.value); } catch {}
+});
+
+/* "..." menus: one open at a time; click outside or Escape closes */
+function closeMenus(except) {
+  document.querySelectorAll('.menu').forEach(m => { if (m === except) return;
+    const p = m.querySelector('.mpop'), b = m.querySelector('[aria-haspopup]'); if (p) p.hidden = true; if (b) b.setAttribute('aria-expanded', 'false'); });
+}
+document.querySelectorAll('.menu').forEach(m => {
+  const b = m.querySelector('[aria-haspopup]'), p = m.querySelector('.mpop');
+  b.onclick = e => { e.stopPropagation(); const open = p.hidden; closeMenus(m); p.hidden = !open; b.setAttribute('aria-expanded', String(open));
+    if (open) { const f = p.querySelector('button,input,a'); if (f) f.focus(); } };
+  p.onclick = e => e.stopPropagation();
+});
+document.addEventListener('click', () => closeMenus());
+
+/* PWA manifest (data: URL, absolute start_url so "Add to Home Screen" opens this hub) */
+try {
+  const icon = document.querySelector('link[rel=apple-touch-icon]').href;
+  const mf = {name: 'Hivemind', short_name: 'Hivemind', display: 'standalone', start_url: location.origin + location.pathname, scope: location.origin + '/',
+              background_color: '#f5f6f8', theme_color: '#4f46e5', icons: [{src: icon, sizes: 'any', type: 'image/svg+xml', purpose: 'any'}]};
+  $('#manifestLink').href = 'data:application/manifest+json,' + encodeURIComponent(JSON.stringify(mf));
+} catch {}
 
 /* api */
 let bannerTimer = null;
@@ -462,20 +603,21 @@ function nodeChips(n) {
   const out = [], tv = targetVersion(), av = n.info?.agent_version;
   if (!n.online) out.push(`<span class="chip err">Offline</span>`);
   if (n.disk_pct != null && n.disk_pct >= 90) out.push(`<span class="chip err">Disk ${Math.round(n.disk_pct)}% full</span>`);
-  if (n.online && av && tv && vcmp(av, tv) < 0) out.push(`<span class="chip warn">Update available (${esc(vfmt(av))} → ${esc(vfmt(tv))})</span>`);
+  if (n.online && av && tv && vcmp(av, tv) < 0) out.push(UI.rolloutActive(H) ? `<span class="chip ok">Updating (${esc(vfmt(av))} → ${esc(vfmt(tv))})</span>`
+    : `<span class="chip warn">Update available (${esc(vfmt(av))} → ${esc(vfmt(tv))})</span>`);
   return out.join('');
 }
 
 /* fleet */
 function renderGrid() {
   const g = $('#grid'), nodes = arr(S.nodes);
-  if (!nodes.length) { g.innerHTML = `<div class="panel empty">No machines yet. Click <b>+ Add machine</b>.</div>`; return; }
+  if (!nodes.length) { g.innerHTML = `<div class="panel empty">No machines yet. Use <b>+ Add machine</b> in the &middot;&middot;&middot; menu.</div>`; return; }
   g.innerHTML = nodes.map(n => {
     const m = n.metrics || {}, i = n.info || {}, gpu = arr(m.gpu)[0], role = roleOf(n.id);
     const wr = m.work_root ? `<div class="sub mono" style="margin-top:6px">Work drive ${esc(String(m.work_root).slice(0,2))} · ${m.work_root_free_gb != null ? Math.round(m.work_root_free_gb)+' GB free' : '—'}</div>` : '';
     const svc = arr(m.services).map(x => `<span class="chip ${x.ok ? 'ok' : 'err'}" title="${x.ok ? 'running' : 'not responding'}">${esc(x.name)} ${x.ok ? '&#10003;' : '&#10007;'}</span>`).join('');
     const t3 = t3Url(n.id);
-    const acts = n.online ? `<div class="mact">${t3 ? `<a class="btn sm" href="${esc(t3)}" target="_blank" rel="noopener" data-stop>Open T3</a>` : ''}<button type="button" class="btn sm" data-pair="${esc(n.id)}">Pair phone</button></div>` : '';
+    const acts = n.online ? `<div class="mact">${t3 ? `<a class="btn sm" href="${esc(t3)}" target="_blank" rel="noopener" data-stop>Open T3</a>` : ''}<button type="button" class="btn sm" data-pair="${esc(n.id)}">Connect phone to T3</button></div>` : '';
     return `<div role="button" tabindex="0" class="panel card ${n.online ? '' : 'off'}" data-node="${esc(n.id)}" aria-label="Open ${esc(hostOf(n))} details">
       <div class="row"><span class="dot ${n.online ? 'on' : ''}"></span><span class="name">${esc(hostOf(n))}</span>
         ${role ? `<span class="badge ${role === 'leader' ? 'leader' : ''}">${esc(role)}</span>` : ''}
@@ -483,7 +625,7 @@ function renderGrid() {
       <div class="sub">${short(i.cpu)} · ${num(i.ram_gb)} GB${gpu ? ' · '+esc(gpu.name) : ''}</div>
       <div class="meters">${meter('CPU', m.cpu, '--cpu')}${meter('RAM', m.mem_pct, '--mem')}${meter('Disk', n.disk_pct, '--disk')}${gpu ? meter('GPU', gpu.util, '--gpu') : ''}</div>
       ${wr}
-      <div class="chips">${nodeChips(n)}${svc}${agentChips(n.agents)}${n.active_jobs ? `<span class="chip job">${n.active_jobs} job${n.active_jobs>1?'s':''} running</span>` : ''}</div>
+      <div class="chips">${nodeChips(n)}${svc}${agentChips(n.agents)}${n.active_jobs ? `<span class="chip job">${n.active_jobs} task${n.active_jobs>1?'s':''} running</span>` : ''}</div>
       ${acts}
       ${sparkSvg(n.spark, [['mem','--mem'],['cpu','--cpu']])}
     </div>`;
@@ -494,7 +636,9 @@ function renderGrid() {
   g.querySelectorAll('[data-pair]').forEach(b => b.onclick = e => { e.stopPropagation(); openPair(b.dataset.pair); });
 }
 function renderFeed() {
-  const ev = arr(S.events);
+  // info-level health items belong in the activity feed, not in Alerts
+  const info = arr(H.alerts).filter(a => a && a.level !== 'warn' && a.level !== 'error').map(a => ({ts: H.now || now(), node_id: a.node_id, level: 'info', msg: a.msg}));
+  const ev = info.concat(arr(S.events));
   $('#feed').innerHTML = ev.length ? ev.map(e => `<div class="ev"><span class="t">${clock(e.ts)}</span><span class="lvl ${esc(e.level)}">${esc(e.level || 'info')}</span><span><b>${esc(e.node_id ? nodeName(e.node_id) : 'hub')}</b> ${esc(e.msg)}</span></div>`).join('') : '<div class="empty">Quiet so far.</div>';
 }
 function fillSelect(sel, opts, keep) {
@@ -504,8 +648,8 @@ function fillSelect(sel, opts, keep) {
 }
 function nodeOptions() {
   const nodes = arr(S.nodes), adm = isAdmin();
-  const list = nodes.map(n => [n.id, hostOf(n) + (n.online ? '' : ' (offline)') + (adm && !n.system_lane?.online ? ' · system lane offline' : '')]);
-  if (!adm) return [['auto','Auto (best available)'], ...list];
+  const list = nodes.map(n => [n.id, hostOf(n) + (n.online ? '' : ' (offline)') + (adm && !n.system_lane?.online ? ' · admin helper offline' : '')]);
+  if (!adm) return [['auto','Any free machine'], ...list];
   // admin jobs never go to "auto": pick a machine, or (actions only) every online machine
   return [['', 'Choose a machine…'], ...(adminMode() === 'custom' ? [] : [['__all__', 'All machines (online)']]), ...list];
 }
@@ -516,24 +660,47 @@ function renderSelects() {
 }
 
 /* jobs */
-const sysBadge = j => j && j.run_as === 'system' ? '<span class="badge sys" title="Runs as SYSTEM">SYSTEM</span> ' : '';
+const sysBadge = j => j && j.run_as === 'system' ? '<span class="badge sys" title="Runs with admin rights">admin rights</span> ' : '';
+const ENG = {claude:'Claude Code', codex:'Codex', shell:'PowerShell', ollama:'Ollama', admin:'Admin', action:'Action', any:'Best fit'};
+const engLbl = e => ENG[e] || String(e || '—');
+/* "With" cell: Best fit jobs keep their label after the hub resolves them (engine rewritten, req_engine:"any") */
+function withHtml(j) {
+  if (UI.isAnyJob(j)) return 'Best fit' + (j.engine && j.engine !== 'any' ? ` <span class="chip">${esc(engLbl(j.engine))}</span>` : '');
+  return esc(j.action || engLbl(j.engine));
+}
+const withTxt = j => UI.isAnyJob(j) ? 'Best fit' + (j.engine && j.engine !== 'any' ? ' (' + engLbl(j.engine) + ')' : '') : (j.action || engLbl(j.engine));
 function jobRow(j, showNode = true) {
   const via = j.requested === 'auto' ? ' <span class="chip">auto</span>' : '';
-  return `<tr class="click" tabindex="0" data-job="${esc(j.id)}"><td class="mono sub">${esc(String(j.id).slice(-6))}</td>${showNode ? `<td>${esc(nodeName(j.node_id))}${via}</td>` : ''}<td>${sysBadge(j)}${j.engine === 'any' ? 'Any' : esc(j.action || j.engine)}${j.engine === 'any' && j.resolved_engine ? ' <span class="chip">' + esc(j.resolved_engine) + '</span>' : ''}${j.full_access ? ' <span class="chip warn">full access</span>' : ''}</td>
+  return `<tr class="click" tabindex="0" data-job="${esc(j.id)}"><td class="mono sub">${esc(String(j.id).slice(-6))}</td>${showNode ? `<td>${esc(nodeName(j.node_id))}${via}</td>` : ''}<td>${sysBadge(j)}${withHtml(j)}${j.full_access ? ' <span class="chip warn">full access</span>' : ''}</td>
     <td><div class="trunc">${esc(j.prompt)}</div>${j.status === 'queued' && j.wait_reason ? `<div class="sub trunc">&#8987; ${esc(j.wait_reason)}</div>` : ''}</td><td><span class="st ${esc(j.status)}">${esc(j.status)}</span></td>
     <td class="sub">${ago(j.created)}</td><td class="sub">${j.started ? dur(j.started, j.finished) : '—'}</td></tr>`;
 }
 function bindJobRows(root) {
-  root.querySelectorAll('tr[data-job]').forEach(tr => {
+  root.querySelectorAll('[data-job]').forEach(tr => {
     tr.onclick = () => openJobModal(tr.dataset.job);
-    tr.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); tr.click(); } };
+    if (tr.tagName === 'TR') tr.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); tr.click(); } };
   });
 }
+/* phone layout: one card per task, failed/running first */
+const jobCard = j => `<button type="button" class="panel jcard" data-job="${esc(j.id)}"><span class="jdot ${esc(j.status)}" title="${esc(j.status)}"></span>
+  <span class="tt">${esc(oneLine(j.prompt || j.action, 120) || '(no prompt)')}</span>
+  <span class="sub">${esc(nodeName(j.node_id))} · ${esc(withTxt(j))} · ${ago(j.created)}${j.status === 'queued' && j.wait_reason ? ' · ' + esc(j.wait_reason) : ''}</span></button>`;
+/* "Show brief tasks": /api/state never includes them, so fetch /api/jobs?include_brief=true (hub >= 2.2) */
+let jobsAllOk = null;
+async function loadJobsAll() {
+  if (!$('#fBriefs').checked || jobsAllOk === false) return;
+  try { S.jobsAll = arr(await api('/api/jobs?include_brief=true&limit=80')); jobsAllOk = true; }
+  catch (e) { if (e.status === 404 || e.status === 405) { jobsAllOk = false; S.jobsAll = null; } }
+  renderJobs();
+}
 function renderJobs() {
-  const f = {n:$('#fNode').value, s:$('#fStatus').value, e:$('#fEngine').value};
-  const js = arr(S.jobs).filter(j => (!f.n || j.node_id === f.n) && (!f.s || j.status === f.s) && (!f.e || j.engine === f.e) && ($('#fBriefs').checked || j.source !== 'brief'));
-  $('#jobs').innerHTML = js.length ? js.map(j => jobRow(j)).join('') : `<tr><td colspan="7" class="empty">No matching jobs.</td></tr>`;
-  bindJobRows($('#jobs'));
+  const f = {n:$('#fNode').value, s:$('#fStatus').value, e:$('#fEngine').value}, br = $('#fBriefs').checked;
+  const src = br && Array.isArray(S.jobsAll) ? S.jobsAll : arr(S.jobs);
+  const js = src.filter(j => j && (!f.n || j.node_id === f.n) && (!f.s || j.status === f.s) && UI.engineMatch(j, f.e) && (br || j.source !== 'brief'));
+  const none = br && jobsAllOk === false ? 'This hub cannot list brief tasks yet (needs v2.2.0).' : 'No matching tasks.';
+  $('#jobs').innerHTML = js.length ? js.map(j => jobRow(j)).join('') : `<tr><td colspan="7" class="empty">${none}</td></tr>`;
+  $('#jobCards').innerHTML = js.length ? UI.sortCards(js).map(jobCard).join('') : `<div class="panel empty">${none}</div>`;
+  bindJobRows($('#jobs')); bindJobRows($('#jobCards'));
 }
 
 /* health */
@@ -558,17 +725,27 @@ function renderHealth() {
       <td class="sub">${n ? lastAction(n) : '—'}</td></tr>`;
   }).join('') : `<tr><td colspan="7" class="empty">No cluster information.</td></tr>`;
   $('#cluster').querySelectorAll('[data-prio]').forEach(b => b.onclick = () => movePeer(b.dataset.prio, +b.dataset.dir, peers));
-  const al = arr(H.alerts), lab = {error:'Error', warn:'Warning'}, cls = {error:'failed', warn:'cancelled'};
-  $('#alerts').innerHTML = al.length ? al.map(a => `<div class="alert"><span class="st ${cls[a.level] || 'running'}">${lab[a.level] || 'Info'}</span><span>${a.node_id ? '<b>'+esc(nodeName(a.node_id))+'</b> ' : ''}${esc(a.msg)}</span></div>`).join('')
-    : '<div class="empty">All clear. Nothing needs attention.</div>';
+  // alerts: plain reason + one action; info-level items go to the activity feed instead
+  const act = UI.rolloutActive(H);
+  const al = arr(H.alerts).filter(a => a && (a.level === 'warn' || a.level === 'error'));
+  $('#alerts').innerHTML = al.length ? al.map((a, i) => {
+    const n = a.node_id ? arr(S.nodes).find(x => x.id === a.node_id) : null;
+    const v = UI.alertView(a, act, a.node_id ? nodeName(a.node_id) : '', n ? n.disk_pct : null);
+    const btn = v.action === 'details' && n ? `<button type="button" class="btn sm act" data-adet="${esc(n.id)}">Details</button>` : '';
+    return `<div class="alert" title="${esc(a.msg || '')}"><span class="st ${esc(v.cls)}">${esc(v.label)}</span><span class="why">${esc(v.reason)}</span>${btn}</div>`;
+  }).join('') : '<div class="empty">All clear. Nothing needs attention.</div>';
+  $('#alerts').querySelectorAll('[data-adet]').forEach(b => b.onclick = () => openDrawer(b.dataset.adet));
   $('#bundle').textContent = H.bundle_version ? `· current ${vfmt(H.bundle_version)}` : '';
   const ro = arr(H.rollout);
-  $('#rollout').innerHTML = ro.length ? ro.map(r => `<tr><td>${esc(nodeName(r.node_id))}</td><td class="mono">${esc(vfmt(r.version))}</td><td><span class="st ${/ok|current|done|updated/i.test(r.status) ? 'done' : /fail|error/i.test(r.status) ? 'failed' : 'running'}">${esc(r.status || '—')}</span></td></tr>`).join('')
+  $('#rollout').innerHTML = ro.length ? ro.map(r => `<tr><td>${esc(nodeName(r.node_id))}</td><td class="mono">${esc(vfmt(r.version))}</td><td><span class="st ${UI.rolloutClass(r.status)}">${esc(r.status || '—')}</span></td></tr>`).join('')
     : `<tr><td colspan="3" class="empty">No rollout data.</td></tr>`;
   const bad = arr(c.bad_versions || H.bad_versions), lease = H.update_lease !== undefined ? H.update_lease : c.update_lease, fi = $('#fleetInfo');
-  const leaseTxt = lease === undefined ? '' : lease && lease.holder ? `<span class="pill warn">Update lease: ${esc(nodeName(lease.holder))}${lease.version ? ' &rarr; ' + esc(vfmt(lease.version)) : ''}</span>` : '<span class="pill">Update lease: free</span>';
+  const left = lease && lease.expires_in_s != null ? ` · ${Math.max(1, Math.round(lease.expires_in_s / 60))} min left` : '';
+  const leaseTxt = lease === undefined ? '' : lease && lease.holder
+    ? `<span class="pill warn">Updating one at a time: ${esc(nodeName(lease.holder))}${lease.version ? ' &rarr; ' + esc(vfmt(lease.version)) : ''}${left}</span>`
+    : '<span class="pill">No update in progress</span>';
   fi.hidden = !bad.length && !leaseTxt;
-  fi.innerHTML = (bad.length ? `<span class="sub">Fleet-bad versions (never installed):</span>${bad.map(v => `<span class="chip err">${esc(vfmt(v))}</span>`).join('')}` : '') + leaseTxt;
+  fi.innerHTML = (bad.length ? `<span class="sub">Rolled back (won't be installed):</span>${bad.map(v => `<span class="chip err">${esc(vfmt(v))}</span>`).join('')}` : '') + leaseTxt;
   const hn = arr(H.nodes);
   const lane = (on, seen) => `<span class="st ${on ? 'done' : 'failed'}">${on ? 'online' : 'offline'}</span>${!on && seen ? ' <span class="sub">seen ' + ago(seen) + ' ago</span>' : (!seen ? ' <span class="sub">never</span>' : '')}`;
   $('#lanes').innerHTML = hn.length ? hn.map(n => { const sl = n.system_lane || {}, sn = arr(S.nodes).find(x => x.id === n.id);
@@ -587,9 +764,9 @@ async function movePeer(id, dir, peers) {
 }
 
 /* header + tabs */
-const TABS_TOP = [['projects','Projects'],['fleet','Fleet'],['jobs','Jobs'],['health','Health']];
+const TABS_TOP = [['projects','Projects'],['fleet','Fleet'],['jobs','Tasks'],['health','Health']];
 function renderNav() {
-  const act = arr(S.jobs).filter(j => ACTIVE.includes(j.status)).length, al = arr(H.alerts).filter(a => a.level !== 'info').length;
+  const act = arr(S.jobs).filter(j => ACTIVE.includes(j.status)).length, al = UI.needsYou(H).length;
   const live = arr(P.list).reduce((a, p) => a + (+p.live_sessions || 0), 0);
   const cnt = {projects: live || '', fleet: arr(S.nodes).length, jobs: act || '', health: al || ''};
   $('#nav').innerHTML = TABS_TOP.map(([k, l]) => `<button role="tab" id="tab-${k}" data-v="${k}" aria-selected="${k === view}" aria-controls="v-${k}">${l}${cnt[k] !== '' ? `<span class="n">${cnt[k]}</span>` : ''}</button>`).join('');
@@ -600,28 +777,28 @@ function setView(v) {
   TABS_TOP.forEach(([k]) => $('#v-' + k).hidden = k !== v);
   renderNav();
 }
+/* header: one status sentence instead of leader/via pills */
+let hubOk = null, healthLoaded = false;
 function renderHeader() {
-  const c = S.cluster || {}, nodes = arr(S.nodes), on = nodes.filter(n => n.online).length, act = arr(S.jobs).filter(j => ACTIVE.includes(j.status)).length;
-  const lp = $('#leaderPill');
-  lp.textContent = 'Leader: ' + (c.leader_id ? nodeName(c.leader_id) : '—');
-  lp.className = 'pill ' + (c.leader_id ? 'ok' : 'warn');
-  $('#via').textContent = c.viewing && c.leader_id && c.viewing !== c.leader_id ? 'via ' + nodeName(c.viewing) : '';
-  $('#stats').innerHTML = `<span><b>${on}</b>/${nodes.length} online</span><span><b>${act}</b> active job${act === 1 ? '' : 's'}</span>`;
+  const s = UI.statusLine(S.nodes, healthLoaded ? H : null, hubOk), el = $('#hStatus');
+  el.className = 'hstatus ' + s.cls; $('#hStatusTxt').textContent = s.text;
 }
+$('#hStatus').onclick = () => setView('health');
 function render() { renderHeader(); renderNav(); renderGrid(); renderProjects(); renderFeed(); renderSelects(); renderJobs(); renderHealth(); }
 
 async function refresh() {
   if (document.hidden) return;
-  try { S = Object.assign({nodes:[], jobs:[], events:[], cluster:{}}, await api('/api/state')); banner(''); render(); if (openNode) loadDetail(); }
-  catch (e) { if (e.status === 503) banner('No leader reachable — retrying'); else if (e instanceof TypeError) banner('Hub unreachable — retrying'); }
+  try { const jobsAll = S.jobsAll; S = Object.assign({nodes:[], jobs:[], events:[], cluster:{}}, await api('/api/state')); S.jobsAll = jobsAll;
+        hubOk = true; banner(''); render(); if (openNode) loadDetail(); loadJobsAll(); }
+  catch (e) { if (e.status === 503) { hubOk = false; banner('No leader reachable — retrying'); } else if (e instanceof TypeError) { hubOk = false; banner('Hub unreachable — retrying'); } renderHeader(); }
 }
 async function refreshHealth() {
   if (document.hidden) return;
-  try { H = Object.assign({alerts:[], rollout:[]}, await api('/api/health')); renderNav(); renderHealth(); renderGrid(); } catch (e) {}
+  try { H = Object.assign({alerts:[], rollout:[]}, await api('/api/health')); healthLoaded = true; renderHeader(); renderNav(); renderHealth(); renderGrid(); renderFeed(); } catch (e) {}
 }
 
 /* drawer */
-const TABS = [['overview','Overview'],['processes','Processes'],['agents','Agents'],['logs','Logs'],['jobs','Jobs'],['settings','Settings']];
+const TABS = [['overview','Overview'],['processes','Processes'],['agents','Agents'],['logs','Logs'],['jobs','Tasks'],['settings','Settings']];
 function openDrawer(id) { openNode = id; openTab = 'overview'; detail = null; $('#tabs').innerHTML = ''; $('#dContent').dataset.tab = ''; $('#drawer').classList.add('open'); $('#dContent').innerHTML = '<div class="empty">Loading…</div>'; $('#dClose').focus(); loadDetail(); }
 function closeDrawer() { openNode = null; $('#drawer').classList.remove('open'); }
 $('#dClose').onclick = closeDrawer;
@@ -662,16 +839,16 @@ function renderDetail() {
         <div><span class="k">Power</span><b>${bat}</b></div>
         <div><span class="k">Network</span><b>${ips}</b></div><div><span class="k">Tools</span><b>${vers}</b></div>
         <div><span class="k">WSL</span><b>${esc(arr(i.wsl).join(', ') || '—')}</b></div>
-        <div><span class="k">Agent</span><b>${esc(vfmt(i.agent_version))} · ${num(i.max_jobs)} job slots · ${num(m.procs_total)} procs</b></div>
-        <div><span class="k">System lane</span><b>${d.system_lane?.online ? 'Online' : 'Offline'}</b> <span class="sub">${d.system_lane?.last_seen ? 'seen ' + ago(d.system_lane.last_seen) + ' ago' : 'never seen'}</span></div>
-        <div><span class="k">Watchdog</span><b>${lastAction(d)}</b></div>
+        <div><span class="k">Agent</span><b>${esc(vfmt(i.agent_version))} · ${num(i.max_jobs)} task slots · ${num(m.procs_total)} procs</b></div>
+        <div><span class="k">Admin helper</span><b>${d.system_lane?.online ? 'Online' : 'Offline'}</b> <span class="sub">${d.system_lane?.last_seen ? 'seen ' + ago(d.system_lane.last_seen) + ' ago' : 'never seen'}</span></div>
+        <div><span class="k">Auto-repair</span><b>${lastAction(d)}</b></div>
       </div>`;
   } else if (openTab === 'processes') {
     h += `<div class="panel tablewrap"><table><thead><tr><th>Process</th><th>PID</th><th>CPU</th><th>Memory</th></tr></thead><tbody>` +
       arr(d.procs).map(p => `<tr><td>${esc(p.name)}</td><td class="mono sub">${esc(p.pid)}</td><td>${num(p.cpu)}%</td><td>${num(p.mem_mb)} MB</td></tr>`).join('') + `</tbody></table></div>`;
   } else if (openTab === 'agents') {
     h += arr(d.agents).length ? `<div class="panel tablewrap"><table><thead><tr><th>Kind</th><th>PID</th><th>Started</th><th>Command</th></tr></thead><tbody>` +
-      d.agents.map(a => `<tr><td><span class="chip">${esc(a.kind)}</span></td><td class="mono sub">${esc(a.pid)}</td><td class="sub">${a.started ? ago(Date.parse(a.started)/1000)+' ago' : (a.job ? 'job '+esc(String(a.job).slice(-6)) : '—')}</td><td class="mono sub"><div class="trunc">${esc(a.cmd)}</div></td></tr>`).join('') + `</tbody></table></div>`
+      d.agents.map(a => `<tr><td><span class="chip">${esc(a.kind)}</span></td><td class="mono sub">${esc(a.pid)}</td><td class="sub">${a.started ? ago(Date.parse(a.started)/1000)+' ago' : (a.job ? 'task '+esc(String(a.job).slice(-6)) : '—')}</td><td class="mono sub"><div class="trunc">${esc(a.cmd)}</div></td></tr>`).join('') + `</tbody></table></div>`
       : '<div class="empty">No agent processes running.</div>';
   } else if (openTab === 'logs') {
     const logs = arr(d.logs);
@@ -683,8 +860,8 @@ function renderDetail() {
         <span class="spacer"></span><span class="sub">updated ${ago(L.ts)} ago</span></div><pre class="log mono">${esc(L.text)}</pre>`;
     }
   } else if (openTab === 'jobs') {
-    h += arr(d.jobs).length ? `<div class="panel tablewrap"><table><thead><tr><th>#</th><th>Engine</th><th>Task</th><th>Status</th><th>Age</th><th>Duration</th></tr></thead><tbody>${d.jobs.map(j => jobRow(j, false)).join('')}</tbody></table></div>`
-      : '<div class="empty">No jobs on this machine yet.</div>';
+    h += arr(d.jobs).length ? `<div class="panel tablewrap"><table><thead><tr><th>#</th><th>With</th><th>Task</th><th>Status</th><th>Age</th><th>Duration</th></tr></thead><tbody>${d.jobs.map(j => jobRow(j, false)).join('')}</tbody></table></div>`
+      : '<div class="empty">No tasks on this machine yet.</div>';
   }
   c.innerHTML = h;
   c.querySelectorAll('[data-log]').forEach(b => b.onclick = () => { logSel = b.dataset.log; renderDetail(); const p = c.querySelector('pre.log'); if (p) p.scrollTop = p.scrollHeight; });
@@ -696,7 +873,7 @@ function renderSettings(c, d) {
   c.innerHTML = `<form class="set" id="setForm">
     <label>Work folder<input type="text" id="sRoot" class="mono" value="${esc(s.work_root || '')}" placeholder="${esc(m.work_root || 'Auto: drive with most free space')}">
       <span class="hint">Leave empty to let the machine pick the drive with the most free space${m.work_root ? ' (now: ' + esc(m.work_root) + ')' : ''}.</span></label>
-    <label>Max parallel jobs<input type="number" id="sMax" min="1" max="32" value="${esc(s.max_jobs ?? '')}" placeholder="${esc(d.info?.max_jobs ?? 'default')}">
+    <label>Max parallel tasks<input type="number" id="sMax" min="1" max="32" value="${esc(s.max_jobs ?? '')}" placeholder="${esc(d.info?.max_jobs ?? 'default')}">
       <span class="hint">Leave empty for the default.</span></label>
     <div class="sendrow"><button class="btn primary" type="submit">Save</button><span class="hint" id="sMsg" role="status"></span></div></form>`;
   $('#setForm').onsubmit = async e => {
@@ -722,22 +899,22 @@ async function loadActions() {
   try { ACTIONS = await api('/api/actions'); } catch (e) { return; }
   const sel = $('#aMode'), cur = sel.value;
   sel.innerHTML = arr(ACTIONS.actions).map(a => `<option value="${esc(a.name)}">${esc(a.name)}${a.destructive ? ' (needs confirm)' : ''}</option>`).join('')
-    + '<option value="custom">Custom PowerShell (as SYSTEM)</option>';
+    + '<option value="custom">Custom PowerShell (admin rights)</option>';
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : sel.options[0].value;
   renderActionArgs();
 }
 function renderActionArgs() {
   const a = actionSpec(), custom = adminMode() === 'custom';
   $('#promptBox').hidden = isAdmin() && !custom;
-  const off = ACTIONS && ACTIONS.admin_lane_enabled === false ? ' Admin lane is disabled on this hub (admin_lane_enabled=false); jobs will fail.' : '';
-  $('#aDesc').textContent = (custom ? 'Free-form PowerShell, run as SYSTEM. Always asks for confirmation.' : (a?.description || '') + (a?.destructive ? ' Asks for confirmation.' : '')) + off;
+  const off = ACTIONS && ACTIONS.admin_lane_enabled === false ? ' The admin helper is turned off on this hub (admin_lane_enabled=false); these tasks will fail.' : '';
+  $('#aDesc').textContent = (custom ? 'Free-form PowerShell, run with admin rights. Always asks for confirmation.' : (a?.description || '') + (a?.destructive ? ' Asks for confirmation.' : '')) + off;
   $('#aArgs').innerHTML = custom || !a ? '' : Object.entries(a.args || {}).map(([k, r]) => {
     const lab = `${esc(r.label || k)}${r.required ? ' *' : ''}`, id = 'aArg-' + esc(k);
     if (r.enum) return `<label class="f">${lab}<select id="${id}" data-arg="${esc(k)}">${r.required ? '' : '<option value="">(default)</option>'}${r.enum.map(v => `<option>${esc(v)}</option>`).join('')}</select></label>`;
     if (r.type === 'int') return `<label class="f">${lab}<input type="number" id="${id}" data-arg="${esc(k)}" data-int="1" ${r.min != null ? `min="${r.min}"` : ''} ${r.max != null ? `max="${r.max}"` : ''} placeholder="${esc(r.default ?? '')}"></label>`;
     return `<label class="f">${lab}<input type="text" class="mono" id="${id}" data-arg="${esc(k)}" autocomplete="off" spellcheck="false"></label>`;
   }).join('');
-  if (isAdmin()) $('#tPrompt').placeholder = 'PowerShell to run as SYSTEM on the chosen machine';
+  if (isAdmin()) $('#tPrompt').placeholder = 'PowerShell to run with admin rights on the chosen machine';
   renderSelects();
 }
 function collectArgs() {
@@ -748,7 +925,7 @@ function collectArgs() {
 function syncEngine() {
   const adm = isAdmin();
   $('#adminBox').hidden = !adm; $('#advBox').hidden = adm;
-  $('#sendBtn').textContent = adm ? 'Run as SYSTEM' : 'Run task';
+  $('#sendBtn').textContent = adm ? 'Run with admin rights' : 'Run task';
   $('#sendBtn').classList.toggle('sysbtn', adm);
   if (!adm) { $('#promptBox').hidden = false; $('#tPrompt').placeholder = 'What should it do?  (Ctrl/Cmd+Enter to run)'; }
   if (adm && !ACTIONS) loadActions(); else renderActionArgs();
@@ -770,7 +947,7 @@ async function submitAdmin() {
   }
   const targets = target === '__all__' ? arr(S.nodes).filter(n => n.online).map(n => n.id) : [target];
   if (!targets.length) { $('#tMsg').textContent = 'No online machines.'; return; }
-  if (needsConfirm && !confirm(`Run ${label} as SYSTEM on ${targets.map(nodeName).join(', ')}?`)) { $('#tMsg').textContent = 'Not sent.'; return; }
+  if (needsConfirm && !confirm(`Run ${label} with admin rights on ${targets.map(nodeName).join(', ')}?`)) { $('#tMsg').textContent = 'Not sent.'; return; }
   $('#sendBtn').disabled = true;
   const ids = [], errs = [];
   try {
@@ -779,7 +956,7 @@ async function submitAdmin() {
       catch (err) { errs.push(`${nodeName(t)}: ${err.message}`); }
     }
   } finally { $('#sendBtn').disabled = false; }
-  $('#tMsg').textContent = errs.length ? 'Error: ' + errs.join('; ') : (ids.length > 1 ? `Queued ${ids.length} jobs.` : 'Started.');
+  $('#tMsg').textContent = errs.length ? 'Error: ' + errs.join('; ') : (ids.length > 1 ? `Queued ${ids.length} tasks.` : 'Started.');
   if (ids.length && custom) $('#tPrompt').value = '';
   refresh();
   if (ids.length === 1 && targets.length === 1) openJobModal(ids[0]);
@@ -790,13 +967,14 @@ async function submitTask() {
   if (!body.prompt) { $('#tMsg').textContent = 'Write what the task should do.'; $('#tPrompt').focus(); return; }
   $('#sendBtn').disabled = true;
   try { const r = await api('/api/jobs', {method:'POST', body:JSON.stringify(body)});
-        $('#tMsg').textContent = 'Started.'; $('#tPrompt').value = ''; refresh(); openJobModal(r.id); }
+        $('#tMsg').textContent = r && r.wait_reason ? 'Queued: ' + r.wait_reason : 'Started.'; $('#tPrompt').value = ''; refresh(); openJobModal(r.id); }
   catch (err) { $('#tMsg').textContent = 'Error: ' + err.message; }
   finally { $('#sendBtn').disabled = false; }
 }
 $('#taskForm').onsubmit = e => { e.preventDefault(); submitTask(); };
 $('#tPrompt').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitTask(); } };
-['fNode','fStatus','fEngine','fBriefs'].forEach(id => $('#'+id).onchange = renderJobs);
+['fNode','fStatus','fEngine'].forEach(id => $('#'+id).onchange = renderJobs);
+$('#fBriefs').onchange = () => { renderJobs(); loadJobsAll(); };
 
 /* job modal */
 let lastFocus = null;
@@ -804,7 +982,7 @@ async function openJobModal(id) { lastFocus = document.activeElement; openJob = 
 async function loadJob(first) {
   if (!openJob || (document.hidden && !first)) return;
   const id = openJob, j = await api('/api/jobs/' + encodeURIComponent(id)).catch(() => null); if (!j || id !== openJob) return;
-  $('#jTitle').textContent = `Job ${String(j.id).slice(-6)} · ${j.action || j.engine} on ${nodeName(j.node_id)}${j.requested === 'auto' ? ' (auto)' : ''}`;
+  $('#jTitle').textContent = `Task ${String(j.id).slice(-6)} · ${withTxt(j)} on ${nodeName(j.node_id)}${j.requested === 'auto' ? ' (auto)' : ''}`;
   $('#jStatus').innerHTML = `${sysBadge(j)}<span class="st ${esc(j.status)}">${esc(j.status)}</span>`;
   $('#jMeta').innerHTML = `created ${ago(j.created)} ago · ${j.started ? 'ran ' + dur(j.started, j.finished) : 'waiting for machine'}${j.exit_code != null ? ' · exit ' + esc(j.exit_code) : ''}${j.cwd ? ' · ' + esc(j.cwd) : ''}${j.full_access ? ' · <b style="color:var(--err)">full access</b>' : ''}`;
   $('#jPrompt').textContent = j.prompt || '';
@@ -819,12 +997,14 @@ $('#jobModal').onclick = e => { if (e.target.id === 'jobModal') closeJob(); };
 $('#jCancel').onclick = async () => { try { await api(`/api/jobs/${encodeURIComponent(openJob)}/cancel`, {method:'POST'}); } catch (e) {} loadJob(); refresh(); };
 
 /* enroll */
-$('#addBtn').onclick = async () => { try { const r = await api('/api/enroll'); $('#addCmd').textContent = r.command || ''; $('#copyCmd').textContent = 'Copy command'; $('#addModal').classList.add('open'); $('#addClose').focus(); } catch (e) { banner('Could not load install command: ' + e.message, 4000); } };
+$('#addBtn').onclick = async () => { closeMenus(); try { const r = await api('/api/enroll'); $('#addCmd').textContent = r.command || ''; $('#copyCmd').textContent = 'Copy command'; $('#addModal').classList.add('open'); $('#addClose').focus(); } catch (e) { banner('Could not load install command: ' + e.message, 4000); } };
 $('#addClose').onclick = () => $('#addModal').classList.remove('open');
 $('#addModal').onclick = e => { if (e.target.id === 'addModal') $('#addClose').click(); };
 $('#copyCmd').onclick = () => navigator.clipboard?.writeText($('#addCmd').textContent).then(() => $('#copyCmd').textContent = 'Copied');
 document.addEventListener('keydown', e => { if (e.key !== 'Escape') return;
-  if ($('#addModal').classList.contains('open')) $('#addClose').click();
+  const om = [...document.querySelectorAll('.menu')].find(m => !m.querySelector('.mpop').hidden);
+  if (om) { closeMenus(); om.querySelector('[aria-haspopup]').focus(); }
+  else if ($('#addModal').classList.contains('open')) $('#addClose').click();
   else if ($('#pairModal').classList.contains('open')) closePair();
   else if (openJob) closeJob();
   else if (openNode) closeDrawer();
@@ -833,7 +1013,7 @@ document.addEventListener('keydown', e => { if (e.key !== 'Escape') return;
 /* ======================= Phase 2: projects, sessions, pairing, scheduler =======================
    Every field below may be missing (mixed-version fleet): render "—" or hide, never throw. */
 const enc = encodeURIComponent;
-const TOOLS = {claude:'Claude', codex:'Codex', t3:'T3', forge:'Forge'};
+const TOOLS = {claude:'Claude', codex:'Codex', t3:'T3', forge:'Task'};
 const toolLbl = t => TOOLS[t] || String(t || '?');
 const tsec = v => { if (v == null || v === '') return null; if (typeof v === 'number') return v > 1e12 ? v / 1000 : v; const d = Date.parse(v); return isNaN(d) ? null : d / 1000; };
 const agoT = v => { const t = tsec(v); return t ? ago(t) + ' ago' : '—'; };
@@ -841,9 +1021,8 @@ const truthy = v => v === true || v === 1 || v === '1';
 const oneLine = (t, n = 140) => { const l = String(t ?? '').split('\n').map(x => x.trim()).find(Boolean) || ''; return l.length > n ? l.slice(0, n - 1) + '…' : l; };
 function t3Url(id) {
   const peer = arr((S.cluster || {}).peers).find(p => p.id === id), n = arr(S.nodes).find(x => x.id === id);
-  let host = ''; try { if (peer && peer.url) host = new URL(peer.url).hostname; } catch {}
-  host = host || (n && n.addr) || '';
-  return host && /^[\w.\-:\[\]]+$/.test(host) ? `http://${host}:3773` : '';
+  const host = UI.pickT3Host(peer, n && n.addr, n && n.metrics && n.metrics.ips);
+  return host ? `http://${host.includes(':') && !host.startsWith('[') ? '[' + host + ']' : host}:3773` : '';
 }
 function copyText(t) {
   if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(t);
@@ -868,7 +1047,7 @@ function renderProjects() {
   else {
     const q = P.q.trim().toLowerCase(), list = arr(P.list).filter(p => projMatch(p, q));
     h = list.length ? list.map(p => {
-      const live = +p.live_sessions || 0, ahead = +p.ahead || 0, br = plainBrief(p.brief && p.brief.text);
+      const live = +p.live_sessions || 0, ahead = +(p.ahead_any ?? p.ahead) || 0, br = plainBrief(p.brief && p.brief.text);
       return `<div role="button" tabindex="0" class="panel pcard ${truthy(p.pinned) ? 'pin' : ''}" data-pid="${esc(p.id)}" aria-label="Open project ${esc(p.name || 'Untitled')}">
         <div class="row"><span class="name">${truthy(p.pinned) ? '&#9733; ' : ''}${esc(p.name || 'Untitled')}</span><span class="spacer"></span>
           ${live ? `<span class="live"><span class="pulse"></span>${live} live</span>` : ''}</div>
@@ -892,7 +1071,7 @@ async function pollProjects() {
 }
 async function loadBriefAll() {
   const box = $('#briefAllBox'); if (briefAllOk === false && now() < briefAllRetry) return;
-  try { const b = await api('/api/brief/all'); briefAllOk = true;
+  try { const b = UI.unwrapBrief(await api('/api/brief/all')); briefAllOk = true;   // hub 2.2 answers {brief: {...} | null}
     if (b && b.text) { box.hidden = false; box.innerHTML = `<span class="sub">Roll-up across all active projects · ${agoT(b.ts)}${b.model ? ' · ' + esc(b.model) : ''}</span>${esc(b.text)}`; } else box.hidden = true; }
   catch (e) { if (e.status === 404 || e.status === 405) { briefAllOk = false; briefAllRetry = now() + 60; } box.hidden = true; }
 }
@@ -906,7 +1085,7 @@ $('#briefAll').onclick = async e => {
 /* ---------- Project view ---------- */
 function showScreen() { $('#pContent').hidden = pScreen !== 'project'; $('#sView').hidden = pScreen !== 'session'; }
 function openProject(id) {
-  pOpen = id; PD = null; sess = null; pScreen = 'project'; T.key = null;
+  pOpen = id; PD = null; pdSig = null; sess = null; pScreen = 'project'; T.key = null;
   const row = arr(P.list).find(p => p.id === id) || {};
   $('#pName').textContent = row.name || 'Project'; $('#pSub').textContent = ''; $('#pLive').hidden = true;
   $('#pContent').innerHTML = '<div class="empty">Loading…</div>'; showScreen();
@@ -923,10 +1102,17 @@ async function loadProject() {
     else renderProject(); }
   catch (e) { if (id === pOpen && !PD) $('#pContent').innerHTML = `<div class="panel empty">Could not load this project${e.message ? ' (' + esc(e.message) + ')' : ''}.</div>`; }
 }
-function renderProject() {
+let pdSig = null;
+function renderProject(force) {
   const d = PD, c = $('#pContent'); if (!d || pScreen !== 'project') return;
   const ae = document.activeElement;
   if (ae && c.contains(ae) && /^(TEXTAREA|SELECT|INPUT)$/.test(ae.tagName)) return;   // don't wipe what the user is typing
+  const sig = JSON.stringify(d);
+  if (!force && sig === pdSig && c.querySelector('#pPin')) return;                       // nothing changed: keep the DOM (drafts, open <details>)
+  pdSig = sig;
+  // keep a draft in "New task here" and the open state of "Brief history" across the rebuild
+  const draft = {text: $('#ntText')?.value, node: $('#ntNode')?.value, eng: $('#ntEng')?.value, msg: $('#ntMsg')?.textContent};
+  const histOpen = !!c.querySelector('#bHist')?.open;
   const keep = c.scrollTop, ses = arr(d.sessions), live = ses.filter(s => s.state === 'live').length;
   $('#pName').textContent = (truthy(d.pinned) ? '★ ' : '') + (d.name || 'Project');
   $('#pSub').textContent = [d.group_name, arr(d.machines).map(nodeName).join(', ')].filter(Boolean).join(' · ');
@@ -942,13 +1128,19 @@ function renderProject() {
       <button class="btn sm" id="pNew">New task here</button><button class="btn sm primary" id="pBrief">Brief me</button></div>
     <div class="panel newtask" id="ntForm" ${ntOpen ? '' : 'hidden'}></div>
     ${br && br.text ? `<div class="panel briefbox"><span class="sub">Latest brief · ${agoT(br.ts)}${br.model ? ' · ' + esc(br.model) : ''}</span>${esc(br.text)}</div>` : '<div class="panel briefbox"><span class="sub">No brief yet. Press Brief me for a quick summary.</span></div>'}
-    ${brs.length > 1 ? `<details class="adv" style="margin-bottom:8px"><summary>Brief history (${brs.length})</summary><div class="inner">${brs.map(b => `<div class="panel briefbox" style="margin:0"><span class="sub">${agoT(b.ts)}${b.model ? ' · ' + esc(b.model) : ''}</span>${esc(b.text)}</div>`).join('')}</div></details>` : ''}
+    ${brs.length > 1 ? `<details class="adv" id="bHist" style="margin-bottom:8px" ${histOpen ? 'open' : ''}><summary>Brief history (${brs.length})</summary><div class="inner">${brs.map(b => `<div class="panel briefbox" style="margin:0"><span class="sub">${agoT(b.ts)}${b.model ? ' · ' + esc(b.model) : ''}</span>${esc(b.text)}</div>`).join('')}</div></details>` : ''}
     <div class="sec"><h2>Sessions (${ses.length})</h2>${live ? `<span class="live"><span class="pulse"></span>${live} live</span>` : ''}</div>
     <div class="panel">${ses.length ? ses.map(sRow).join('') : '<div class="empty">No sessions yet.</div>'}</div>
     ${arr(d.commits).length ? `<div class="sec"><h2>Commits</h2></div><div class="panel list2">${arr(d.commits).slice(0, 15).map(k => `<div class="li"><span class="mono">${esc(String(k.sha || '').slice(0, 7))}</span><span class="grow">${esc(k.subject)}</span><span class="sub">${esc(k.author || '')} · ${agoT(k.ts)}</span></div>`).join('')}</div>` : ''}
     ${arr(d.repos).length ? `<div class="sec"><h2>Repos</h2></div><div class="panel list2">${arr(d.repos).map(r => `<div class="li"><b>${esc(nodeName(r.node_id))}</b><span class="grow mono">${esc(r.branch || '—')} <span class="sub">${esc(r.cwd || '')}</span></span>${truthy(r.dirty) ? '<span class="chip warn">uncommitted</span>' : '<span class="chip ok">clean</span>'}${+r.ahead ? `<span class="chip">&#8593;${esc(r.ahead)}</span>` : ''}${+r.behind ? `<span class="chip">&#8595;${esc(r.behind)}</span>` : ''}</div>`).join('')}</div>` : ''}`;
   c.scrollTop = keep;
-  if (ntOpen) fillNewTask();
+  if (ntOpen) {
+    fillNewTask();
+    if (draft.text != null) $('#ntText').value = draft.text;
+    if (draft.node && [...$('#ntNode').options].some(o => o.value === draft.node)) $('#ntNode').value = draft.node;
+    if (draft.eng) $('#ntEng').value = draft.eng;
+    if (draft.msg) $('#ntMsg').textContent = draft.msg;
+  }
   c.querySelectorAll('[data-si]').forEach(b => b.onclick = () => { const s = ses[+b.dataset.si]; if (s.tool === 'forge') openJobModal(s.session_id); else openSession(s); });
   const patch = async body => { try { await api('/api/projects/' + enc(d.id), {method:'PATCH', body:JSON.stringify(body)}); } catch (e) { banner('Could not save: ' + e.message, 4000); } await loadProject(); pollProjects(); };
   $('#pPin').onclick = () => patch({pinned: truthy(d.pinned) ? 0 : 1});
@@ -962,67 +1154,99 @@ function renderProject() {
 function fillNewTask() {
   const d = PD, f = $('#ntForm'); if (!d || !f || f.dataset.ready) return; f.dataset.ready = '1';
   const ids = [...new Set([...arr(d.repos).map(r => r.node_id), ...arr(d.machines)])].filter(Boolean);
-  f.innerHTML = `<label class="f sub">Machine<select id="ntNode">${ids.map(n => `<option value="${esc(n)}">${esc(nodeName(n))}</option>`).join('') || '<option value="auto">Auto</option>'}</select></label>
-    <label class="f sub">Engine<select id="ntEng"><option value="any">Any</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label>
+  f.innerHTML = `<label class="f sub">Machine<select id="ntNode">${ids.map(n => `<option value="${esc(n)}">${esc(nodeName(n))}</option>`).join('') || '<option value="auto">Any free machine</option>'}</select></label>
+    <label class="f sub">With<select id="ntEng"><option value="any">Best fit</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label>
     <textarea id="ntText" placeholder="What should it do in this project?" aria-label="Task"></textarea>
     <div class="row"><button class="btn primary" id="ntGo">Run task</button><span class="hint" id="ntMsg" role="status"></span></div>`;
   $('#ntGo').onclick = async () => {
     const node = $('#ntNode').value, prompt = $('#ntText').value.trim(); if (!prompt) { $('#ntMsg').textContent = 'Write what the task should do.'; return; }
     const cwd = (arr(d.repos).find(r => r.node_id === node) || arr(d.sessions).find(s => s.node_id === node) || {}).cwd || null;
     try { const r = await api('/api/jobs', {method:'POST', body:JSON.stringify({node_id: node, engine: $('#ntEng').value, prompt, cwd, full_access: false, project_id: d.id, source: 'ui'})});
-      $('#ntText').value = ''; $('#ntMsg').textContent = 'Started.'; refresh(); openJobModal(r.id); }
+      $('#ntText').value = ''; $('#ntMsg').textContent = r && r.wait_reason ? 'Queued: ' + r.wait_reason : 'Started.'; refresh(); openJobModal(r.id); }
     catch (err) { $('#ntMsg').textContent = 'Error: ' + err.message; }
   };
 }
 
 /* ---------- Session view ---------- */
 function openSession(s) {
-  sess = Object.assign({}, s); pScreen = 'session'; showScreen();
+  sess = Object.assign({}, s); pScreen = 'session'; showScreen(); closeMenus();
   T = {key: sess.tool + '/' + sess.session_id, cursor: null, n: 0, busy: false, lastRow: null, lastNew: 0, stick: true, msg: '', jobId: null};
   $('#pName').textContent = oneLine(sess.title, 80) || 'Session'; $('#pSub').textContent = `${toolLbl(sess.tool)} · ${nodeName(sess.node_id)}`;
   $('#trScroll').innerHTML = '<div class="msg system">Loading transcript…</div>'; $('#jumpBtn').hidden = true;
   $('#trScroll').classList.toggle('show-think', showThink); $('#sPrompt').value = ''; autosize();
-  const t3 = t3Url(sess.node_id);
   $('#sInfo').innerHTML = `<div class="row wrap"><span class="tool ${esc(sess.tool)}">${esc(toolLbl(sess.tool))}</span><span class="chip">${esc(nodeName(sess.node_id))}</span>
       ${sess.git_branch ? `<span class="chip mono">${esc(sess.git_branch)}</span>` : ''}${sess.model ? `<span class="chip">${esc(sess.model)}</span>` : ''}<span class="spacer"></span><span class="live" id="sLive"></span></div>
     ${sess.cwd ? `<div class="sub mono" style="word-break:break-all">${esc(sess.cwd)}</div>` : ''}
-    <div class="hbtns">${t3 ? `<a class="btn sm" href="${esc(t3)}" target="_blank" rel="noopener">Open in T3</a>` : ''}${truthy(sess.remote_control) ? '<a class="btn sm" href="https://claude.ai/code" target="_blank" rel="noopener">Open in claude.ai</a>' : ''}
-      <label class="hint" style="display:inline-flex;gap:6px;align-items:center;margin-left:auto"><input type="checkbox" id="sThink" ${showThink ? 'checked' : ''}> Show thinking</label></div>`;
-  $('#sThink').onchange = e => { showThink = e.target.checked; $('#trScroll').classList.toggle('show-think', showThink); };
+    <div class="row wrap sub" id="sUnsup" hidden></div>`;
+  // Full access, Show thinking and the "open elsewhere" links live in the composer's "..." menu
+  const t3 = t3Url(sess.node_id);
+  $('#sLinks').innerHTML = (t3 ? `<a class="mi" role="menuitem" href="${esc(t3)}" target="_blank" rel="noopener">Open in T3</a>` : '')
+    + (truthy(sess.remote_control) ? '<a class="mi" role="menuitem" href="https://claude.ai/code" target="_blank" rel="noopener">Open in claude.ai</a>' : '');
+  $('#sThink').checked = showThink; syncFullChip();
   syncPrompt(); updateLive(); watchSession(); pollTranscript();
 }
-function closeSession() { sess = null; T.key = null; pScreen = 'project'; showScreen(); $('#pLive').hidden = true; renderProject(); }
+$('#sThink').onchange = e => { showThink = e.target.checked; $('#trScroll').classList.toggle('show-think', showThink); };
+function syncFullChip() { $('#sFullChip').hidden = !$('#sFull').checked; }
+$('#sFull').onchange = syncFullChip;
+function closeSession() { sess = null; T.key = null; pScreen = 'project'; showScreen(); closeMenus(); $('#pLive').hidden = true; renderProject(); }
 function updateLive() {
   if (!sess) return;
   const el = $('#sLive'), live = sess.state === 'live', fresh = Date.now() - T.lastNew < 20000;
   if (el) el.innerHTML = live || fresh ? `<span class="pulse"></span>Live` : `<span class="sdot ${esc(sess.state || '')}"></span>${esc(sess.state || 'unknown')}`;
   $('#pLive').hidden = true;
 }
+const canContinue = s => !!s && (s.tool === 'claude' || s.tool === 'codex');
+const inTerminal = s => !!s && s.state === 'live' && !!s.pid;
 function syncPrompt() {
   if (!sess) return;
-  const can = sess.tool === 'claude' || sess.tool === 'codex', term = sess.state === 'live' && !!sess.pid;
-  const base = !can ? `Continuing ${toolLbl(sess.tool)} sessions from here isn't supported. Use Open in T3.` : term ? `This session is open in a terminal on ${nodeName(sess.node_id)}. Continue is off so two writers don't clash.` : '';
-  const n = $('#sNote'); n.textContent = T.msg || base;
-  if (T.jobId) { n.appendChild(document.createTextNode(' ')); const a = document.createElement('a'); a.href = '#'; a.textContent = 'View job'; a.onclick = e => { e.preventDefault(); openJobModal(T.jobId); }; n.appendChild(a); }
-  $('#sSend').disabled = !can || term; $('#sTake').hidden = !(can && term); $('#sPrompt').disabled = !can;
-  $('#sPrompt').placeholder = can ? (term ? 'Type a follow-up, then Take over anyway…' : 'Send a follow-up to this session…') : 'Not available for this session type';
+  const can = canContinue(sess), term = inTerminal(sess);
+  // sessions the hub cannot resume (T3 threads, ...) get no composer; the links move next to the explanation
+  $('#pBox').hidden = !can;
+  const un = $('#sUnsup');
+  if (un) {
+    un.hidden = can;
+    if (!can) {
+      un.innerHTML = `<span>Continuing ${esc(toolLbl(sess.tool))} sessions from here isn't supported.</span>`;
+      const w = document.createElement('div'); w.innerHTML = $('#sLinks').innerHTML;
+      w.querySelectorAll('a').forEach(a => { a.className = 'btn sm'; a.removeAttribute('role'); un.appendChild(a); });
+    }
+  }
+  if (!can) return;
+  const n = $('#sNote');
+  n.textContent = T.msg || (term ? `Running in a terminal on ${nodeName(sess.node_id)}. Sending will continue it here.` : '');
+  n.classList.toggle('warn', !T.msg && term);
+  if (T.jobId) { n.appendChild(document.createTextNode(' ')); const a = document.createElement('a'); a.href = '#'; a.textContent = 'View task'; a.onclick = e => { e.preventDefault(); openJobModal(T.jobId); }; n.appendChild(a); }
+  n.hidden = !n.textContent;
+  $('#sSend').disabled = sending; $('#sPrompt').disabled = false;
 }
 function autosize() { const t = $('#sPrompt'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, innerHeight * .3) + 'px'; }
 $('#sPrompt').oninput = autosize;
 $('#sPrompt').onfocus = () => setTimeout(() => { if (T.stick) toBottom(); }, 300);
-$('#sPrompt').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); (sess && sess.state === 'live' && sess.pid ? $('#sTake') : $('#sSend')).click(); } };
-$('#sSend').onclick = () => sendContinue(false);
-$('#sTake').onclick = () => sendContinue(true);
-async function sendContinue(force) {
-  if (!sess) return;
+$('#sPrompt').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $('#sSend').click(); } };
+$('#sSend').onclick = () => sendContinue();
+let sending = false;
+/* "Continue here": send without force; only if the hub answers 409 (live in a terminal) ask once, then resend with force */
+async function sendContinue() {
+  if (!sess || sending || !canContinue(sess)) return;
   const text = $('#sPrompt').value.trim(); if (!text) { $('#sPrompt').focus(); return; }
-  if (force && !confirm(`This session is live in a terminal on ${nodeName(sess.node_id)}. Take over and send anyway? Both writers may conflict.`)) return;
-  const body = {node_id: sess.node_id, engine: sess.tool, prompt: text, cwd: sess.cwd || null, full_access: $('#sFull').checked, resume: {tool: sess.tool, session_id: sess.session_id}, project_id: pOpen, source: 'ui'};
-  if (force) body.force = true;
-  $('#sSend').disabled = $('#sTake').disabled = true;
-  try { const r = await api('/api/jobs', {method:'POST', body:JSON.stringify(body)}); $('#sPrompt').value = ''; autosize(); T.msg = 'Sent. The reply streams in below.'; T.jobId = r && r.id; setTimeout(pollTranscript, 1500); }
-  catch (e) { T.jobId = null; if (e.status === 409) { sess.state = 'live'; sess.pid = sess.pid || 1; T.msg = ''; } else T.msg = 'Could not send: ' + e.message; }
-  $('#sTake').disabled = false; syncPrompt();
+  const s = sess, body = {node_id: s.node_id, engine: s.tool, prompt: text, cwd: s.cwd || null, full_access: $('#sFull').checked,
+                          resume: {tool: s.tool, session_id: s.session_id}, project_id: pOpen, source: 'ui'};
+  const post = b => api('/api/jobs', {method:'POST', body:JSON.stringify(b)});
+  sending = true; $('#sSend').disabled = true;
+  try {
+    let r;
+    try { r = await post(body); }
+    catch (e) {
+      if (e.status !== 409) throw e;
+      if (sess === s) { s.state = 'live'; s.pid = s.pid || 1; }
+      if (!confirm(`This session is running in a terminal on ${nodeName(s.node_id)}. Continue it here?`)) { T.msg = ''; return; }
+      r = await post(Object.assign({}, body, {force: true}));
+    }
+    if (sess !== s) return;
+    $('#sPrompt').value = ''; autosize(); T.jobId = r && r.id;
+    T.msg = r && r.wait_reason ? 'Queued: ' + r.wait_reason : 'Sent. The reply streams in below.'; setTimeout(pollTranscript, 1500);
+  } catch (e) { if (sess === s) { T.jobId = null; T.msg = 'Could not send: ' + e.message; } }
+  finally { sending = false; if (sess === s) syncPrompt(); }
 }
 async function watchSession() {
   if (!sess || document.hidden) return;
@@ -1035,26 +1259,28 @@ $('#jumpBtn').onclick = () => { toBottom(); T.stick = true; };
 async function pollTranscript() {
   if (!sess || document.hidden || T.busy) return;
   const key = T.key, s = sess; T.busy = true;
+  let again = false;
   try {
     const r = await api(`/api/sessions/${enc(s.tool)}/${enc(s.session_id)}/transcript${T.cursor != null ? '?since=' + enc(T.cursor) : ''}`);
-    if (key === T.key) applyTranscript(r);
+    if (key === T.key) again = applyTranscript(r) === 'reset';
   } catch (e) { if (key === T.key && !T.n) $('#trScroll').innerHTML = '<div class="msg system">Waiting for the machine to send this transcript…</div>'; }
   finally { T.busy = false; }
+  if (again && key === T.key) pollTranscript();          // hub restarted: fetch everything again from the start
 }
 function applyTranscript(r) {
-  const evs = Array.isArray(r) ? r : arr(r && r.events), cur = r && !Array.isArray(r) ? (r.cursor ?? r.next) : null;
-  if (r && r.session && sess) { Object.assign(sess, r.session); syncPrompt(); }
-  const tr = $('#trScroll'), stick = T.stick;
-  if (cur == null) {                         // hub gave no cursor: always replace
-    if (evs.length === T.n && T.n) { updateLive(); return; }
+  const st = UI.transcriptStep(T.cursor, r), evs = st.events, tr = $('#trScroll'), stick = T.stick;
+  if (r && r.session && sess) { Object.assign(sess, r.session); syncPrompt(); }   // tolerated from older builds
+  if (st.mode === 'reset') { tr.innerHTML = ''; T.n = 0; T.lastRow = null; T.cursor = null; return 'reset'; }
+  if (st.mode === 'replace') {                 // hub gave no cursor: always replace
+    if (evs.length === T.n && T.n) { updateLive(); return st.mode; }
     tr.innerHTML = ''; T.n = 0; T.lastRow = null;
-  } else if (r.reset) { tr.innerHTML = ''; T.n = 0; T.lastRow = null; }
-  if (cur != null) T.cursor = cur;
-  if (!T.n && !evs.length) { tr.innerHTML = `<div class="msg system">${r && r.done ? 'No messages in this session.' : 'Waiting for the machine to send this transcript…'}</div>`; updateLive(); return; }
+  } else T.cursor = st.cursor;
+  if (!T.n && !evs.length) { tr.innerHTML = `<div class="msg system">${r && r.done ? 'No messages in this session.' : 'Waiting for the machine to send this transcript…'}</div>`; updateLive(); return st.mode; }
   if (!T.n && evs.length) tr.innerHTML = '';
   if (evs.length) { appendEvents(evs); T.n += evs.length; T.lastNew = Date.now(); if (T.n > 1500) pruneTranscript(); }
   updateLive();
   if (evs.length) { if (stick) toBottom(); else $('#jumpBtn').hidden = false; }
+  return st.mode;
 }
 function pruneTranscript() { const tr = $('#trScroll'); while (tr.children.length > 900) tr.removeChild(tr.firstChild); T.lastRow = null; T.n = 900; }
 function fmtText(t) {
@@ -1088,7 +1314,7 @@ function closePair() { pairJob = null; clearTimeout(pairTimer); $('#pairModal').
 $('#pairClose').onclick = closePair;
 $('#pairModal').onclick = e => { if (e.target.id === 'pairModal') closePair(); };
 async function openPair(nid) {
-  $('#pairTitle').textContent = 'Pair phone · ' + nodeName(nid);
+  $('#pairTitle').textContent = 'Connect phone to T3 · ' + nodeName(nid);
   $('#pairBody').innerHTML = '<div class="empty">Asking the machine for a pairing link…</div>'; $('#pairModal').classList.add('open'); $('#pairClose').focus();
   try {
     const r = await api('/api/jobs', {method:'POST', body:JSON.stringify({node_id: nid, engine: 'shell', lane: 'user', prompt: 't3 pair --ttl 10m', full_access: false, source: 'ui'})});

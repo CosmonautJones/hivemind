@@ -9,6 +9,12 @@
 #   3. rollback: local healthz fails for 3 consecutive runs after an update -> flip back, restart,
 #      record the version in data\bad-versions.txt.
 #   4. keep the last 3 releases; data\watchdog.log (rotated at 5 MB); data\watchdog.json.
+#      Job dirs under <work_root>\jobs untouched for 14 days are deleted (at most once per hour; running jobs kept).
+#   2.2 (SPEC-phase2 A): download/extract any time, but ACTIVATE (pip + flip) only while holding the leader's
+#      update lease (POST /cluster/update-lease); "waiting for update lease (holder X)" otherwise. Pre-2.2 leader
+#      (404) -> old behaviour; no leader reachable for > 5 min -> proceed (lone survivor). The lease is released
+#      (DELETE) once the new release is confirmed healthy, or after a rollback (+ POST /cluster/bad-version). Versions in the
+#      leader's /cluster/status bad_versions (fleet-bad) are never installed.
 # Safe to run every minute: a lock file prevents overlap; the healthy no-op path is a few HTTP calls.
 #
 #   -DryRun : log every action instead of doing it (no state written).
@@ -20,7 +26,7 @@ param(
     [switch]$NoRun
 )
 
-$WatchdogVersion = '2.1.0'
+$WatchdogVersion = '2.2.0'
 $RequiredBundleFiles = @('hub/app.py', 'agent/forge-agent.ps1', 'watchdog/watchdog.ps1', 'watchdog/run-hub.cmd')
 
 # ======================= pure helpers (unit-tested) =======================
@@ -289,6 +295,171 @@ function Get-BadVersions([string]$DataDir) {
     , @(Get-Content -LiteralPath $f | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
 }
 
+# ---- 2.2 staggered rollout (SPEC-phase2 A) ----
+# Fleet-bad versions: the leader's /cluster/status `bad_versions` (unioned over every status we saw, so a
+# standby that replicated it counts too). Never installed, like data\bad-versions.txt.
+function Get-FleetBadVersions([object[]]$Statuses = @()) {
+    $set = New-Object System.Collections.Generic.List[string]
+    foreach ($s in @($Statuses)) {
+        if (-not $s) { continue }
+        foreach ($v in @($s.bad_versions)) { if ($v -and -not $set.Contains([string]$v)) { $set.Add([string]$v) } }
+    }
+    , $set.ToArray()
+}
+
+# Statuses: @{url; role}. The first one whose hub says it is the leader.
+function Find-LeaderUrl([object[]]$Statuses = @()) {
+    foreach ($s in @($Statuses)) { if ($s -and "$($s.role)" -eq 'leader' -and $s.url) { return ([string]$s.url).TrimEnd('/') } }
+    $null
+}
+
+# Result of asking the leader for the update lease: @{kind = granted|denied|unsupported|error|unreachable; holder}.
+# Returns @{action = proceed|wait; reason; holder; no_leader_since}:
+#   granted      -> proceed (we hold the lease)
+#   unsupported  -> proceed (leader is a pre-2.2 hub without the endpoint: old behaviour)
+#   denied       -> wait    "waiting for update lease (holder X)"
+#   error        -> wait    a leader ANSWERED (401/422/500/502...): never the lone-survivor path, and it resets that
+#                           clock (otherwise every node would activate at the same moment after 5 min)
+#   unreachable  -> wait, unless no leader answered for >= LoneSurvivorSec (lone survivor) -> proceed
+#                   (connection failure, or 503 "no leader" from a standby)
+function Get-LeaseDecision {
+    param($Result, $NoLeaderSince = $null, [double]$Now = 0, [int]$LoneSurvivorSec = 300)
+    $kind = if ($Result -and $Result.kind) { [string]$Result.kind } else { 'unreachable' }
+    if ($kind -eq 'granted') { return @{ action = 'proceed'; reason = 'update lease granted'; holder = $null; no_leader_since = $null } }
+    if ($kind -eq 'unsupported') { return @{ action = 'proceed'; reason = 'leader has no update lease endpoint (pre-2.2 hub); proceeding'; holder = $null; no_leader_since = $null } }
+    if ($kind -eq 'denied') {
+        $h = if ($Result.holder) { [string]$Result.holder } else { 'unknown' }
+        $why = if ($Result.why) { ": $($Result.why)$(if ($Result.waiting_for) { " $($Result.waiting_for)" })" } else { '' }
+        return @{ action = 'wait'; reason = "waiting for update lease (holder $h)$why"; holder = $h; no_leader_since = $null }
+    }
+    if ($kind -eq 'error') {
+        return @{ action = 'wait'; reason = "waiting for update lease: request failed (HTTP $($Result.code)): $($Result.msg)"; holder = $null; no_leader_since = $null }
+    }
+    $since =if ($null -ne $NoLeaderSince -and "$NoLeaderSince" -ne '') { [double]$NoLeaderSince } else { $Now }
+    $age = [int]($Now - $since)
+    if ($age -ge $LoneSurvivorSec) { return @{ action = 'proceed'; reason = "no leader reachable for $age s (lone survivor); proceeding without lease"; holder = $null; no_leader_since = $since } }
+    @{ action = 'wait'; reason = "waiting for update lease (holder unknown: no leader reachable for $age s)"; holder = $null; no_leader_since = $since }
+}
+
+function Request-UpdateLease([string]$LeaderUrl, [string]$Token, [string]$NodeId, [string]$Version, [int]$TimeoutSec = 5) {
+    $body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject @{ node_id = $NodeId; version = $Version } -Compress))
+    try {
+        $r = Invoke-RestMethod -Uri "$($LeaderUrl.TrimEnd('/'))/cluster/update-lease" -Method Post -Headers @{ 'X-Cluster-Token' = $Token } `
+            -ContentType 'application/json' -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing
+        if ($r.granted -eq $true) { return @{ kind = 'granted'; holder = [string]$r.holder } }
+        return @{ kind = 'denied'; holder = [string]$r.holder; retry_after_s = $r.retry_after_s; why = [string]$r.reason; waiting_for = [string]$r.waiting_for }
+    } catch {
+        $code = $null; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -eq 404 -or $code -eq 405 -or $code -eq 501) { return @{ kind = 'unsupported'; code = $code } }
+        if ($code -eq 503) { return @{ kind = 'unreachable'; code = $code; msg = 'no leader' } }
+        if ($code -eq 409 -or $code -eq 423 -or $code -eq 429) {
+            $holder = $null; try { $holder = [string]($_.ErrorDetails.Message | ConvertFrom-Json).holder } catch {}
+            return @{ kind = 'denied'; holder = $holder; code = $code }
+        }
+        if ($code) { return @{ kind = 'error'; code = $code; msg = $_.Exception.Message } }
+        @{ kind = 'unreachable'; msg = $_.Exception.Message }
+    }
+}
+
+# 2.2 hub: explicit fleet-bad report after a rollback (the leader also detects it on its own).
+function Send-BadVersion([string]$HubUrl, [string]$Token, [string]$NodeId, [string]$Version, [int]$TimeoutSec = 5) {
+    if (-not $HubUrl -or -not $Version) { return $false }
+    $body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject @{ version = $Version; node_id = $NodeId; reason = 'watchdog rollback' } -Compress))
+    try {
+        Invoke-RestMethod -Uri "$($HubUrl.TrimEnd('/'))/cluster/bad-version" -Method Post -Headers @{ 'X-Cluster-Token' = $Token } `
+            -ContentType 'application/json' -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing | Out-Null
+        $true
+    } catch { $false }
+}
+
+function Remove-UpdateLease([string]$LeaderUrl, [string]$Token, [string]$NodeId, [string]$BadVersion, [int]$TimeoutSec = 5) {
+    if (-not $LeaderUrl) { return $false }
+    $q = if ($BadVersion) { "?bad_version=$([uri]::EscapeDataString($BadVersion))" } else { '' }
+    try {
+        Invoke-RestMethod -Uri "$($LeaderUrl.TrimEnd('/'))/cluster/update-lease/$([uri]::EscapeDataString($NodeId))$q" -Method Delete `
+            -Headers @{ 'X-Cluster-Token' = $Token } -TimeoutSec $TimeoutSec -UseBasicParsing | Out-Null
+        $true
+    } catch { $false }
+}
+
+# The lease step of Invoke-Update as a state machine. State (watchdog-state.json hashtable) keys used:
+# lease_no_leader_since, lease_wait, lease. Record = $false (dry run) never stores a held lease.
+# Returns Get-LeaseDecision's result; State is updated in place.
+function Step-LeaseState {
+    param($Result, [hashtable]$State, [string]$Version, [string]$Leader, [double]$Now, [int]$LoneSurvivorSec = 300, [bool]$Record = $true)
+    $ld = Get-LeaseDecision -Result $Result -NoLeaderSince $State.lease_no_leader_since -Now $Now -LoneSurvivorSec $LoneSurvivorSec
+    $State.lease_no_leader_since = $ld.no_leader_since
+    if ($ld.action -eq 'wait') {
+        $State.lease_wait = @{ version = $Version; holder = $ld.holder; at = $Now; reason = $ld.reason }
+        return $ld
+    }
+    $State.lease_wait = $null
+    $State.lease = if ($Record -and $Result -and $Result.kind -eq 'granted' -and $Leader) { @{ version = $Version; url = $Leader; at = $Now } } else { $null }
+    $ld
+}
+
+function Get-WdNodeId($Cfg) { if ($Cfg -and $Cfg.node_id) { [string]$Cfg.node_id } else { $env:COMPUTERNAME.ToLowerInvariant() } }
+
+# Give the update lease back (after the new release proved healthy, or after a failed/rolled-back activation).
+# Uses $script:State, $DryRun, $Local and Write-WdLog from the runtime (tests stub them).
+function Clear-UpdateLease($Cfg, [string]$BadVersion) {
+    $l = $script:State.lease
+    if ($BadVersion -and -not $DryRun) {
+        # tell the leader (any 2.2 hub proxies it) even when we held no lease (pre-2.2 leader / lone survivor)
+        $u = if ($l -and $l.url) { [string]$l.url } else { $Local }
+        if (Send-BadVersion $u ([string]$Cfg.cluster_token) (Get-WdNodeId $Cfg) $BadVersion) { Write-WdLog "reported $BadVersion as fleet-bad to $u" }
+    }
+    if (-not $l) { return }
+    if ($DryRun) { Write-WdLog "[dry-run] release update lease ($($l.version))"; return }
+    $ok = Remove-UpdateLease ([string]$l.url) ([string]$Cfg.cluster_token) (Get-WdNodeId $Cfg) $BadVersion
+    Write-WdLog "released update lease for $($l.version)$(if ($BadVersion) { " (rolled back: $BadVersion is bad)" })$(if (-not $ok) { ' (leader did not answer; it expires on its own)' })"
+    $script:State.lease = $null
+}
+
+# ---- job dir cleanup (<work_root>\jobs, 14 days, at most once per hour) ----
+# Work roots from data\agent-config.json (work_root_current = the agent's effective root, work_root_auto = its auto
+# pick). The file is user-writable, so only absolute local-drive paths are accepted and only <root>\jobs is touched.
+function Get-JobCleanupRoots($AgentCfg) {
+    $out = New-Object System.Collections.Generic.List[string]
+    if (-not $AgentCfg) { return , $out.ToArray() }
+    foreach ($k in 'work_root_current', 'work_root_auto') {
+        $v = "$($AgentCfg.$k)".Trim().TrimEnd('\')
+        if ($v -notmatch '^[A-Za-z]:\\[^<>|"?*]+$' -or $v -match '\\\.\.?(\\|$)') { continue }
+        if (-not ($out | Where-Object { $_ -eq $v })) { $out.Add($v) }
+    }
+    , $out.ToArray()
+}
+
+# Dirs: @{name; path; mtime (newest of the dir and its top-level files, epoch); reparse; marker (has a job file)}.
+# Stale = older than MaxAgeDays, a real dir (never a junction/symlink), named like a job dir, and holding a job
+# file (out.log / err.log / prompt.txt / task.ps1 / spec.json). Skip = ids of jobs still running.
+function Select-StaleJobDirs {
+    param([object[]]$Dirs = @(), [double]$Now, [int]$MaxAgeDays = 14, [string[]]$Skip = @())
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($d in @($Dirs)) {
+        if (-not $d -or $d.reparse -or -not $d.marker) { continue }
+        $n = [string]$d.name
+        if ($n -notmatch '^(sys-)?[A-Za-z0-9_-]{1,64}$') { continue }
+        if ($Skip -contains $n -or $Skip -contains ($n -replace '^sys-', '')) { continue }
+        if (($Now - [double]$d.mtime) -lt ($MaxAgeDays * 86400)) { continue }
+        $out.Add([string]$d.path)
+    }
+    , $out.ToArray()
+}
+
+# rmdir /s removes junctions/symlinks inside the tree as links: it never deletes what they point to (a job can
+# leave a junction to C:\Windows in its dir; Remove-Item -Recurse on PS 5.1 would follow it). Returns $true when gone.
+function Remove-JobDirTree([string]$Path) {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $true }
+    & cmd.exe /d /c "rmdir /s /q `"$Path`"" 2>$null | Out-Null
+    -not (Test-Path -LiteralPath $Path)
+}
+
+function Test-CleanupDue($LastRun, [double]$Now, [int]$EverySec = 3600) {
+    if ($null -eq $LastRun -or "$LastRun" -eq '') { return $true }
+    ($Now - [double]$LastRun) -ge $EverySec
+}
+
 if ($NoRun) { return }
 
 # ======================= runtime =======================
@@ -402,6 +573,42 @@ function Invoke-SystemAgentCheck([datetime]$Now, [double]$NowEpoch) {
     $true
 }
 
+# Delete <work_root>\jobs\<id> dirs untouched for 14 days (at most once per hour). Jobs listed in the agents'
+# running.json / running-system.json are kept. rmdir /s never follows junctions/symlinks a job left inside its dir.
+function Invoke-JobDirCleanup([double]$NowEpoch) {
+    if (-not (Test-CleanupDue $script:State.last_job_cleanup $NowEpoch)) { return }
+    $script:State.last_job_cleanup = $NowEpoch
+    $skip = @()
+    foreach ($f in 'running.json', 'running-system.json') {
+        $r = Read-JsonFile (Join-Path $DataDir $f)
+        if ($r -and $r.jobs) { $skip += @($r.jobs | Where-Object { $_ -and $_.id } | ForEach-Object { [string]$_.id }) }
+    }
+    $markers = @('out.log', 'err.log', 'prompt.txt', 'task.ps1', 'spec.json')
+    foreach ($root in (Get-JobCleanupRoots (Read-JsonFile (Join-Path $DataDir 'agent-config.json')))) {
+        $jobs = Join-Path $root 'jobs'
+        if (-not (Test-Path -LiteralPath $jobs -PathType Container)) { continue }
+        if (((Get-Item -LiteralPath $jobs -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Write-WdLog "job cleanup: $jobs is a junction/symlink; skipped"; continue }
+        $dirs = @(foreach ($d in @(Get-ChildItem -LiteralPath $jobs -Directory -Force -ErrorAction SilentlyContinue)) {
+            $reparse = (($d.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            $newest = $d.LastWriteTimeUtc; $marker = $false
+            if (-not $reparse) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -File -Force -ErrorAction SilentlyContinue)) {
+                    if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
+                    if ($markers -contains $f.Name.ToLowerInvariant()) { $marker = $true }
+                }
+            }
+            @{ name = $d.Name; path = $d.FullName; reparse = $reparse; marker = $marker
+               mtime = [double]([DateTimeOffset][DateTime]::SpecifyKind($newest, [DateTimeKind]::Utc)).ToUnixTimeSeconds() }
+        })
+        $stale = Select-StaleJobDirs -Dirs $dirs -Now $NowEpoch -MaxAgeDays 14 -Skip $skip
+        if ($stale.Count -gt 500) { $stale = $stale[0..499] }
+        if (-not $stale.Count) { continue }
+        Invoke-Action "remove $($stale.Count) job dir(s) older than 14 days under $jobs" {
+            foreach ($p in $stale) { if (-not (Remove-JobDirTree $p)) { Write-WdLog "  could not remove $p" } }
+        } | Out-Null
+    }
+}
+
 function Invoke-Native([string]$Exe, [string]$Arguments, [int]$TimeoutSec = 900) {
     $o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()
     try {
@@ -447,27 +654,31 @@ function Get-PeerStatuses($Cfg, $LocalStatus) {
     if (-not $peers -and $script:State.peers_cache) { $peers = @($script:State.peers_cache) }
     $out = @()
     # the local hub's status.version is the latest AVAILABLE bundle (e.g. published here, not yet active)
+    # role + bad_versions are used by the 2.2 update lease / fleet-bad logic
     if ($LocalStatus -and $LocalStatus.version) {
-        $out += [pscustomobject]@{ id = "$($Cfg.node_id) (local)"; url = $Local; version = [string]$LocalStatus.version; bundle_sha256 = [string]$LocalStatus.bundle_sha256 }
+        $out += [pscustomobject]@{ id = "$($Cfg.node_id) (local)"; url = $Local; version = [string]$LocalStatus.version; bundle_sha256 = [string]$LocalStatus.bundle_sha256
+                                   role = [string]$LocalStatus.role; bad_versions = @($LocalStatus.bad_versions | Where-Object { $_ }) }
     }
     foreach ($p in @($peers)) {
         if (-not $p -or $p.id -eq $Cfg.node_id) { continue }
         foreach ($u in @($p.urls)) {
             if (-not $u) { continue }
             $s = Get-ClusterStatus ([string]$u) $Cfg.cluster_token
-            if ($s) { $out += [pscustomobject]@{ id = $p.id; url = ([string]$u).TrimEnd('/'); version = [string]$s.version; bundle_sha256 = [string]$s.bundle_sha256 }; break }
+            if ($s) { $out += [pscustomobject]@{ id = $p.id; url = ([string]$u).TrimEnd('/'); version = [string]$s.version; bundle_sha256 = [string]$s.bundle_sha256
+                                                 role = [string]$s.role; bad_versions = @($s.bad_versions | Where-Object { $_ }) }; break }
         }
     }
     , $out
 }
 
-function Invoke-Update($Cand, [string]$CurVer, $Cfg) {
+# Returns 'ok' (switched), 'fail' (backoff applies) or 'wait' (release staged, waiting for the update lease).
+function Invoke-Update($Cand, [string]$CurVer, $Cfg, [object[]]$Peers = @(), [double]$NowEpoch = 0) {
     $ver = [string]$Cand.version
     $dl = Join-Path $DataDir 'tmp'
     $zip = Join-Path $dl "forge-$ver.zip"
     if (Test-LocalRelease -ForgeHome $ForgeHome -Version $ver -ExpectedSha $Cand.bundle_sha256) {
         $ok = $true
-        Write-WdLog "release $ver already present locally with matching sha256 (published here); activating"
+        Write-WdLog "release $ver present locally with matching sha256 (published here or staged earlier)"
         $script:Actions.Add("activate local release $ver")
     } else {
       $ok = Invoke-Action "update $CurVer -> $ver from $($Cand.id) ($($Cand.url))" {
@@ -478,15 +689,26 @@ function Invoke-Update($Cand, [string]$CurVer, $Cfg) {
       }
       Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
     }
-    if (-not $ok) { return $false }
+    if (-not $ok) { return 'fail' }
+
+    # ---- 2.2: activation needs the fleet update lease (canary first, leader last; SPEC-phase2 A) ----
+    # the leader seen in the statuses, else the local hub (a 2.2 standby proxies /cluster/update-lease to the leader; 503 = no leader)
+    $leader = Find-LeaderUrl $Peers; if (-not $leader) { $leader = $Local }
+    if ($DryRun) { Write-WdLog "[dry-run] request update lease for $ver from $(if ($leader) { $leader } else { 'no reachable leader' })"; $lr = @{ kind = 'granted' } }
+    elseif ($leader) { $lr = Request-UpdateLease $leader ([string]$Cfg.cluster_token) (Get-WdNodeId $Cfg) $ver }
+    else { $lr = @{ kind = 'unreachable' } }
+    $ld = Step-LeaseState -Result $lr -State $script:State -Version $ver -Leader $leader -Now $NowEpoch -Record (-not $DryRun)
+    if ($ld.action -eq 'wait') { Write-WdLog "$($ld.reason); release $ver is staged"; return 'wait' }
+    Write-WdLog "update to ${ver}: $($ld.reason)"
+
     $relDir = Join-Path $ForgeHome "releases\$ver"
-    if (-not (Install-Requirements $relDir)) { Write-WdLog "requirements for $ver failed; not switching"; return $false }
+    if (-not (Install-Requirements $relDir)) { Write-WdLog "requirements for $ver failed; not switching"; Clear-UpdateLease $Cfg $null; return 'fail' }
     $flipped = Invoke-Action "switch current -> releases\$ver" { Set-CurrentRelease $ForgeHome $ver }
-    if (-not $flipped) { return $false }
+    if (-not $flipped) { Clear-UpdateLease $Cfg $null; return 'fail' }
     $script:State.probation = @{ from = $CurVer; to = $ver; fails = 0; since = (Get-Date).ToString('o') }
     $script:State.active_version = $ver
     Restart-Hub "updated to $ver"
-    $true
+    'ok'
 }
 
 function Invoke-Watchdog {
@@ -531,7 +753,7 @@ function Invoke-Watchdog {
 
         $dec = Get-RollbackDecision -Probation $prob -CurrentVersion $curVer -HealthOk ($hubOk -and (-not $running -or $running -eq $curVer)) -InGrace ($grace -or $justSwitched)
         switch ($dec.action) {
-            'confirm' { Write-WdLog "release $curVer confirmed healthy"; $script:State.probation = $null }
+            'confirm' { Write-WdLog "release $curVer confirmed healthy"; $script:State.probation = $null; try { Clear-UpdateLease $cfg $null } catch {} }
             'wait'    { $script:State.probation.fails = $dec.fails; Write-WdLog "release $curVer unhealthy after update ($($dec.fails)/3)" }
             'rollback' {
                 $from = [string]$prob.from
@@ -546,6 +768,8 @@ function Invoke-Watchdog {
                         Install-Requirements (Join-Path $ForgeHome "releases\$from") | Out-Null
                     }
                 } else { Write-WdLog "cannot roll back: previous release '$from' not present" }
+                # 2.2: hand the lease back and tell the leader this version is bad (it marks it fleet-bad)
+                try { Clear-UpdateLease $cfg ([string]$prob.to) } catch {}
                 $script:State.probation = $null
                 Restart-Hub 'rollback'
                 $grace = $true
@@ -573,20 +797,23 @@ function Invoke-Watchdog {
         try { $sysAgentOk = Invoke-SystemAgentCheck $now $nowEpoch } catch { Write-WdLog "system agent check failed: $($_.Exception.Message)" }
 
         # ---- 2. update from peers ----
-        $script:State.peers_seen = @()
+        $script:State.peers_seen = @(); $fleetBad = @()
         $probNow = $script:State.probation
         if (-not $probNow -and $dec.action -ne 'rollback') {
             $peers = Get-PeerStatuses $cfg $st
-            $script:State.peers_seen = @($peers | ForEach-Object { @{ id = $_.id; version = $_.version } })
-            $cand = Select-UpdateCandidate -Peers $peers -Current $curVer -Bad $bad
+            $script:State.peers_seen = @($peers | ForEach-Object { @{ id = $_.id; version = $_.version; role = $_.role } })
+            # 2.2: fleet-bad versions from the leader's status are never installed (like bad-versions.txt)
+            $fleetBad = Get-FleetBadVersions $peers
+            $cand = Select-UpdateCandidate -Peers $peers -Current $curVer -Bad (@($bad) + @($fleetBad))
             $backoff = $false
             if ($cand -and $script:State.update_fail -and $script:State.update_fail.version -eq $cand.version) {
                 $backoff = (($nowEpoch - [double]$script:State.update_fail.at) -lt 600)
             }
+            if (-not $cand) { $script:State.lease_wait = $null; $script:State.lease_no_leader_since = $null }
             if ($cand -and -not $backoff) {
-                if (-not (Invoke-Update $cand $curVer $cfg)) {
-                    $script:State.update_fail = @{ version = $cand.version; at = $nowEpoch }
-                } else { $script:State.update_fail = $null; $curVer = [string]$cand.version }
+                $res = Invoke-Update $cand $curVer $cfg $peers $nowEpoch
+                if ($res -eq 'fail') { $script:State.update_fail = @{ version = $cand.version; at = $nowEpoch } }
+                elseif ($res -eq 'ok') { $script:State.update_fail = $null; $curVer = [string]$cand.version }
             }
         }
 
@@ -600,6 +827,8 @@ function Invoke-Watchdog {
         foreach ($s in @(Get-ChildItem -LiteralPath (Join-Path $ForgeHome 'releases') -Directory -Filter '_staging-*' -ErrorAction SilentlyContinue)) {
             if (($now - $s.LastWriteTime).TotalMinutes -gt 30) { Invoke-Action "remove stale $($s.Name)" { Remove-Item -LiteralPath $s.FullName -Recurse -Force } | Out-Null }
         }
+        # ---- 4b. old job dirs under <work_root>\jobs (14 days, hourly) ----
+        try { Invoke-JobDirCleanup $nowEpoch } catch { Write-WdLog "job dir cleanup failed: $($_.Exception.Message)" }
 
         # ---- 5. status files ----
         $last = $script:State.last_action
@@ -610,6 +839,7 @@ function Invoke-Watchdog {
             version = (Get-CurrentVersion $ForgeHome); hub_ok = [bool]$hubOk; hub_running_version = $running
             agent_ok = [bool]$agentOk; system_agent_ok = [bool]$sysAgentOk; actions = @($script:Actions); last_action = $last
             probation = $script:State.probation; bad_versions = @($bad); peers = @($script:State.peers_seen)
+            fleet_bad_versions = @($fleetBad); update_lease = $script:State.lease; lease_wait = $script:State.lease_wait
             dry_run = [bool]$DryRun
         }
         if ($DryRun) { Write-Host (ConvertTo-Json -InputObject $summary -Depth 6); return }

@@ -99,6 +99,25 @@ function New-AgentConfig {
     $h
 }
 
+# icacls calls, in order. Lock down the ROOT only, then make every child inherit from it (applying /inheritance:r
+# with /T strips each file's ACL, and (OI)(CI) grants don't apply to files -> nobody could read the release).
+#   root:        Administrators + SYSTEM full, installing user (OI)(CI)RX  -> releases\, current, venv\ are read-only to the user
+#   data\:       + user Modify (agent-config.json, logs, running.json, hub state)
+#   config.json: explicit Administrators + SYSTEM full, user Read (tokens; the user lane only reads it)
+function Get-ForgeAclPlan([string]$ForgeHome, [string]$User) {
+    $data = Join-Path $ForgeHome 'data'; $cfg = Join-Path $data 'config.json'
+    , @(
+        @{ what = "icacls $ForgeHome : Administrators + SYSTEM full, $User read+execute, inheritance removed (root only)"
+           args = @($ForgeHome, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', "${User}:(OI)(CI)RX", '/C', '/Q') },
+        @{ what = "icacls $ForgeHome\* /reset /T : everything inherits the root ACL"
+           args = @((Join-Path $ForgeHome '*'), '/reset', '/T', '/C', '/Q') },
+        @{ what = "icacls $data : + $User modify"
+           args = @($data, '/grant:r', "${User}:(OI)(CI)M", '/C', '/Q') },
+        @{ what = "icacls $cfg : explicit Administrators + SYSTEM full, $User read only"
+           args = @($cfg, '/inheritance:r', '/grant:r', '*S-1-5-32-544:F', '*S-1-5-18:F', "${User}:R", '/C', '/Q') }
+    )
+}
+
 function Get-ZipVersion([string]$ZipPath) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $z = [IO.Compression.ZipFile]::OpenRead($ZipPath)
@@ -327,14 +346,16 @@ function Install-Forge {
     Invoke-Step "write $agentCfgPath (hub_urls: $($agentCfg.hub_urls -join ', '); $(@($agentCfg.logs).Count) extra log(s)$(if ($v1Cfg) { '; migrated from v1' }))" { Write-JsonFile $agentCfgPath $agentCfg } | Out-Null
 
     Write-Step 'Permissions'
-    Invoke-Step "icacls $ForgeHome : Administrators + SYSTEM + $user full, inheritance removed" {
-        # Lock down the ROOT only, then make every child inherit from it. (Applying /inheritance:r with /T
-        # strips each file's ACL, and (OI)(CI) grants don't apply to files -> nobody can read the release.)
-        & icacls.exe $ForgeHome /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' "${user}:(OI)(CI)F" /C /Q | Out-Null
-        & icacls.exe (Join-Path $ForgeHome '*') /reset /T /C /Q | Out-Null
-    } | Out-Null
-    Invoke-Step "icacls $cfgPath : explicit Administrators + SYSTEM + $user only" {
-        & icacls.exe $cfgPath /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' "${user}:F" | Out-Null
+    # Code (releases, current, venv) runs as SYSTEM (watchdog, ForgeSystemAgent), so the user account must not be able
+    # to change it: Administrators + SYSTEM full, the user read+execute only. data\ is the user lane's working dir.
+    foreach ($a in (Get-ForgeAclPlan -ForgeHome $ForgeHome -User $user)) {
+        Invoke-Step $a.what { & icacls.exe @($a.args) | Out-Null; if ($LASTEXITCODE) { throw "icacls exited $LASTEXITCODE" } } | Out-Null
+    }
+    Invoke-Step 'w32tm /resync (job/lease clocks; agents report agent_time)' {
+        $ErrorActionPreference = 'Continue'
+        Start-Service -Name w32time -ErrorAction SilentlyContinue
+        $o = & w32tm.exe /resync 2>&1 | Out-String
+        if ($LASTEXITCODE) { Write-Host "    w32tm /resync: $($o.Trim()) (not fatal)" -ForegroundColor DarkYellow }
     } | Out-Null
 
     # ---- 3. firewall + power ----

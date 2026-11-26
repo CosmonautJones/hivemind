@@ -54,8 +54,8 @@ of which session on which machine was doing what.
 
 <p align="center"><img src="docs/screenshots/mobile-session.png" alt="Mobile" width="300"><br><sub>Same thing on your phone.</sub></p>
 
-> Screenshots use demo data (`MOCK_DEMO=1 python tools/mock_ui_server.py`). The Projects / live-session
-> views are the **v2.2** UI, landing now — see [status](#-status).
+> Screenshots use demo data (`MOCK_DEMO=1 python tools/mock_ui_server.py`). Projects and live sessions are
+> live as of **v2.2**; the "Today" home screen and Hive land in v2.3 / v2.4 — see [status](#-status).
 
 ---
 
@@ -112,7 +112,7 @@ flowchart LR
 **1 · First machine (becomes the leader)**
 
 ```powershell
-git clone https://github.com/<you>/hivemind; cd hivemind
+git clone https://github.com/CosmonautJones/hivemind; cd hivemind
 .\tools\build-bundle.ps1 -OutDir .\dist          # -> dist\forge-<ver>.zip + .sha256
 # write a bootstrap file with fresh random tokens (see NODE-README.md for the shape), then as admin:
 .\agent\install.ps1 -BootstrapFile .\bootstrap.json -BundleFile .\dist\forge-<ver>.zip
@@ -154,33 +154,40 @@ The watchdogs take it from there: canary first, leader last, rollback on failure
 
 ## 🚦 Status
 
-**Works today — v2.1.x, running 24/7 on a 4-machine home fleet**
+**Works today — v2.2, running 24/7 on a 4-machine home fleet**
 
-- [x] Leader/standby hubs on every machine, replication, request forwarding, failover
+- [x] Leader/standby hubs on every machine, replication, request forwarding, failover, merge-on-election
 - [x] Fleet dashboard: metrics, processes, agents, services, logs — desktop + phone
-- [x] Jobs: Claude Code, Codex, PowerShell, **Auto** placement, live output, cancel
-- [x] SYSTEM admin lane with allowlisted actions + confirmed admin PowerShell
-- [x] Watchdog self-heal (incl. zombie processes) and self-update with health-checked rollback
-- [x] One-line enrollment, Tailscale, no-sleep power policy, work dir on the biggest drive
-- [x] T3 Code installed + kept alive on every machine
-- [x] 270 automated tests (pytest + PowerShell), incl. multi-hub election in-process
+- [x] Jobs: Claude Code, Codex, PowerShell, local Ollama, **Auto** placement, live output, cancel, timeouts
+- [x] **Projects**: Claude Code / Codex / Hivemind sessions grouped by repo across machines
+- [x] **Live session viewer** with Continue (`claude --resume`, `codex exec resume`)
+- [x] **AI briefs** — local model on the GPU box overnight + morning digest; Claude on demand
+- [x] **Staggered rollout** via an update lease (canary first, leader last) + fleet-wide rolled-back list
+- [x] **Rate-limit-aware scheduler**: per-account cooldowns, engine rotation, requeue on node loss
+- [x] SYSTEM admin lane (allowlisted actions + confirmed admin PowerShell), watchdog self-heal + rollback
+- [x] T3 Code + Ollama kept alive on every machine; desktop **Hivemind** + **Update & Repair** icons
+- [x] ~500 automated tests incl. chaos simulation (partitions, clock skew, sleeping laptops, leader kills)
 
-**Landing now — v2.2 ("Jarvis")**
+**Next — v2.3 ("complete, safe, intuitive")** · in progress
 
-- [ ] **Projects**: sessions from Claude Code, Codex, T3 and Hivemind jobs grouped by repo across machines
-- [ ] **Live session viewer** with Continue / Take over (`claude --resume`, `codex exec resume`)
-- [ ] **AI briefs** every 30 min for active projects — local model on the GPU box (free), Claude on demand
-- [ ] **Staggered rollout** via an update lease (canary → … → leader) + fleet-wide bad-version list
-- [ ] **Rate-limit-aware scheduler**: account cooldowns, engine rotation, requeue on node loss
-- [ ] Chaos simulation: 4 hubs × 30 agents × 500 jobs with random failures, invariants checked
+- [ ] Agent jobs run with a **normal-user token** (not admin); split secrets; signed updates; admin PIN
+- [ ] One-command **first machine** setup + one-time enrollment codes (no hand-written config)
+- [ ] Phone **notifications** (ntfy + Web Push) only when something needs you
+- [ ] **Today** home screen, **Ask** box, Maintenance ("update X everywhere, one at a time"), add-machine wizard
+- [ ] Nightly DB backups, stronger rollback health gate, repo sync, Windows Updates in a 3–5 AM window
 
-**What's left right now**
+**Then — v2.4: conversations + Hive**
 
-- [ ] First-machine bootstrap is manual (hand-written `bootstrap.json`) — needs a `hivemind init`
+- [ ] Every task is a **conversation** — reply to any agent, it continues the same session
+- [ ] **Hive**: one companion you talk to that spawns and steers agents across all your machines
+- [ ] Three-step tutorial and example prompts for first-time users
+
+**Known gaps**
+
 - [ ] macOS / Linux agents (the hub is portable; the agent/watchdog are PowerShell + Task Scheduler)
-- [ ] HTTPS + per-device tokens (today: shared tokens over LAN/tailnet)
+- [ ] HTTPS on the LAN (Tailscale encrypts in transit today)
 - [ ] Rename internals from the codename `Forge` (task names, paths) without breaking upgrades
-- [ ] Proper release artifacts on GitHub + CI
+- [ ] Release artifacts on GitHub + CI
 
 ## 🔭 Roadmap
 

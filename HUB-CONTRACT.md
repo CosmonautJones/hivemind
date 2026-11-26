@@ -90,3 +90,164 @@ cluster, leader_id, running_version, bundle_version}`; alert kinds: `node_offlin
   Lost-job detection and `boot` failure are per lane.
 - `/api/state`, `/api/health`, `/api/nodes/{id}` nodes gain `system_lane: {online, last_seen, capacity, version}`; job rows carry
   `run_as`, `action`, `args`. New columns are added to existing databases with `ALTER TABLE`.
+
+---
+
+# Phase 2 (hub 2.2.0): rollout lease, sessions, projects, briefs, scheduler
+
+Implements SPEC-phase2.md sections A-G (+ the API needs of I). New code: `forge_lease.py`, `forge_sched.py`,
+`forge_projects.py`, `forge_phase2.py` (wired in `app.py`). All errors are `{"detail": "..."}`.
+New persistent tables replicate to standbys exactly like Phase 1 tables (`updated` column, TEXT ids, tombstones):
+`projects, project_alias, sessions, repos, briefs, cooldowns, bad_versions, leases`. **Not replicated (ephemeral, leader memory):**
+watchers and transcripts. Standbys proxy every non-`/cluster/*` call to the leader, so agents/UI may talk to any hub.
+New `jobs` columns (ALTER TABLE): `resume, project_id, attempts, wait_reason, model, req_engine`.
+
+## A. Update lease / fleet-bad (cluster token; standbys proxy these to the leader, 503 `no leader` if none)
+- `POST /cluster/update-lease` `{node_id, version}` -> `200 {granted, holder, retry_after_s}` plus optional `reason`
+  (`"lease held" | "waiting for earlier node" | "fleet-bad" | "unknown peer"`) and `waiting_for` (peer id).
+  `node_id` is the peer id (same as the hub's node id). `version` must match `^\d+\.\d+\.\d+$` (422 otherwise).
+  Granted -> `holder == node_id`, `retry_after_s: 0`; calling again while holding renews the 10 min TTL.
+  Denied -> `retry_after_s` is the suggested poll delay (5-30; 300 for fleet-bad).
+- **Canary (2.2.1)**: `PUT /api/nodes/{id}/settings {"canary": true|false}` (bool, 400 otherwise; stored in the replicated `settings` table, returned
+  by the PUT and in `/api/state` node `settings`, NOT sent to agents). Flagged non-leader peers go first; with no flag set the order below is unchanged.
+- **Order**: non-leader peers by DESCENDING priority number (canary = lowest priority), the current leader LAST. A node is
+  granted only if every earlier node already runs `running_version >= version`, or has been unreachable (leader's view) for
+  >= 10 min (skipped). One holder at a time; TTL 600 s; the lease row is replicated, so a new leader inherits it.
+- **Auto release**: when, for 60 s straight (leader-observed), the holder's hub is healthy, reports `running_version >= version` AND `eligible:true`
+  in `/cluster/status`, AND that machine's agent is online and reports `bundle_version >= version` (2.2.1; hub healthy alone is not enough).
+  Explicit: `DELETE /cluster/update-lease/{node_id}` -> `{ok, released}` (`released:false` if that node was not the holder).
+- `GET /cluster/update-lease` -> `{lease: {holder, version, expires_in_s} | null, bad_versions: [...]}` (local, any hub).
+- **Fleet-bad**: if the holder reached `version` (healthy, running_version >= version) and later reports a LOWER running_version
+  (rollback), the leader records the version in `bad_versions`, releases the lease and raises a UI alert `fleet_bad_version`.
+  Optional explicit report from a watchdog that rolled back: `POST /cluster/bad-version {version, node_id?, reason?}` ->
+  `{ok, bad_versions}`. Admin clear: `DELETE /cluster/bad-version/{version}` -> `{ok, cleared, bad_versions}`.
+  A lease request for a fleet-bad version is denied with `reason: "fleet-bad"`.
+- `GET /cluster/status` gains `bad_versions: ["2.3.0"]` and `update_lease: {holder, version, expires_in_s} | null`.
+  `GET /api/health` gains `bad_versions`, `update_lease`, `cooldowns` (+ alert kind `fleet_bad_version`).
+- Watchdog contract: before activating a newer version, `POST /cluster/update-lease` against any hub (via `hub_urls`); if no
+  leader answers (connection error / 503) for > 5 min it may proceed (lone survivor); never install a version listed in
+  `bad_versions`; `DELETE` the lease after a failed activation/rollback (and ideally also `POST /cluster/bad-version`).
+
+## B/E. Session index and projects
+- `POST /api/agent/sessions` (agent token) `{node_id, sessions:[{tool,session_id,cwd,git_remote,git_branch,title,started,
+  last_activity,messages,tokens,state,remote_control,pid,model}], removed:[...], t3?: "unsupported"}` -> `{ok, accepted, changed}`.
+  Upsert by `(tool, session_id)`; tools `claude|codex|t3` (others ignored); sessions idle > 14 days ignored; `started` and
+  `last_activity` may be epoch seconds (ms tolerated) or ISO-8601; `title` is re-redacted (see **Redaction** below) and cut to 140;
+  `git_remote` is normalized by the hub (`github.com/owner/repo`); rows are only written when a field other than `last_activity`
+  changed or `last_activity` moved by more than 60 s (2.2.1: keeps replication churn down). `removed`: bare session ids (or `tool:id`) deleted for that node. Sessions may be posted in batches (any subset).
+  `state` is stored as sent; the hub downgrades `live` on read when the node is offline (decays by `last_activity` age).
+- `POST /api/agent/commits` (agent token) `{node_id, repos:[{cwd,git_remote,branch,dirty,ahead,behind,commits:[{sha,author,ts,subject}]}]}` -> `{ok, changed}`.
+- Project key: normalized remote; `misc:<node>` for user-profile root / `Windows\system32` / any `temp` dir / `\forge\scratch`
+  (named "Scratch / misc"); else `local:<node>:<cwd-lower>`. Projects auto-create on first sighting (sessions, commits, jobs with a cwd).
+- A job's project: its `project_id` when that names an existing project (UI "New task here" / Continue send it); otherwise by
+  `(node, cwd)` via the `repos` table, then the `sessions` table (same node + folder), else `local:<node>:<cwd>`. A job with a valid
+  `project_id` never auto-creates a project.
+- `GET /api/projects`, `GET /api/projects/{id}`, `PATCH /api/projects/{id}`, `POST /api/projects/merge {ids}` as in the spec. List rows
+  carry `ahead` / `behind` (max over the project's working copies) next to `dirty_any`. Detail adds
+  `sessions` (all tools; forge jobs appear as `tool:"forge"`, `session_id` = job id, with `status`), `commits`, `repos`, `briefs`.
+  Merge keeps `project_alias` rows so future sessions of merged keys map to the surviving project (first id).
+- Session row fields in `sessions[]`: `tool, session_id, node_id, cwd, git_remote, git_branch, title, started, last_activity, messages,
+  tokens, state, remote_control, pid, model, project_key`.
+
+## C. Live transcript (ephemeral)
+- `POST /api/sessions/{tool}/{id}/watch` (UI) -> `{ok, node_id, ttl_s: 30}` (404 unknown session). UI refreshes every 10 s.
+- Report response (user lane) gains `watch: [{tool, session_id, since}]` for that node, only while a watcher is alive (30 s TTL).
+  `since` is the **agent's own `cursor`** echoed back from its last `POST /api/agent/transcript` for that session, or `null` when the
+  hub has nothing (first call: send the last 200 events).
+- `POST /api/agent/transcript` (agent token) `{node_id, tool, session_id, cursor, events:[{ts,role,kind,text,tool_name?,collapsed}], done}` ->
+  `{ok, accepted}`. Hub redacts again, caps text at 4000 chars, keeps the last 1000 events per session, unknown roles -> `system`.
+- `GET /api/sessions/{tool}/{id}/transcript?since=<seq>` -> `{events:[{seq,...}], cursor: <last seq>, done, available}`.
+  `tool=forge` is synthesized from the job (prompt = user event, output = assistant events). Unwatched transcripts are dropped after 10 min.
+
+## D. Continue / take over
+`POST /api/jobs` accepts `resume: {tool: "claude"|"codex", session_id}` (+ `force: true`, `engine` optional, `node_id` may be the session's node or `auto`,
+`cwd` is forced to the session's cwd, engine derived from `resume.tool`). 404 unknown session, 400 wrong node/tool, **409 `session is live in a terminal`**
+when the session's effective state is `live` and it has a `pid`, unless `force`. The dispatched job item carries `resume: {tool, session_id}`.
+
+## F. Briefs / ollama
+- Job `engine: "ollama"` (+ `model`); dispatch items carry `model` (default hub config `brief_model`, `qwen2.5:14b`) and, for brief jobs, `source: "brief"`.
+  Claude brief jobs carry `model: "haiku"` (agent should pass `--model haiku`). The agent returns the model's answer as the job output; progress lines starting with
+  `pulling `, `verifying `, `writing manifest`, `success` or `[ollama]` are stripped before the text is stored in `briefs`.
+- **2.2.1 schedule**: the automatic loop runs only inside config `brief_window` (local time, default `"00:00-07:00"`; `"HH:MM-HH:MM"`,
+  wraps midnight, `"always"` = all day) and only while the brief node's GPU util (`metrics.gpu[].util`, max) is below `brief_gpu_max`
+  (default 30 %; a busy GPU is re-checked every tick). Once a day at `brief_digest_time` (local, default `"07:30"`, `"off"` disables;
+  skipped if the hub comes up more than 3 h later) a morning digest = all-projects roll-up is queued as an `ollama` job on the brief node
+  (`project_id:"*"`), unless a roll-up was already queued since that time. On-demand briefs (`POST /api/projects/{id}/brief`,
+  `POST /api/brief/all`) are always allowed. Briefs keep the newest 20 per project. Settings are shown in `GET /api/scheduler` -> `briefs`.
+- Hub loop (leader, every 30 min, after leader grace): projects with sessions/commits/jobs newer than their last brief attempt get an `ollama` job (max 6/loop, skip projects with a
+  pending brief job; a failed brief is not retried until new activity). Node = config `brief_node`, else the node with the most `metrics.gpu[].mem_total_mb` that has tool `ollama`, agent >= 2.2.0 and
+  (if `info.capabilities` is a list/map) the `briefs` capability; online nodes preferred; no capable node -> loop skipped; never falls back to Claude.
+- `POST /api/projects/{id}/brief` -> `{id, existing}` (Claude haiku on an auto node, `source:"brief"`); `POST /api/brief/all` -> `{id, projects}` (roll-up, `project_id:"*"`);
+  `GET /api/brief/all` -> `{brief: {text,ts,model,job_id}|null, text, ts, model, job_id}` (nested and flat; flat fields are null when there is none).
+  Results are stored on job `done` into `briefs`. Brief jobs are hidden from `/api/state`, node detail and `GET /api/jobs` unless `?include_brief=1`
+  (accepted by both `GET /api/state` and `GET /api/jobs`).
+- Config (config.json): `brief_model`, `brief_node` (`"auto"`/absent = auto), `engine_preference` (default `["claude","codex","ollama"]`),
+  `brief_window`, `brief_digest_time`, `brief_gpu_max`.
+
+## G. Scheduler
+- `engine: "any"` and `node_id: "auto"`; the hub rewrites `engine` (and `node_id`) before dispatch, so agents never see `any`; job rows keep `req_engine:"any"`, `requested:"auto"`.
+- Score `100 - cpu*0.5 - mem_pct*0.3 - active_jobs*15 - (leader?10:0) + (gpu&&ollama?40:0) - (work_root_free_gb<20?50:0)`; ties: free capacity, priority, id.
+  Explicit engine on a fixed node is not capability-checked (as in 2.1); `any`/`auto` require the tool (`ollama` also requires agent >= 2.2.0).
+- Cooldowns (2.2.1): ONLY a claude/codex job (not `source:"brief"`) that ends (`done`/`failed`) with a NON-ZERO `exit_code`, and only a CLI-style
+  limit message in the LAST 20 non-empty lines of its output (`usage limit reached|hit|exceeded`, `limit reached|<epoch>`, `5-hour limit reached`,
+  `hit/reached your ... limit`, `rate limit reached|exceeded|hit`, `429 ... rate limit`, `exceeded your current quota`, `quota exceeded|exhausted`).
+  Streamed output is never checked; output that merely mentions "rate limit" or "quota" never triggers. Sets `cooldowns[engine]` (reset time parsed
+  from `try again in 2 hours 15 minutes`, `try again at 3:45 PM`, `limit reached|<epoch>`; clamp 1 min..12 h; default +30 min) and a `warn` event.
+  Held jobs stay `queued` with `wait_reason` (`"claude cooling down until HH:MM"`, hub-local time); `any` jobs pick the next engine, also after they
+  were already resolved (`req_engine:"any"`) but not yet dispatched (a job requested `auto` is then re-placed on any node).
+- Job `kind` (2.2.1, `POST /api/jobs`): `"code"` (default) | `"text"` (400 otherwise); brief jobs are `text`. Engine `any` resolves to ollama ONLY for
+  `kind:"text"`; a code job waits (`wait_reason`) instead of falling to ollama.
+- `GET /api/scheduler` -> `{cooldowns:{engine:{until,reason}}, queue_depth, placement_preview:{claude|codex|ollama|shell:[{node_id,score}],
+  any:{engine,node_id}|null (code jobs), any_text:{engine,node_id}|null}, engine_preference, briefs:{brief_window, in_window, brief_digest_time,
+  brief_gpu_max, brief_node, brief_node_gpu_util, brief_model, interval_s, last_loop}}`; `DELETE /api/scheduler/cooldowns/{engine}` -> `{ok, cleared}`.
+- Version gating: `ollama` and resume jobs are only dispatched to agents whose `info.agent_version` (or report body `agent_version`, which also refreshes the stored info) is >= 2.2.0;
+  otherwise they stay queued with a `wait_reason`. 2.1.x agents are unaffected.
+- Requeue on node loss (user lane, presence path only): a job lost because its node went silent (> 90 s) is requeued ONCE (`attempts` 0 -> 1, status `queued`, node `auto` if it was
+  requested auto, engine `any` restored) only if it had < 1 KB output and the node was alive for < 60 s after `started`; otherwise `failed` (`[hub] node offline; job lost`).
+  An agent restart (`boot`) still fails its jobs, as in 2.1. System-lane jobs are never requeued.
+- `POST /api/jobs` response gains `engine`, `wait_reason`; job rows gain `resume, project_id, attempts, wait_reason, model, req_engine`. `GET /api/jobs?include_brief=&limit=` lists jobs.
+- Replication fix (affects all tables): a hub that steps down from leader now does a full authoritative resync from the new leader so its own un-merged writes cannot keep newer `updated` stamps.
+
+---
+
+# 2.2.1 (hub): fencing, races, partition safety, retention
+
+## Job ownership (stale holders)
+- Dispatch items carry `attempt` (the job's `attempts`). The hub records `dispatched_to` on each dispatch.
+- `POST /api/agent/jobs/{id}/update` accepts optional `node_id` and `attempt` (2.2.1+ agents SHOULD send both). It is rejected with
+  **409 `{"detail":"job reassigned","status":...}`** when the job is not `starting`/`running` (queued again, finished, failed by the hub),
+  when `node_id` differs from the current holder, or when `attempt` differs from the current `attempts`. The rejected node then gets the
+  job id in `cancel` of its next reports (kill your copy; treat 409 as final for that job). Without `node_id`/`attempt` (older agents)
+  only the status check applies.
+- A job requeued after its node went silent remembers that node (`prev_holder`, `requeued_at`, replicated): while the job is active
+  anywhere else, that node's report `cancel` lists it; it is not handed back to that same node for 60 s (time for the cancel to land).
+- Report bodies may carry `agent_time` (epoch seconds or ISO-8601). The hub stores `metrics.clock_skew_s = agent_time - hub now` and
+  `/api/health` raises alert kind **`clock_skew`** (warn) when `|skew| > 5 s`.
+
+## Scheduling races
+Agent reports run concurrently; placement (`place_jobs`), dispatch, lost-job handling, job updates and cancels are serialized by one
+scheduler lock, and every state transition is a conditional UPDATE (`... WHERE status='queued' AND node_id=?` etc.), so a job is never
+handed out twice or relabelled while running.
+
+## Partition safety / replication
+- `updated` stamps never go backwards per row (`max(now, previous + 1 ms)`), so last-write-wins holds across skewed hub clocks.
+- On every leader change a standby drops its sync cursor and does a full resync (the cursor was in the old leader's clock).
+- A hub that becomes leader merge-pulls (`/cluster/sync?since=-1`, last-write-wins) from EVERY healthy peer; a leader also merge-pulls a
+  peer that still claims leadership (every 10 s) and one that stepped down. Rows it takes over are re-stamped to its clock so its standbys
+  pull them too. `/cluster/status` adds `stepdown_seq` (bumped when that hub stops leading) and `merged: {peer: seq}`; a demoted hub keeps
+  pulling last-write-wins and only does its authoritative (forced) resync once the leader's `merged[self] >= stepdown_seq` (or after 60 s).
+- **Contested leader**: a leader that sees a healthy peer naming a BETTER-priority leader (only its own link to that leader is cut, or a
+  healed partition before it steps down) keeps serving but hands out no jobs, sends no fencing cancels, answers job updates with
+  **503 `leader contested`**, and makes no presence / brief / retention decisions. It still honours `boot` (fails that agent's jobs).
+- `cluster.peers[]` in `/api/state` gains `url`: the peer's first non-loopback URL (the one this hub reaches it on when known).
+
+## Retention (leader, every 10 min; deletes replicate as tombstones)
+Finished jobs older than 30 days are pruned, always keeping the newest 200 jobs; briefs keep the newest 20 per project; tombstones older
+than 7 days are dropped on every hub.
+
+## Redaction
+Server-side (`forge_projects.redact`: session titles, commit subjects, transcripts, forge-job transcripts, brief prompts):
+tokens `sk-…` (incl. `sk-ant-`), `ghp_/gho_/ghu_/ghs_/ghr_`, `github_pat_`, `glpat-`, `xox[abprs]-`, `AKIA…`, `AIza…`, JWT `eyJ…`;
+PEM blocks `-----BEGIN …----- … -----END …-----` (unterminated: to the end of the text); key=value secrets `password|passwd|pwd|
+accountkey|sharedaccesskey|client_secret|api_key = value` (connection strings `Password=…;`, `AccountKey=…;`) keep the key and
+redact the value. Forge-job transcripts are redacted before being split into 4000-char events.

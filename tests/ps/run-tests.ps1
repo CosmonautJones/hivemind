@@ -98,9 +98,454 @@ Write-Host 'agent'
         Assert-True (-not (Test-SafeJobId '..\x')); Assert-True (-not (Test-SafeJobId 'a b')); Assert-True (-not (Test-SafeJobId '')); Assert-True (-not (Test-SafeJobId 'a"&calc'))
     }
     Test-Case 'lanes: system-lane report body is minimal (no metrics/procs/logs/info)' {
-        $b = New-SystemLaneReport -NodeId 'n' -Capacity 1 -Running 0 -Boot $true -AgentVersion '2.1.0' -BundleVersion '2.1.0'
-        Assert-Equal @('agent_version', 'boot', 'bundle_version', 'capacity', 'lane', 'node_id', 'running') @($b.Keys | Sort-Object)
-        Assert-Equal 'system' $b.lane
+        $b = New-SystemLaneReport -NodeId 'n' -Capacity 1 -Running @() -Boot $true -AgentVersion '2.1.0' -BundleVersion '2.1.0' -AgentTime 1700000000.25
+        Assert-Equal @('agent_time', 'agent_version', 'boot', 'bundle_version', 'capacity', 'lane', 'node_id', 'running') @($b.Keys | Sort-Object)
+        Assert-Equal 'system' $b.lane; Assert-Equal 1700000000.25 $b.agent_time
+        Assert-True ((ConvertTo-Json -InputObject $b -Compress) -match '"running":\[\]') 'running must be an (empty) array'
+        $b = New-SystemLaneReport -NodeId 'n' -Capacity 0 -Running @('sys-1') -Boot $false -AgentVersion 'x' -BundleVersion 'x'
+        Assert-True ((ConvertTo-Json -InputObject $b -Compress) -match '"running":\["sys-1"\]') 'one running id must stay a JSON array'
+    }
+
+    # ---- jobs: timeout, status lines, orphan re-attach (pure parts) ----
+    Test-Case 'jobs: timeout_s honored (default 7200); timed out at >= timeout' {
+        Assert-Equal 7200 (Get-JobTimeoutSec ([pscustomobject]@{ id = 'a' })); Assert-Equal 30 (Get-JobTimeoutSec @{ timeout_s = 30 })
+        Assert-Equal 90 (Get-JobTimeoutSec @{ timeout_s = '90.5' }); Assert-Equal 7200 (Get-JobTimeoutSec @{ timeout_s = 0 }); Assert-Equal 7200 (Get-JobTimeoutSec @{ timeout_s = 'x' })
+        Assert-True (Test-JobTimedOut 100 130 30); Assert-True (-not (Test-JobTimedOut 100 129 30)); Assert-True (-not (Test-JobTimedOut 0 1e9 30))
+    }
+    Test-Case 'jobs: agent status lines of brief jobs carry the [forge] tag the hub brief filter drops' {
+        Assert-Equal "[forge] [n1] ollama started in C:\w`n" (Format-AgentJobLine ([pscustomobject]@{ source = 'brief' }) 'n1' 'ollama started in C:\w')
+        Assert-Equal "[n1] shell started`n" (Format-AgentJobLine ([pscustomobject]@{ source = 'ui' }) 'n1' 'shell started')
+        $noise = '^\s*(pulling |verifying |writing manifest|success\b|\[ollama\]|\[forge\])'   # hub BRIEF_NOISE
+        $out = (Format-AgentJobLine @{ source = 'brief' } 'nova' 'ollama (model qwen2.5:14b) started in C:\forge\scratch\j1') + "[ollama] generating`nThe brief.`n"
+        Assert-Equal @('The brief.') @($out -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch $noise })
+    }
+    Test-Case 'jobs: running records keep no paths; re-attach only when pid AND command line name the job dir' {
+        $run = @{ 'j1' = @{ pid = 11; engine = 'claude'; offset = 120; erroffset = 0; err = $null; started = 5.5; timeout_s = 60; source = 'brief'; resume_tool = $null; resume_id = $null; cancelled = $false; out = 'C:\x\out.log' } }
+        $recs = ConvertTo-RunningRecords $run
+        Assert-Equal 1 @($recs).Count; Assert-Equal 'j1' $recs[0].id; Assert-Equal 120 $recs[0].offset; Assert-Equal 'brief' $recs[0].source
+        Assert-True (-not $recs[0].Contains('out')) 'paths must not be persisted'
+        $j = ConvertTo-Json -InputObject ([ordered]@{ jobs = $recs }) -Depth 5 | ConvertFrom-Json; Assert-True ($j.jobs -is [array]) 'one record must stay an array'
+        $recs2 = @([pscustomobject]@{ id = 'j1'; pid = 11 }, [pscustomobject]@{ id = 'j2'; pid = 12 }, [pscustomobject]@{ id = 'j3'; pid = 13 },
+                   [pscustomobject]@{ id = '..\evil'; pid = 14 }, [pscustomobject]@{ id = 'j5'; pid = 15 })
+        $procs = @{ 11 = @{ pid = 11; cmd = 'cmd.exe /s /c ""C:\t\claude.exe" -p < "C:\W\JOBS\j1\prompt.txt" > "C:\W\jobs\j1\out.log" 2>&1"' }
+                    12 = @{ pid = 12; cmd = 'C:\Windows\notepad.exe' }                                   # pid reused by something else
+                    14 = @{ pid = 14; cmd = 'cmd.exe C:\w\jobs\..\evil\x' }
+                    15 = @{ pid = 15; cmd = 'cmd.exe "C:\w\jobs\j55\out.log"' } }                        # other job's dir (prefix)
+        $plan = Select-ReattachJobs -Records $recs2 -Procs $procs -JobsDir 'C:\w\jobs'
+        Assert-Equal @('j1') @($plan.attach | ForEach-Object { $_.id }); Assert-Equal @('j2', 'j3', 'j5') @($plan.gone | ForEach-Object { $_.id })
+        $p2 = Select-ReattachJobs -Records @([pscustomobject]@{ id = 'a1'; pid = 7 }) -Procs @{ 7 = @{ pid = 7; cmd = 'powershell.exe -File "C:\w\jobs\sys-a1\task.ps1"' } } -JobsDir 'C:\w\jobs' -Lane system
+        Assert-Equal @('a1') @($p2.attach | ForEach-Object { $_.id })
+    }
+}
+
+# ---------------- 1a. 2.2: sessions, transcripts, jobs, services (agent\sessions.ps1, services.ps1) ----------------
+Write-Host 'agent 2.2'
+New-Item -ItemType Directory -Force $Scratch | Out-Null
+& {
+    . (Join-Path $Repo 'agent\forge-agent.ps1') -NoRun
+    $fx = Join-Path $PSScriptRoot 'fixtures\sessions'
+    $claudeFile = Join-Path $fx 'claude\projects\C--Users-dev-proj\11111111-2222-4333-8444-555555555555.jsonl'
+    $codexFile = Join-Path $fx 'codex\2026\11\20\rollout-2026-11-20T11-00-00-0aaa1111-2222-7333-8444-555555555555.jsonl'
+    $legacyFile = Join-Path $fx 'codex\2026\08\08\rollout-2026-08-08T21-10-47-9f0d19f4-0000-4000-8000-000000000001.jsonl'
+    $now = ConvertTo-EpochFromDate (Get-Date)
+    function Get-Fixture([string]$Path, [string]$Tool) { $m = New-SessionMeta $Tool $Path; $null = Update-SessionMetaFromFile $m 4MB; $m }
+    function Get-AllEvents([string]$Tool, [string]$Path) { $evs = New-Object System.Collections.Generic.List[object]; $n = @{}; foreach ($l in (Read-JsonlLines -Path $Path).lines) { foreach ($e in (ConvertFrom-SessionLine $Tool $l.text $n)) { $evs.Add($e) } }; , $evs.ToArray() }
+
+    Test-Case 'redact: spec prefixes (sk-, ghp_, xox, AKIA, eyJ) + 10 chars -> [redacted]; short strings kept' {
+        Assert-Equal 'key [redacted] ok' (Protect-SecretText 'key sk-ant-api03-ABCDEFGHIJ ok')
+        Assert-Equal '[redacted] [redacted] [redacted] [redacted]' (Protect-SecretText 'ghp_1234567890ab xoxb-1234567890 AKIAABCDEFGHIJKL eyJhbGciOiJIUzI1NiJ9')
+        Assert-Equal 'sk-short and task-list' (Protect-SecretText 'sk-short and task-list')
+        Assert-Equal '[redacted]' (Protect-SecretText 'github_pat_ABCDEFGHIJ1234')
+        Assert-Equal '' (Protect-SecretText $null)
+    }
+    Test-Case 'redact: PEM keys, URL credentials, Bearer, KEY=value, connection strings (value only)' {
+        $pem = "key:`n-----BEGIN OPENSSH PRIVATE KEY-----`nb3BlbnNzaC1rZXktdjEAAAAA`n-----END OPENSSH PRIVATE KEY-----`nafter"
+        Assert-Equal "key:`n[redacted private key]`nafter" (Protect-SecretText $pem)
+        Assert-Equal 'x [redacted private key]' (Protect-SecretText "x -----BEGIN RSA PRIVATE KEY-----`nMIIEowIBAAKCAQEA (cut")
+        Assert-Equal 'postgres://[redacted]@db:5432/app and https://[redacted]@github.com/o/r.git' (Protect-SecretText 'postgres://admin:hunter22@db:5432/app and https://user:ghs_abc123@github.com/o/r.git')
+        Assert-Equal 'origin	https://github.com/Example/Repo.git (fetch) http://127.0.0.1:8787/x' (Protect-SecretText 'origin	https://github.com/Example/Repo.git (fetch) http://127.0.0.1:8787/x')
+        Assert-Equal 'Authorization: Bearer [redacted]' (Protect-SecretText 'Authorization: Bearer abcdefghijklmnop0123456789')
+        Assert-Equal 'PASSWORD=[redacted] AWS_SECRET_ACCESS_KEY=[redacted]' (Protect-SecretText 'PASSWORD=s3cretpass AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG')
+        Assert-Equal 'password: [redacted]' (Protect-SecretText 'password: hunter22')
+        Assert-Equal '"agent_token": "[redacted]", "input_tokens": 123456' (Protect-SecretText '"agent_token": "Zk3j_x9Qa-pL0", "input_tokens": 123456')
+        Assert-Equal 'Server=db;Database=app;User Id=sa;Password=[redacted];' (Protect-SecretText 'Server=db;Database=app;User Id=sa;Password=P@ss-w0rd!;')
+        Assert-Equal 'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=[redacted];EndpointSuffix=core.windows.net' (Protect-SecretText 'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=abcDEF123+/xyz==;EndpointSuffix=core.windows.net')
+        Assert-Equal 'ANTHROPIC_API_KEY=[redacted]' (Protect-SecretText 'ANTHROPIC_API_KEY=sk-ant-api03-ABCDEFGHIJKLMN')
+        Assert-Equal 'the token is fine; max_tokens: 4096' (Protect-SecretText 'the token is fine; max_tokens: 4096')
+    }
+    Test-Case 'title: whitespace collapsed, redacted BEFORE the 140-char cut' {
+        Assert-Equal 'a b c' (ConvertTo-SessionTitle "  a`r`n  b`tc ")
+        $t = ConvertTo-SessionTitle (('x' * 135) + ' sk-ABCDEFGHIJKLMNOP')
+        Assert-True ($t.Length -le 140) "length $($t.Length)"; Assert-True ($t -notmatch 'sk-|ABCDEFG') 'secret fragment survived the cut'
+        Assert-Equal $null (ConvertTo-SessionTitle '   ')
+    }
+    Test-Case 'real prompt: injected context / slash-command wrappers are not titles' {
+        Assert-True (Test-RealPrompt 'fix the bug'); Assert-True (-not (Test-RealPrompt '<environment_context>x</environment_context>'))
+        Assert-True (-not (Test-RealPrompt '  <command-name>/login</command-name>')); Assert-True (-not (Test-RealPrompt '# AGENTS.md instructions')); Assert-True (-not (Test-RealPrompt ''))
+    }
+    Test-Case 'json line parser: objects only; malformed / blank / arrays -> $null' {
+        Assert-Equal 'x' (ConvertFrom-JsonLine '{"type":"x"}').type
+        Assert-True ($null -eq (ConvertFrom-JsonLine '{"broken')); Assert-True ($null -eq (ConvertFrom-JsonLine '')); Assert-True ($null -eq (ConvertFrom-JsonLine '[1,2]'))
+    }
+
+    Test-Case 'claude parser (fixture): session metadata' {
+        $m = Get-Fixture $claudeFile 'claude'
+        Assert-Equal '11111111-2222-4333-8444-555555555555' $m.session_id; Assert-Equal 'C:\Users\dev\proj' $m.cwd; Assert-Equal 'main' $m.branch_hint
+        Assert-Equal 'Fix the login bug; my key is [redacted] and it fails' $m.title
+        Assert-Equal 5 $m.messages 'two real prompts + three assistant API messages (blocks sharing message.id count once)'
+        Assert-Equal 168 $m.tokens 'input + cache_creation + output, once per message id (cache reads excluded)'
+        Assert-Equal 'claude-opus-5-5' $m.model; Assert-Equal $false $m.remote_control; Assert-Equal 'Fix login bug' $m.ai_title; Assert-Equal 'cli' $m.entrypoint
+        Assert-Equal (ConvertTo-EpochSeconds '2026-11-20T10:00:00.000Z') $m.started; Assert-Equal '2026-11-20T10:01:05.000Z' $m.last_ts_raw
+        Assert-True $m.indexed 'not marked indexed'
+    }
+    Test-Case 'claude parser (fixture): transcript events (meta, sidechain, malformed, bookkeeping skipped)' {
+        $e = Get-AllEvents 'claude' $claudeFile
+        Assert-Equal 10 $e.Count
+        Assert-Equal 'user/text,user/text,assistant/thinking,tool/tool_call,tool/tool_result,assistant/text,system/text,user/text,user/text,assistant/text' (($e | ForEach-Object { "$($_.role)/$($_.kind)" }) -join ',')
+        Assert-Equal 'Bash' $e[3].tool_name; Assert-Equal 'command: git status' $e[3].text; Assert-Equal 'Bash' $e[4].tool_name 'tool_result gets the tool name of its tool_use'
+        Assert-True ($e[2].collapsed -and $e[3].collapsed -and $e[4].collapsed) 'thinking/tool events must be collapsed'; Assert-True (-not $e[1].collapsed)
+        Assert-True (($e | ForEach-Object { $_.text }) -join ' ' -notmatch 'sk-ant|ghp_') 'secret leaked into transcript'
+        Assert-Equal '[image]' $e[8].text; Assert-Equal "Docs updated $([char]0x2713)" $e[9].text 'utf-8 decoding'
+        Assert-Equal (ConvertTo-EpochSeconds '2026-11-20T10:00:09.000Z') $e[5].ts
+    }
+    Test-Case 'codex parser (fixture): metadata from session_meta / turn_context / token_count' {
+        $m = Get-Fixture $codexFile 'codex'
+        Assert-Equal '0aaa1111-2222-7333-8444-555555555555' $m.session_id; Assert-Equal 'C:\Users\dev\proj2' $m.cwd; Assert-Equal 'gpt-5.5-codex' $m.model
+        Assert-Equal 'Summarize the repo layout please' $m.title; Assert-Equal 2 $m.messages; Assert-Equal 1234 $m.tokens; Assert-Equal 'codex_exec' $m.entrypoint
+    }
+    Test-Case 'codex parser (fixture): transcript events (developer/env context/event_msg skipped)' {
+        $e = Get-AllEvents 'codex' $codexFile
+        Assert-Equal 'user/text,assistant/thinking,tool/tool_call,tool/tool_result,tool/tool_call,tool/tool_result,assistant/text,system/text' (($e | ForEach-Object { "$($_.role)/$($_.kind)" }) -join ',')
+        Assert-Equal 'shell_command' $e[2].tool_name; Assert-Equal 'command: Get-ChildItem' $e[2].text; Assert-Equal 'shell_command' $e[3].tool_name
+        Assert-Equal 'apply_patch' $e[5].tool_name; Assert-Equal 'Done!' $e[5].text
+        Assert-True ($e[6].text -match '\[redacted\]' -and $e[6].text -notmatch 'AKIA') 'AKIA key not redacted'
+    }
+    Test-Case 'codex parser (legacy 2025 format fixture): header id, bare message records, <cwd> from env context' {
+        $m = Get-Fixture $legacyFile 'codex'
+        Assert-Equal '9f0d19f4-0000-4000-8000-000000000001' $m.session_id; Assert-Equal 'C:\Users\dev\Temp' $m.cwd
+        Assert-Equal 'Reply with exactly: OK' $m.title; Assert-Equal 2 $m.messages; Assert-Equal (ConvertTo-EpochSeconds '2026-08-08T21:10:47.000Z') $m.started
+        $le = Get-AllEvents 'codex' $legacyFile; Assert-Equal 'user/text,assistant/text' (($le | ForEach-Object { "$($_.role)/$($_.kind)" }) -join ',')
+    }
+
+    Test-Case 'transcript: since=null -> last N events, cursor = end of file, at_end' {
+        $size = (Get-Item $claudeFile).Length
+        $b = Get-TranscriptBatch -Tool claude -Path $claudeFile -Since $null
+        Assert-Equal 10 @($b.events).Count; Assert-Equal $size $b.cursor; Assert-True $b.at_end
+        $b = Get-TranscriptBatch -Tool claude -Path $claudeFile -Since $null -Max 3
+        Assert-Equal 'user/text,user/text,assistant/text' ((@($b.events) | ForEach-Object { "$($_.role)/$($_.kind)" }) -join ',') 'expected the LAST 3 events'
+    }
+    Test-Case 'transcript: since=cursor pages forward, max N per call, no gaps or repeats' {
+        $all = Get-AllEvents 'claude' $claudeFile
+        $got = New-Object System.Collections.Generic.List[string]; $cur = 0; $calls = 0; $names = @{}
+        do {
+            $b = Get-TranscriptBatch -Tool claude -Path $claudeFile -Since $cur -Max 3 -ToolNames $names
+            Assert-True (@($b.events).Count -le 3) 'more than Max events'
+            foreach ($e in @($b.events)) { $got.Add("$($e.kind):$($e.text)") }
+            Assert-True ($b.cursor -gt $cur -or $b.at_end) 'cursor did not advance'
+            $cur = $b.cursor; $calls++
+        } until ($b.at_end -or $calls -gt 20)
+        Assert-Equal (@($all | ForEach-Object { "$($_.kind):$($_.text)" })) @($got) 'paged events differ from a full parse'
+        Assert-True ($calls -ge 4) "expected several pages, got $calls"
+        $b = Get-TranscriptBatch -Tool claude -Path $claudeFile -Since $cur
+        Assert-Equal 0 @($b.events).Count; Assert-Equal $cur $b.cursor; Assert-True $b.at_end
+    }
+    Test-Case 'transcript: tail walks back in small chunks, each byte parsed once, same events as a full parse' {
+        $all = Get-AllEvents 'claude' $claudeFile
+        foreach ($tb in 300, 700, 1500) {
+            $b = Get-TranscriptBatch -Tool claude -Path $claudeFile -Since $null -TailBytes $tb
+            Assert-Equal (@($all | ForEach-Object { "$($_.kind):$($_.text)" })) (@(@($b.events) | ForEach-Object { "$($_.kind):$($_.text)" })) "TailBytes $tb"
+            Assert-Equal (Get-Item $claudeFile).Length $b.cursor
+        }
+        $b = Get-TranscriptBatch -Tool claude -Path $claudeFile -Since $null -TailBytes 700 -MaxTailBytes 2100
+        Assert-True (@($b.events).Count -lt 10 -and @($b.events).Count -ge 1) "MaxTailBytes cap ignored ($(@($b.events).Count))"
+    }
+    Test-Case 'transcript: a cursor beyond the file (truncated / rewritten) restarts from the tail' {
+        $b = Get-TranscriptBatch -Tool claude -Path $claudeFile -Since 99999999
+        Assert-Equal 10 @($b.events).Count
+    }
+
+    # ---- transcript step (main-loop logic) with a stubbed sender ----
+    $txSid = '11111111-2222-4333-8444-555555555555'
+    $txFile = Join-Path $Scratch 'tx-session.jsonl'
+    function New-TxSess { $ss = New-SessionIndexState; $m = New-SessionMeta 'claude' $txFile; $m.session_id = $txSid; $m.mtime = 1000.0; $ss.files[$txFile] = $m; $ss }
+    Test-Case 'transcript step: a stale watch since (report failed / hub switch) never resends a posted batch' {
+        Copy-Item $claudeFile $txFile -Force
+        $ss = New-TxSess; $tx = New-TranscriptState; $script:posts = New-Object System.Collections.Generic.List[object]
+        $send = { param($P, $B) $script:posts.Add($B); $true }
+        Invoke-TranscriptStep -Watches @(@{ tool = 'claude'; session_id = $txSid; since = $null }) -TxState $tx -SessState $ss -NodeId 'n1' -Now 1001 -Send $send
+        Assert-Equal 1 $script:posts.Count; $c0 = [long]$script:posts[0].cursor; Assert-Equal 10 @($script:posts[0].events).Count
+        [IO.File]::AppendAllText($txFile, '{"type":"user","message":{"role":"user","content":"next question"},"timestamp":"2026-11-20T10:03:00.000Z","sessionId":"x"}' + "`n")
+        Invoke-TranscriptStep -Watches @(@{ tool = 'claude'; session_id = $txSid; since = $c0 }) -TxState $tx -SessState $ss -NodeId 'n1' -Now 1002 -Send $send
+        Assert-Equal 2 $script:posts.Count; Assert-Equal 'next question' @($script:posts[1].events)[0].text; $c1 = [long]$script:posts[1].cursor
+        # the hub never stored batch 2 in time (report failed, hub switched): the watch still says since=c0
+        Invoke-TranscriptStep -Watches @(@{ tool = 'claude'; session_id = $txSid; since = $c0 }) -TxState $tx -SessState $ss -NodeId 'n1' -Now 1003 -Send $send
+        Assert-Equal 2 $script:posts.Count 'batch from the same since was posted twice'
+        [IO.File]::AppendAllText($txFile, '{"type":"user","message":{"role":"user","content":"third"},"timestamp":"2026-11-20T10:04:00.000Z","sessionId":"x"}' + "`n")
+        Invoke-TranscriptStep -Watches @(@{ tool = 'claude'; session_id = $txSid; since = $c0 }) -TxState $tx -SessState $ss -NodeId 'n1' -Now 1004 -Send $send
+        Assert-Equal 3 $script:posts.Count; Assert-Equal @('third') @(@($script:posts[2].events) | ForEach-Object { $_.text }) 'continues after the last posted batch'
+        Assert-True ([long]$script:posts[2].cursor -gt $c1)
+        # a failed POST is not remembered: the same since is retried
+        $tx2 = New-TranscriptState; $script:n = 0
+        $fail = { param($P, $B) $script:n++; $false }
+        Invoke-TranscriptStep -Watches @(@{ tool = 'claude'; session_id = $txSid; since = $c0 }) -TxState $tx2 -SessState $ss -NodeId 'n1' -Now 1005 -Send $fail
+        Invoke-TranscriptStep -Watches @(@{ tool = 'claude'; session_id = $txSid; since = $c0 }) -TxState $tx2 -SessState $ss -NodeId 'n1' -Now 1006 -Send $fail
+        Assert-Equal 2 $script:n
+    }
+    Test-Case 'transcript step: missing session reported at most once per 60 s, with error' {
+        $ss = New-TxSess; $tx = New-TranscriptState; $script:posts = New-Object System.Collections.Generic.List[object]
+        $send = { param($P, $B) $script:posts.Add($B); $true }
+        $w = @(@{ tool = 'claude'; session_id = 'deadbeef-0000-4000-8000-000000000000'; since = 5 })
+        foreach ($t in 100, 130, 159) { Invoke-TranscriptStep -Watches $w -TxState $tx -SessState $ss -NodeId 'n1' -Now $t -Send $send }
+        Assert-Equal 1 $script:posts.Count; Assert-Equal 'session not found on this node' $script:posts[0].error; Assert-Equal $true $script:posts[0].done
+        Invoke-TranscriptStep -Watches $w -TxState $tx -SessState $ss -NodeId 'n1' -Now 160 -Send $send
+        Assert-Equal 2 $script:posts.Count
+    }
+    Test-Case 'transcript step: more than 4 watches rotate (the 5th+ are served); one tail per cycle' {
+        $ws = @(1..6 | ForEach-Object { @{ tool = 'claude'; session_id = "s$_"; since = 1 } })
+        $a = Select-RotatingWatches -Watches $ws -Offset 0; Assert-Equal @('s1', 's2', 's3', 's4') @($a.items | ForEach-Object { $_.session_id }); Assert-Equal 4 $a.next
+        $b = Select-RotatingWatches -Watches $ws -Offset $a.next; Assert-Equal @('s5', 's6', 's1', 's2') @($b.items | ForEach-Object { $_.session_id })
+        $c = Select-RotatingWatches -Watches $ws[0..1] -Offset 7; Assert-Equal 2 @($c.items).Count
+        Assert-Equal 0 @((Select-RotatingWatches -Watches @()).items).Count
+        $ss = New-TxSess; $tx = New-TranscriptState; $script:posts = New-Object System.Collections.Generic.List[object]
+        $send = { param($P, $B) $script:posts.Add($B); $true }
+        $tails = @(1..5 | ForEach-Object { @{ tool = 'claude'; session_id = "0000000$_-0000-4000-8000-000000000000"; since = $null } })
+        Invoke-TranscriptStep -Watches $tails -TxState $tx -SessState $ss -NodeId 'n1' -Now 100 -Send $send
+        Invoke-TranscriptStep -Watches $tails -TxState $tx -SessState $ss -NodeId 'n1' -Now 101 -Send $send
+        Assert-Equal @('00000001-0000-4000-8000-000000000000', '00000005-0000-4000-8000-000000000000') @($script:posts | ForEach-Object { $_.session_id }) 'one tail per cycle, rotating'
+    }
+
+    $sdir = Join-Path $Scratch 'sess'; $cRoot = Join-Path $sdir 'claude'; $xRoot = Join-Path $sdir 'codex'
+    New-Item -ItemType Directory -Force (Join-Path $cRoot 'C--Users-dev-proj'), (Join-Path $xRoot '2026\11\20') | Out-Null
+    $c1 = Join-Path $cRoot 'C--Users-dev-proj\11111111-2222-4333-8444-555555555555.jsonl'; Copy-Item $claudeFile $c1
+    Copy-Item $codexFile (Join-Path $xRoot '2026\11\20')
+    (Get-Item $c1).LastWriteTime = Get-Date; (Get-Item (Join-Path $xRoot '2026\11\20\*.jsonl')).LastWriteTime = Get-Date
+    New-Item -ItemType Directory -Force (Join-Path $cRoot 'C--Users-dev-proj\11111111-2222-4333-8444-555555555555\subagents') | Out-Null
+    Copy-Item $claudeFile (Join-Path $cRoot 'C--Users-dev-proj\11111111-2222-4333-8444-555555555555\subagents\agent-a1.jsonl')
+    $st = New-SessionIndexState
+    Test-Case 'index cycle: claude top-level + codex recursive; subagent files ignored; every session sent once' {
+        $c = Invoke-SessionIndexCycle -State $st -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now $now
+        Assert-Equal 2 @($c.sessions).Count; Assert-True $c.full
+        Assert-Equal @('claude', 'codex') @(@($c.sessions) | ForEach-Object { $_.tool } | Sort-Object)
+        $s = @($c.sessions) | Where-Object { $_.tool -eq 'claude' }
+        Assert-Equal @('tool', 'session_id', 'node_id', 'cwd', 'git_remote', 'git_branch', 'title', 'started', 'last_activity', 'messages', 'tokens', 'state', 'remote_control', 'pid', 'model', 'ai_title', 'entrypoint') @($s.Keys)
+        Assert-Equal 'n1' $s.node_id; Assert-Equal 'live' $s.state 'just copied = written < 90 s ago'
+        Confirm-SessionsSent $st $c $now
+    }
+    Test-Case 'index cycle: unchanged -> nothing sent; appended line -> only that session, parsed incrementally' {
+        $c = Invoke-SessionIndexCycle -State $st -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now ($now + 1)
+        Assert-Equal 0 @($c.sessions).Count
+        $off = $st.files[$c1].offset
+        [IO.File]::AppendAllText($c1, '{"type":"user","message":{"role":"user","content":"one more thing"},"timestamp":"2026-11-20T10:02:00.000Z","sessionId":"x"}' + "`n")
+        (Get-Item $c1).LastWriteTime = (Get-Date)
+        $c = Invoke-SessionIndexCycle -State $st -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now ($now + 2)
+        Assert-Equal 1 @($c.sessions).Count; Assert-Equal 6 @($c.sessions)[0].messages
+        Assert-True ($st.files[$c1].offset -gt $off) 'offset did not advance'
+        Confirm-SessionsSent $st $c ($now + 2)
+    }
+    Test-Case 'index cycle: state transitions are sent (live -> idle -> done)' {
+        $c = Invoke-SessionIndexCycle -State $st -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now ($now + 3600)
+        Assert-Equal @('idle', 'idle') @(@($c.sessions) | ForEach-Object { $_.state }); Confirm-SessionsSent $st $c ($now + 3600)
+    }
+    Test-Case 'index cycle: forced session (after a resume job) is resent even if unchanged' {
+        $st.force['0aaa1111-2222-7333-8444-555555555555'] = $true
+        $c = Invoke-SessionIndexCycle -State $st -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now ($now + 3601)
+        Assert-Equal @('codex') @(@($c.sessions) | ForEach-Object { $_.tool }); Confirm-SessionsSent $st $c ($now + 3601)
+        Assert-True (-not $st.force.ContainsKey('0aaa1111-2222-7333-8444-555555555555'))
+    }
+    Test-Case 'index cycle: deleted file -> removed id; byte budget defers work to the next cycle' {
+        Remove-Item $c1 -Force
+        $c = Invoke-SessionIndexCycle -State $st -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now ($now + 3602)
+        Assert-Equal @('11111111-2222-4333-8444-555555555555') @($c.removed); Confirm-SessionsSent $st $c ($now + 3602)
+        $st2 = New-SessionIndexState
+        $c = Invoke-SessionIndexCycle -State $st2 -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now $now -BudgetBytes 600
+        Assert-Equal 0 @($c.sessions).Count 'a half-parsed file must not be sent'
+        for ($i = 0; $i -lt 30 -and -not @($c.sessions).Count; $i++) { $c = Invoke-SessionIndexCycle -State $st2 -NodeId 'n1' -ClaudeRoot $cRoot -CodexRoot $xRoot -Now $now -BudgetBytes 600 }
+        Assert-Equal 2 @($c.sessions)[0].messages 'complete after several budgeted cycles'
+    }
+    Test-Case 'jsonl reader: partial trailing line waits; complete JSON tail accepted; oversized line skipped' {
+        $f = Join-Path $Scratch 'p.jsonl'
+        [IO.File]::WriteAllText($f, "{`"a`":1}`n{`"b`":")
+        $r = Read-JsonlLines -Path $f -AcceptPartialTail; Assert-Equal 1 $r.lines.Count; Assert-Equal 8 $r.next
+        [IO.File]::AppendAllText($f, '2}'); $r = Read-JsonlLines -Path $f -Offset 8 -AcceptPartialTail; Assert-Equal 1 $r.lines.Count; Assert-Equal 15 $r.next
+        [IO.File]::WriteAllText($f, ('{"big":"' + ('z' * 5000) + '"}' + "`n" + '{"c":3}' + "`n"))
+        $r = Read-JsonlLines -Path $f -MaxBytes 1000; Assert-Equal 0 $r.lines.Count; Assert-Equal 0 $r.next 'budget window: no skip, retry later'
+        $r = Read-JsonlLines -Path $f -MaxBytes 1000 -SkipOversizeAt 1000; Assert-Equal 0 $r.lines.Count; Assert-Equal 5011 $r.next; Assert-Equal 1 $r.skipped
+        $r = Read-JsonlLines -Path $f -Offset $r.next -MaxBytes 1000; Assert-Equal '{"c":3}' $r.lines[0].text
+        $f2 = Join-Path $Scratch 'crlf.jsonl'; [IO.File]::WriteAllText($f2, "{`"a`":1}`r`n`r`n{`"b`":2}`r`n")
+        $r = Read-JsonlLines -Path $f2; Assert-Equal @('{"a":1}', '{"b":2}') @($r.lines | ForEach-Object { $_.text })
+    }
+
+    Test-Case 'session state: live < 90 s or owning process alive; idle < 24 h; done older' {
+        Assert-Equal 'live' (Get-SessionState -LastWrite 1000 -Now 1089); Assert-Equal 'idle' (Get-SessionState -LastWrite 1000 -Now 1090)
+        Assert-Equal 'live' (Get-SessionState -LastWrite 0 -Now 999999 -ProcAlive $true)
+        Assert-Equal 'idle' (Get-SessionState -LastWrite 0 -Now 86399); Assert-Equal 'done' (Get-SessionState -LastWrite 0 -Now 86400)
+    }
+    Test-Case 'process kind: CLI claude/codex vs desktop apps' {
+        Assert-Equal 'claude' (Get-AiProcessKind 'claude.exe' '"C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe" --dangerously-skip-permissions')
+        Assert-Equal $null (Get-AiProcessKind 'claude.exe' '"C:\Program Files\WindowsApps\Claude_6.2_x64__abc\app\claude.exe"')
+        Assert-Equal $null (Get-AiProcessKind 'claude.exe' '"C:\x\claude.exe" --type=renderer --user-data-dir=C:\x')
+        Assert-Equal 'claude' (Get-AiProcessKind 'node.exe' 'node C:\npm\node_modules\@anthropic-ai\claude-code\cli.js --resume 1')
+        Assert-Equal 'codex' (Get-AiProcessKind 'codex.exe' 'codex.exe exec resume 0aaa1111-2222-7333-8444-555555555555 -')
+        Assert-Equal $null (Get-AiProcessKind 'codex.exe' '"C:\Program Files\WindowsApps\OpenAI.Codex_26.1\app\resources\codex.exe" app-server')
+        Assert-Equal $null (Get-AiProcessKind 'node.exe' 'node desktop-commander\dist\index.js'); Assert-Equal $null (Get-AiProcessKind 'python.exe' 'python x')
+    }
+    Test-Case 'process match: session id from --resume / --session-id / -r / codex resume' {
+        $id = '11111111-2222-4333-8444-555555555555'
+        Assert-Equal $id (Get-SessionIdFromCmd "claude.exe -p --resume $id --permission-mode default")
+        Assert-Equal $id (Get-SessionIdFromCmd "claude.exe --session-id=$id"); Assert-Equal $id (Get-SessionIdFromCmd "claude -r `"$($id.ToUpper())`"")
+        Assert-Equal $id (Get-SessionIdFromCmd "codex.exe exec --skip-git-repo-check --sandbox workspace-write resume $id -")
+        Assert-Equal $null (Get-SessionIdFromCmd 'codex.exe exec resume --last'); Assert-Equal $null (Get-SessionIdFromCmd 'claude.exe --dangerously-skip-permissions')
+    }
+    Test-Case 'process match: pid map (start time must match), then command line, then newest file since process start' {
+        $procs = @(@{ pid = 100; kind = 'claude'; cmd = 'claude.exe'; started = 1000.0 }, @{ pid = 200; kind = 'codex'; cmd = 'codex.exe'; started = 5000.0 },
+                   @{ pid = 300; kind = 'claude'; cmd = 'claude.exe -p --resume cccccccc-0000-4000-8000-000000000003'; started = 6000.0 })
+        $sess = @(@{ tool = 'claude'; session_id = 'aaaaaaaa-0000-4000-8000-000000000001'; last_write = 9000.0 },
+                  @{ tool = 'codex'; session_id = 'bbbbbbbb-0000-4000-8000-000000000002'; last_write = 4000.0 },
+                  @{ tool = 'codex'; session_id = 'dddddddd-0000-4000-8000-000000000004'; last_write = 7000.0 },
+                  @{ tool = 'codex'; session_id = 'eeeeeeee-0000-4000-8000-000000000005'; last_write = 8000.0 })
+        $map = @(@{ pid = 100; session_id = 'aaaaaaaa-0000-4000-8000-000000000001'; proc_start = 1001.0 })
+        $r = Find-SessionPids -Procs $procs -Sessions $sess -PidMap $map
+        Assert-Equal 100 $r['aaaaaaaa-0000-4000-8000-000000000001']; Assert-Equal 300 $r['cccccccc-0000-4000-8000-000000000003']
+        Assert-Equal 200 $r['eeeeeeee-0000-4000-8000-000000000005'] 'codex fallback: newest codex file written since it started'
+        Assert-True (-not $r.ContainsKey('bbbbbbbb-0000-4000-8000-000000000002')) 'file older than the process matched'
+        Assert-True (-not $r.ContainsKey('dddddddd-0000-4000-8000-000000000004')) 'one process may own one session only'
+        $r = Find-SessionPids -Procs $procs[0..0] -Sessions $sess[0..0] -PidMap @(@{ pid = 100; session_id = 'zzzzzzzz-0000-4000-8000-000000000009'; proc_start = 50.0 })
+        Assert-True (-not $r.ContainsKey('zzzzzzzz-0000-4000-8000-000000000009')) 'pid reuse: stale pid file trusted'
+        Assert-Equal 100 $r['aaaaaaaa-0000-4000-8000-000000000001'] 'then falls back to newest file'
+    }
+    Test-Case 'process match: a terminal codex never claims a finished `codex exec` job session (keeps the 409 guard)' {
+        # terminal `codex` A since 09:00 on session X (last write 09:05); a Forge `codex exec` wrote Z 09:10-09:12 and exited
+        $procs = @(@{ pid = 500; kind = 'codex'; cmd = '"C:\npm\codex.exe"'; started = 32400.0 })
+        $sess = @(@{ tool = 'codex'; session_id = 'xxxxxxxx-0000-4000-8000-00000000000a'; last_write = 32700.0; started = 32401.0; entrypoint = 'codex_cli_rs' },
+                  @{ tool = 'codex'; session_id = 'zzzzzzzz-0000-4000-8000-00000000000b'; last_write = 33120.0; started = 33000.0; entrypoint = 'codex_exec' })
+        $r = Find-SessionPids -Procs $procs -Sessions $sess
+        Assert-Equal 500 $r['xxxxxxxx-0000-4000-8000-00000000000a']; Assert-True (-not $r.ContainsKey('zzzzzzzz-0000-4000-8000-00000000000b')) 'interactive process claimed a batch session'
+        # a running `codex exec` (no id on its command line) gets the exec session, not the terminal one
+        $r = Find-SessionPids -Procs @(@{ pid = 600; kind = 'codex'; cmd = 'codex.exe exec --skip-git-repo-check --sandbox workspace-write -'; started = 32990.0 }) -Sessions $sess
+        Assert-Equal 600 $r['zzzzzzzz-0000-4000-8000-00000000000b']; Assert-True (-not $r.ContainsKey('xxxxxxxx-0000-4000-8000-00000000000a'))
+        # claude: -p processes only match sdk sessions; sessions started after the process beat ones only written later
+        Assert-True (Test-BatchProcess 'claude' 'claude.exe -p --output-format text'); Assert-True (-not (Test-BatchProcess 'claude' 'claude.exe --dangerously-skip-permissions'))
+        Assert-True (Test-BatchSession 'sdk-cli'); Assert-True (Test-BatchSession 'codex_exec'); Assert-True (-not (Test-BatchSession 'cli')); Assert-True (-not (Test-BatchSession $null))
+        $s2 = @(@{ tool = 'claude'; session_id = 'old00000-0000-4000-8000-000000000001'; last_write = 2000.0; started = 100.0; entrypoint = 'cli' },
+                @{ tool = 'claude'; session_id = 'new00000-0000-4000-8000-000000000002'; last_write = 1500.0; started = 1001.0; entrypoint = 'cli' })
+        $r = Find-SessionPids -Procs @(@{ pid = 700; kind = 'claude'; cmd = 'claude.exe'; started = 1000.0 }) -Sessions $s2
+        Assert-Equal 700 $r['new00000-0000-4000-8000-000000000002'] 'a session started by this process wins over an older one written later'
+    }
+    Test-Case 'process match: ~/.claude/sessions/<pid>.json map (procStart FILETIME -> epoch)' {
+        $d = Join-Path $Scratch 'pids'; New-Item -ItemType Directory -Force $d | Out-Null
+        $ft = [DateTime]::new(2026, 11, 24, 23, 21, 51, [DateTimeKind]::Utc).ToFileTimeUtc()
+        [IO.File]::WriteAllText((Join-Path $d '4242.json'), "{`"pid`":4242,`"sessionId`":`"AAAAAAAA-0000-4000-8000-000000000001`",`"cwd`":`"C:\\x`",`"procStart`":$ft,`"status`":`"busy`"}")
+        [IO.File]::WriteAllText((Join-Path $d '4242.abc.key'), 'not json'); [IO.File]::WriteAllText((Join-Path $d 'junk.json'), '{')
+        $m = Read-ClaudePidMap $d
+        Assert-Equal 1 @($m).Count; Assert-Equal 4242 $m[0].pid; Assert-Equal 'aaaaaaaa-0000-4000-8000-000000000001' $m[0].session_id
+        Assert-Equal ([double][DateTimeOffset]::new(2026, 11, 24, 23, 21, 51, [TimeSpan]::Zero).ToUnixTimeSeconds()) $m[0].proc_start
+    }
+    Test-Case 'git: status header -> branch/ahead/behind/dirty; log lines -> commits (subjects redacted)' {
+        $s = ConvertFrom-GitStatus @('## main...origin/main [ahead 2, behind 1]', ' M a.txt'); Assert-Equal 'main' $s.branch; Assert-Equal 2 $s.ahead; Assert-Equal 1 $s.behind; Assert-True $s.dirty
+        $s = ConvertFrom-GitStatus @('## feature/x.y...origin/feature/x.y'); Assert-Equal 'feature/x.y' $s.branch; Assert-True (-not $s.dirty); Assert-Equal 0 $s.ahead
+        Assert-Equal 'dev' (ConvertFrom-GitStatus @('## dev')).branch; Assert-Equal 'main' (ConvertFrom-GitStatus @('## No commits yet on main')).branch
+        $us = [char]0x1f
+        $c = ConvertFrom-GitLog @("abc1234def${us}Dev Person${us}1795000000${us}Fix sk-ABCDEFGHIJKLMNOP leak", '', 'garbage')
+        Assert-Equal 1 @($c).Count; Assert-Equal 'abc1234def' $c[0].sha; Assert-Equal 1795000000 $c[0].ts; Assert-Equal 'Fix [redacted] leak' $c[0].subject; Assert-Equal 'Dev Person' $c[0].author
+    }
+    Test-Case 't3: listing supported only if `t3 project --help` lists a list subcommand' {
+        $no = "DESCRIPTION`n  Manage projects.`n`nSUBCOMMANDS`n  add       Add a project.`n  remove    Remove a project.`n  rename    Rename a project."
+        Assert-True (-not (Test-T3ListSupport $no)); Assert-True (Test-T3ListSupport ($no + "`n  list      List projects.")); Assert-True (-not (Test-T3ListSupport ''))
+    }
+
+    # ---- job command lines (SPEC D / F) ----
+    $tools = @{ claude = 'C:\t\claude.exe'; codex = 'C:\t\codex.cmd' }
+    $pf = 'C:\w\jobs\j1\prompt.txt'
+    function Get-Cmd($Job, $Config = ([pscustomobject]@{}), $T = $tools) { Get-JobCommand -Job ([pscustomobject]$Job) -Tools $T -Config $Config -PromptFile $pf -JobDir 'C:\w\jobs\j1' -AgentDir 'C:\F\agent' -OutFile 'C:\w\jobs\j1\out.log' }
+    $clr = 'set "ANTHROPIC_API_KEY=" && set "ANTHROPIC_AUTH_TOKEN=" && '
+    Test-Case 'job cmd: defaults claude acceptEdits / codex workspace-write; full_access bypasses' {
+        Assert-Equal "$clr`"C:\t\claude.exe`" -p --permission-mode acceptEdits --output-format text < `"$pf`"" (Get-Cmd @{ engine = 'claude' }).inner
+        Assert-Equal "`"C:\t\codex.cmd`" exec --skip-git-repo-check --sandbox workspace-write - < `"$pf`"" (Get-Cmd @{ engine = 'codex' }).inner
+        Assert-Equal "`"C:\t\codex.cmd`" exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox - < `"$pf`"" (Get-Cmd @{ engine = 'codex'; full_access = $true }).inner
+        $s = Get-Cmd @{ engine = 'shell' }; Assert-Equal 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\w\jobs\j1\task.ps1"' $s.inner; Assert-Equal 'ps1' $s.write; Assert-Equal 'out' $s.redirect
+    }
+    Test-Case 'job cmd: claude resume = -p --resume <id> --permission-mode <mode> --output-format text < prompt (API key still cleared)' {
+        $c = Get-Cmd @{ engine = 'claude'; full_access = $true; resume = [pscustomobject]@{ tool = 'claude'; session_id = '11111111-2222-4333-8444-555555555555' } }
+        Assert-Equal "$clr`"C:\t\claude.exe`" -p --resume 11111111-2222-4333-8444-555555555555 --permission-mode bypassPermissions --output-format text < `"$pf`"" $c.inner
+        Assert-Equal '11111111-2222-4333-8444-555555555555' $c.resume_id
+        $c = Get-Cmd @{ engine = 'claude'; resume = @{ tool = 'claude'; session_id = '11111111-2222-4333-8444-555555555555' } } ([pscustomobject]@{ claude_use_api_key = $true })
+        Assert-True (-not $c.inner.StartsWith('set ')) 'claude_use_api_key keeps the key'
+        Assert-Equal "$clr`"C:\t\claude.exe`" -p --permission-mode acceptEdits --output-format text --model haiku < `"$pf`"" (Get-Cmd @{ engine = 'claude'; model = 'haiku' }).inner
+    }
+    Test-Case 'job cmd: codex resume = exec <sandbox flags> resume <id> - < prompt (flags before the subcommand)' {
+        Assert-Equal "`"C:\t\codex.cmd`" exec --skip-git-repo-check --sandbox workspace-write resume 0aaa1111-2222-7333-8444-555555555555 - < `"$pf`"" (Get-Cmd @{ engine = 'codex'; resume = @{ tool = 'codex'; session_id = '0AAA1111-2222-7333-8444-555555555555' } }).inner
+        Assert-Equal "`"C:\t\codex.cmd`" exec --skip-git-repo-check --sandbox workspace-write -m gpt-5.5 resume 0aaa1111-2222-7333-8444-555555555555 - < `"$pf`"" (Get-Cmd @{ engine = 'codex'; model = 'gpt-5.5'; resume = @{ tool = 'codex'; session_id = '0aaa1111-2222-7333-8444-555555555555' } }).inner
+    }
+    Test-Case 'job cmd: refuses unsafe resume ids / model names / mismatched tools / missing engines' {
+        Assert-Equal 'bad resume session id' (Get-Cmd @{ engine = 'claude'; resume = @{ tool = 'claude'; session_id = 'x" & calc & "' } }).error
+        Assert-True ((Get-Cmd @{ engine = 'claude'; model = 'haiku && calc' }).error -like 'bad model name*')
+        Assert-True ((Get-Cmd @{ engine = 'claude'; resume = @{ tool = 'codex'; session_id = '11111111-2222-4333-8444-555555555555' } }).error -like '*does not match*')
+        Assert-True ((Get-Cmd @{ engine = 'shell'; resume = @{ tool = 'shell'; session_id = '11111111-2222-4333-8444-555555555555' } }).error -like '*cannot resume*')
+        Assert-Equal "engine 'claude' is not installed on this machine" (Get-Cmd @{ engine = 'claude' } ([pscustomobject]@{}) @{}).error
+        Assert-Equal "engine 'nope' is not installed on this machine" (Get-Cmd @{ engine = 'nope' }).error
+    }
+    Test-Case 'job cmd: ollama runs agent\ollama-job.ps1 (REST), model default qwen2.5:14b, runner writes out.log itself' {
+        Assert-Equal "engine 'ollama' is not installed on this machine" (Get-Cmd @{ engine = 'ollama' }).error
+        $c = Get-Cmd @{ engine = 'ollama'; model = 'llama3.2:1b' } ([pscustomobject]@{ ollama_url = 'http://127.0.0.1:18951' })
+        Assert-Equal "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"C:\F\agent\ollama-job.ps1`" -PromptFile `"$pf`" -Model llama3.2:1b -BaseUrl http://127.0.0.1:18951 -OutFile `"C:\w\jobs\j1\out.log`"" $c.inner
+        Assert-Equal 'err' $c.redirect
+        $c = Get-Cmd @{ engine = 'ollama' } ([pscustomobject]@{}) @{ ollama = 'C:\o\ollama.exe' }
+        Assert-True ($c.inner -match '-Model qwen2\.5:14b -BaseUrl http://127\.0\.0\.1:11434 ') $c.inner
+        Assert-True ((Get-Cmd @{ engine = 'ollama' } ([pscustomobject]@{ ollama_url = 'http://x:1/ & calc' })).error -like 'bad ollama_url*')
+    }
+    Test-Case 'job cmd: ollama only for job kind text (kind missing = text)' {
+        $o = [pscustomobject]@{ ollama_url = 'http://127.0.0.1:19051' }
+        Assert-True (-not (Get-Cmd @{ engine = 'ollama'; kind = 'text' } $o).error); Assert-True (-not (Get-Cmd @{ engine = 'ollama' } $o).error)
+        Assert-Equal "engine 'ollama' runs text jobs only (job kind 'code')" (Get-Cmd @{ engine = 'ollama'; kind = 'code' } $o).error
+    }
+    Test-Case 'safe ids: session ids / model names' {
+        Assert-True (Test-SafeSessionId '0aaa1111-2222-7333-8444-555555555555'); Assert-True (-not (Test-SafeSessionId '-rf')); Assert-True (-not (Test-SafeSessionId 'a b c d e f'))
+        Assert-True (Test-SafeModelName 'qwen2.5:14b'); Assert-True (Test-SafeModelName 'library/llama3.2:1b-q4'); Assert-True (-not (Test-SafeModelName 'x;y')); Assert-True (-not (Test-SafeModelName '-x'))
+    }
+
+    # ---- services (SPEC H) ----
+    Test-Case 'services: defaults (t3 check + ollama when_tool), t3_autostart:false drops t3, explicit [] = none' {
+        $d = Get-ForgeServices ([pscustomobject]@{})
+        Assert-Equal @('t3', 'ollama') @($d | ForEach-Object { $_.name }); Assert-Equal 'start-t3.ps1' $d[0].check
+        Assert-Equal '127.0.0.1:11434' $d[1].env.OLLAMA_HOST; Assert-Equal 'http://127.0.0.1:11434/api/version' $d[1].health; Assert-Equal 'ollama' $d[1].when_tool
+        $d2 = Get-ForgeServices ([pscustomobject]@{ t3_autostart = $false }); Assert-Equal @('ollama') @($d2 | ForEach-Object { $_.name })
+        $d3 = Get-ForgeServices ('{"services":[]}' | ConvertFrom-Json); Assert-Equal 0 @($d3).Count
+        $j = Get-ForgeServices ('{"services":[{"name":"x","health":"http://h/","start":"a.exe b","env":{"K":"V"}}]}' | ConvertFrom-Json)
+        Assert-Equal 'x' $j[0].name; Assert-Equal 'V' $j[0].env.K
+    }
+    Test-Case 'services: keep-alive decision (ok / skip / start / grace wait / backoff / down)' {
+        Assert-Equal 'skip' (Get-ServiceDecision -ToolPresent $false -Healthy $true)
+        Assert-Equal 'ok' (Get-ServiceDecision -Healthy $true -Now 100 -LastStart 99)
+        Assert-Equal 'start' (Get-ServiceDecision -Healthy $false -Now 1000)
+        Assert-Equal 'wait' (Get-ServiceDecision -Healthy $false -Now 1000 -LastStart 900 -Fails 1) 'within 120 s grace'
+        Assert-Equal 'start' (Get-ServiceDecision -Healthy $false -Now 1000 -LastStart 880 -Fails 2)
+        Assert-Equal 'wait' (Get-ServiceDecision -Healthy $false -Now 1000 -LastStart 600 -Fails 3) '3 failed starts -> 10 min backoff'
+        Assert-Equal 'start' (Get-ServiceDecision -Healthy $false -Now 1300 -LastStart 600 -Fails 3)
+        Assert-Equal 'down' (Get-ServiceDecision -Healthy $false -CanStart $false -Now 1000)
+    }
+    Test-Case 'services: start command placeholders and status "since" only moves on a change' {
+        $c = Split-ServiceCommand '<ollama.exe> serve' @{ ollama = 'C:\o\ollama.exe' }; Assert-Equal 'C:\o\ollama.exe' $c.exe; Assert-Equal 'serve' $c.args
+        Assert-Equal $null (Split-ServiceCommand '<ollama.exe> serve' @{})
+        $c = Split-ServiceCommand '"C:\Program Files\x\y.exe" --a b'; Assert-Equal 'C:\Program Files\x\y.exe' $c.exe; Assert-Equal '--a b' $c.args
+        $t = @{}
+        Assert-True (Update-ServiceStatus $t 'ollama' $false 10); Assert-True (-not (Update-ServiceStatus $t 'ollama' $false 20)); Assert-Equal 10 $t.ollama.since
+        Assert-True (Update-ServiceStatus $t 'ollama' $true 30); Assert-Equal 30 $t.ollama.since
+        $m = Get-ServiceMetrics $t; Assert-Equal 1 @($m).Count; Assert-Equal 'ollama' $m[0].name; Assert-Equal $true $m[0].ok
+    }
+}
+& {
+    . (Join-Path $Repo 'agent\ollama-job.ps1') -PromptFile 'x' -Model 'm' -OutFile 'x' -NoRun
+    Test-Case 'ollama job: model presence (untagged name matches :latest)' {
+        Assert-True (Test-OllamaHasModel @('qwen2.5:14b', 'llama3:latest') 'qwen2.5:14b'); Assert-True (Test-OllamaHasModel @('llama3:latest') 'llama3')
+        Assert-True (-not (Test-OllamaHasModel @('qwen2.5:7b') 'qwen2.5:14b')); Assert-True (-not (Test-OllamaHasModel @() 'x'))
+    }
+    Test-Case 'ollama job: pull progress = one line per status and per 10% step' {
+        $seen = @{}
+        $lines = @(foreach ($m in @(@{ status = 'pulling manifest' }, @{ status = 'pulling manifest' }, @{ status = 'pulling abc'; total = 1000; completed = 0 },
+                                     @{ status = 'pulling abc'; total = 1000; completed = 50 }, @{ status = 'pulling abc'; total = 1000; completed = 120 },
+                                     @{ status = 'pulling abc'; total = 1000; completed = 1000 }, @{ status = 'success' })) { Format-PullProgress ([pscustomobject]$m) $seen })
+        Assert-Equal 5 @($lines | Where-Object { $_ }).Count
+        Assert-True ($lines[0] -eq '[ollama] pulling manifest'); Assert-True (@($lines | Where-Object { $_ -match '100%' }).Count -eq 1)
     }
 }
 
@@ -349,6 +794,103 @@ New-Item -ItemType Directory -Force $Scratch | Out-Null
         [IO.File]::WriteAllText((Join-Path $d 'bad-versions.txt'), "# comment`r`n2.0.1`r`n`r`n 2.0.5 `r`n")
         Assert-Equal @('2.0.1', '2.0.5') (Get-BadVersions $d)
     }
+
+    # ---- 2.2 staggered rollout: update lease + fleet-bad (SPEC-phase2 A) ----
+    Test-Case 'lease: granted -> proceed; pre-2.2 leader (404) -> proceed; denied -> wait with holder' {
+        $d = Get-LeaseDecision -Result @{ kind = 'granted' } -Now 1000; Assert-Equal 'proceed' $d.action; Assert-Equal $null $d.no_leader_since
+        Assert-Equal 'proceed' (Get-LeaseDecision -Result @{ kind = 'unsupported'; code = 404 } -Now 1000).action
+        $d = Get-LeaseDecision -Result @{ kind = 'denied'; holder = 'nova' } -NoLeaderSince 500 -Now 1000
+        Assert-Equal 'wait' $d.action; Assert-Equal 'nova' $d.holder; Assert-Equal 'waiting for update lease (holder nova)' $d.reason
+        Assert-Equal $null $d.no_leader_since 'a reachable leader resets the lone-survivor clock'
+    }
+    Test-Case 'lease: no leader reachable -> wait, lone survivor proceeds after 5 min' {
+        $d = Get-LeaseDecision -Result @{ kind = 'unreachable' } -NoLeaderSince $null -Now 1000; Assert-Equal 'wait' $d.action; Assert-Equal 1000 $d.no_leader_since
+        Assert-Equal 'wait' (Get-LeaseDecision -Result $null -NoLeaderSince 1000 -Now 1299).action
+        $d = Get-LeaseDecision -Result @{ kind = 'unreachable'; code = 503; msg = 'no leader' } -NoLeaderSince 1000 -Now 1300; Assert-Equal 'proceed' $d.action; Assert-True ($d.reason -match 'lone survivor')
+    }
+    Test-Case 'lease: a leader that answers with an error -> wait, never lone survivor, clock reset' {
+        foreach ($code in 401, 422, 500, 502) {
+            $d = Get-LeaseDecision -Result @{ kind = 'error'; code = $code; msg = 'boom' } -NoLeaderSince 400 -Now 1000   # no leader for 10 min before
+            Assert-Equal 'wait' $d.action "HTTP $code"; Assert-Equal $null $d.no_leader_since; Assert-True ($d.reason -match "HTTP $code") $d.reason
+        }
+    }
+    Test-Case 'lease state machine over several runs: unreachable -> error resets -> unreachable 5 min -> proceed' {
+        $st = @{ lease_no_leader_since = $null; lease_wait = $null; lease = $null }
+        $d = Step-LeaseState -Result @{ kind = 'unreachable' } -State $st -Version '2.2.1' -Leader 'http://l' -Now 1000
+        Assert-Equal 'wait' $d.action; Assert-Equal 1000 $st.lease_no_leader_since; Assert-Equal '2.2.1' $st.lease_wait.version
+        $d = Step-LeaseState -Result @{ kind = 'error'; code = 500; msg = 'x' } -State $st -Version '2.2.1' -Leader 'http://l' -Now 1240
+        Assert-Equal 'wait' $d.action; Assert-Equal $null $st.lease_no_leader_since 'an answering leader resets the lone-survivor clock'
+        foreach ($t in 1300, 1500, 1599) { $d = Step-LeaseState -Result @{ kind = 'unreachable' } -State $st -Version '2.2.1' -Leader 'http://l' -Now $t; Assert-Equal 'wait' $d.action "t=$t" }
+        Assert-Equal 1300 $st.lease_no_leader_since
+        $d = Step-LeaseState -Result @{ kind = 'unreachable' } -State $st -Version '2.2.1' -Leader 'http://l' -Now 1600
+        Assert-Equal 'proceed' $d.action; Assert-Equal $null $st.lease_wait; Assert-Equal $null $st.lease 'lone survivor holds no lease'
+    }
+    Test-Case 'lease state machine: denied waits with holder; granted stores the lease (not in dry run)' {
+        $st = @{ lease_no_leader_since = 900.0; lease_wait = $null; lease = $null }
+        $d = Step-LeaseState -Result @{ kind = 'denied'; holder = 'canary' } -State $st -Version '2.2.1' -Leader 'http://l' -Now 1000
+        Assert-Equal 'wait' $d.action; Assert-Equal 'canary' $st.lease_wait.holder; Assert-Equal $null $st.lease_no_leader_since
+        $d = Step-LeaseState -Result @{ kind = 'granted' } -State $st -Version '2.2.1' -Leader 'http://l' -Now 1060
+        Assert-Equal 'proceed' $d.action; Assert-Equal $null $st.lease_wait; Assert-Equal 'http://l' $st.lease.url; Assert-Equal '2.2.1' $st.lease.version
+        $st2 = @{}; $null = Step-LeaseState -Result @{ kind = 'granted' } -State $st2 -Version '2.2.1' -Leader 'http://l' -Now 1 -Record $false
+        Assert-Equal $null $st2.lease 'dry run must not record a lease'
+        $st3 = @{}; $null = Step-LeaseState -Result @{ kind = 'unsupported'; code = 404 } -State $st3 -Version '2.2.1' -Leader 'http://l' -Now 1; Assert-Equal $null $st3.lease
+    }
+    Test-Case 'lease release: confirm releases without bad version; rollback reports fleet-bad then releases' {
+        $script:calls = New-Object System.Collections.Generic.List[string]
+        function Send-BadVersion([string]$HubUrl, [string]$Token, [string]$NodeId, [string]$Version) { $script:calls.Add("bad $HubUrl $NodeId $Version"); $true }
+        function Remove-UpdateLease([string]$LeaderUrl, [string]$Token, [string]$NodeId, [string]$BadVersion) { $script:calls.Add("release $LeaderUrl $NodeId $BadVersion"); $true }
+        function Write-WdLog([string]$m) { }
+        $Local = 'http://127.0.0.1:19001'; $cfg = [pscustomobject]@{ node_id = 'n1'; cluster_token = 'c' }
+        $script:State = @{ lease = @{ version = '2.2.1'; url = 'http://leader:8787'; at = 1 } }
+        Clear-UpdateLease $cfg $null
+        Assert-Equal @('release http://leader:8787 n1 ') @($script:calls); Assert-Equal $null $script:State.lease
+        $script:calls.Clear(); $script:State = @{ lease = @{ version = '2.2.1'; url = 'http://leader:8787'; at = 1 } }
+        Clear-UpdateLease $cfg '2.2.1'
+        Assert-Equal @('bad http://leader:8787 n1 2.2.1', 'release http://leader:8787 n1 2.2.1') @($script:calls); Assert-Equal $null $script:State.lease
+        $script:calls.Clear(); $script:State = @{ lease = $null }
+        Clear-UpdateLease $cfg '2.2.1'
+        Assert-Equal @('bad http://127.0.0.1:19001 n1 2.2.1') @($script:calls) 'no lease held (lone survivor): still report fleet-bad via the local hub'
+    }
+    Test-Case 'job cleanup: only real job dirs (marker file, job-like name) older than 14 days; running jobs kept' {
+        $now = 100 * 86400.0; $old = $now - 15 * 86400; $new = $now - 13 * 86400
+        $dirs = @(@{ name = 'j-old'; path = 'W:\jobs\j-old'; mtime = $old; reparse = $false; marker = $true },
+                  @{ name = 'j-new'; path = 'W:\jobs\j-new'; mtime = $new; reparse = $false; marker = $true },
+                  @{ name = 'sys-a1'; path = 'W:\jobs\sys-a1'; mtime = $old; reparse = $false; marker = $true },
+                  @{ name = 'link'; path = 'W:\jobs\link'; mtime = $old; reparse = $true; marker = $true },
+                  @{ name = 'nomark'; path = 'W:\jobs\nomark'; mtime = $old; reparse = $false; marker = $false },
+                  @{ name = 'run1'; path = 'W:\jobs\run1'; mtime = $old; reparse = $false; marker = $true },
+                  @{ name = 'sys-run2'; path = 'W:\jobs\sys-run2'; mtime = $old; reparse = $false; marker = $true },
+                  @{ name = 'we ird'; path = 'W:\jobs\we ird'; mtime = $old; reparse = $false; marker = $true })
+        $sd = Select-StaleJobDirs -Dirs $dirs -Now $now -Skip @('run1', 'run2'); Assert-Equal @('W:\jobs\j-old', 'W:\jobs\sys-a1') @($sd)
+        Assert-True (Test-CleanupDue $null 5000); Assert-True (-not (Test-CleanupDue 2000 5599)); Assert-True (Test-CleanupDue 2000 5600)
+        $jr = Get-JobCleanupRoots ([pscustomobject]@{ work_root_current = 'D:\forge\'; work_root_auto = 'C:\forge' }); Assert-Equal @('D:\forge', 'C:\forge') @($jr)
+        Assert-Equal 0 (Get-JobCleanupRoots ([pscustomobject]@{ work_root_current = '\\srv\share'; work_root_auto = 'relative\x' })).Count
+        Assert-Equal 0 (Get-JobCleanupRoots ([pscustomobject]@{ work_root_current = 'C:\forge\..\Windows' })).Count
+        Assert-Equal 0 (Get-JobCleanupRoots $null).Count
+    }
+    Test-Case 'job cleanup: removing a job dir never follows a junction the job left inside it' {
+        $victim = Join-Path $Scratch 'victim'; New-Item -ItemType Directory -Force $victim | Out-Null
+        [IO.File]::WriteAllText((Join-Path $victim 'keep.txt'), 'precious')
+        $jd = Join-Path $Scratch 'cleanup-jobs\j-old'; New-Item -ItemType Directory -Force (Join-Path $jd 'sub') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $jd 'out.log'), 'x'); [IO.File]::WriteAllText((Join-Path $jd 'sub\f.txt'), 'y')
+        & cmd.exe /d /c "mklink /J `"$(Join-Path $jd 'link')`" `"$victim`"" | Out-Null
+        Assert-True (Test-Path (Join-Path $jd 'link\keep.txt')) 'junction not created'
+        Assert-True (Remove-JobDirTree $jd) 'job dir not removed'
+        Assert-True (-not (Test-Path $jd)); Assert-Equal 'precious' ([IO.File]::ReadAllText((Join-Path $victim 'keep.txt')))
+    }
+    Test-Case 'lease: leader url = the status that says role leader (local first)' {
+        $s = @([pscustomobject]@{ url = 'http://127.0.0.1:8787'; role = 'standby' }, [pscustomobject]@{ url = 'http://forge-01:8787/'; role = 'leader' })
+        Assert-Equal 'http://forge-01:8787' (Find-LeaderUrl $s); Assert-Equal $null (Find-LeaderUrl @($s[0])); Assert-Equal $null (Find-LeaderUrl @())
+    }
+    Test-Case 'fleet-bad: union of bad_versions from statuses; such versions are never update candidates' {
+        $s = @([pscustomobject]@{ id = 'l'; url = 'u'; version = '2.2.1'; bundle_sha256 = 'a'; bad_versions = @('2.2.1') },
+               [pscustomobject]@{ id = 'b'; url = 'v'; version = '2.2.0'; bundle_sha256 = 'b'; bad_versions = @('2.2.1', '2.1.9') },
+               [pscustomobject]@{ id = 'c'; url = 'w'; version = '2.1.5'; bundle_sha256 = 'c' })
+        $fb = Get-FleetBadVersions $s
+        Assert-Equal @('2.2.1', '2.1.9') @($fb)
+        Assert-Equal 'b' (Select-UpdateCandidate -Peers $s -Current '2.1.4' -Bad (@('2.0.0') + @($fb))).id
+        $none = Get-FleetBadVersions @($s[2]); Assert-Equal 0 @($none).Count
+    }
 }
 
 # ---------------- 3. installer ----------------
@@ -420,6 +962,17 @@ Write-Host 'installer'
         $c = New-AgentConfig -Existing $null -V1 ([pscustomobject]@{ logs = [pscustomobject]@{ name = 'one'; path = 'p' } }) -NodeId 'n' -HubUrls @('http://127.0.0.1:8787')
         Assert-True ((ConvertTo-Json -InputObject $c -Depth 5) -match '"logs":\s*\[') 'logs not an array'
         Assert-True ((ConvertTo-Json -InputObject $c -Depth 5) -match '"hub_urls":\s*\[') 'hub_urls not an array'
+    }
+    Test-Case 'installer ACLs: root Admins+SYSTEM full + user RX, then /reset /T, data user Modify, config.json user Read' {
+        $plan = Get-ForgeAclPlan -ForgeHome 'C:\PD\Forge' -User 'BOX\u'
+        Assert-Equal 4 $plan.Count
+        Assert-Equal @('C:\PD\Forge', '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', 'BOX\u:(OI)(CI)RX', '/C', '/Q') @($plan[0].args)
+        Assert-Equal @('C:\PD\Forge\*', '/reset', '/T', '/C', '/Q') @($plan[1].args)
+        Assert-Equal @('C:\PD\Forge\data', '/grant:r', 'BOX\u:(OI)(CI)M', '/C', '/Q') @($plan[2].args)
+        Assert-Equal @('C:\PD\Forge\data\config.json', '/inheritance:r', '/grant:r', '*S-1-5-32-544:F', '*S-1-5-18:F', 'BOX\u:R', '/C', '/Q') @($plan[3].args)
+        Assert-True (-not (@($plan | ForEach-Object { $_.args }) -match ':\(OI\)\(CI\)F$' | Where-Object { $_ -like 'BOX\u*' })) 'user must never get full control'
+        $src = Get-Content (Join-Path $Repo 'agent\install.ps1') -Raw
+        Assert-True ($src -match 'w32tm\.exe /resync') 'w32tm /resync missing'
     }
     Test-Case 'installer semver compare' { Assert-Equal 1 (Compare-SemVer '3.12.1' '3.10.0'); Assert-Equal (-1) (Compare-SemVer '3.9.7' '3.10.0'); Assert-Equal 0 (Compare-SemVer '2.0.0' '2.0.0') }
 }

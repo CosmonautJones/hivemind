@@ -127,6 +127,8 @@ def test_running_job_fails_after_node_offline_for_90s(hub):
     jid = mkjob(c, "w", "shell")["id"]
     report(c, "w")
     c.post(f"/api/agent/jobs/{jid}/update", json={"status": "running"}, headers=AGENT)
+    clock.advance(70)
+    report(c, "w")                    # Phase 2: a job lost within 60 s of starting is requeued, so let it run a while
     clock.advance(60)
     app.state.check_presence()
     assert c.get(f"/api/jobs/{jid}", headers=UI).json()["status"] == "running"   # offline but < 90 s
@@ -150,7 +152,7 @@ def test_settings_round_trip_and_reach_the_agent(hub):
     c, _, _ = hub
     assert report(c, "w").json()["settings"] == {"work_root": None, "max_jobs": None}
     r = c.put("/api/nodes/w/settings", json={"work_root": "D:\\forge", "max_jobs": 3}, headers=UI)
-    assert r.json() == {"work_root": "D:\\forge", "max_jobs": 3}
+    assert r.json() == {"work_root": "D:\\forge", "max_jobs": 3, "canary": False}
     assert report(c, "w").json()["settings"] == {"work_root": "D:\\forge", "max_jobs": 3}
     assert c.get("/api/state", headers=UI).json()["nodes"][0]["settings"]["max_jobs"] == 3
     c.put("/api/nodes/w/settings", json={"work_root": ""}, headers=UI)          # partial update; "" clears

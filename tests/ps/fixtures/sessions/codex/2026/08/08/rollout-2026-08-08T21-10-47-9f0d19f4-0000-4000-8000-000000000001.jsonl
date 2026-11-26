@@ -1,0 +1,6 @@
+{"id":"9f0d19f4-0000-4000-8000-000000000001","timestamp":"2026-08-08T21:10:47.000Z","instructions":null}
+{"record_type":"state"}
+{"type":"message","id":null,"role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>\\\\?\\C:\\Users\\dev\\Temp</cwd>\n  <approval_policy>never</approval_policy>\n</environment_context>"}]}
+{"record_type":"state"}
+{"type":"message","id":null,"role":"user","content":[{"type":"input_text","text":"Reply with exactly: OK"}]}
+{"type":"message","id":null,"role":"assistant","content":[{"type":"output_text","text":"OK"}]}

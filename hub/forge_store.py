@@ -34,6 +34,26 @@ CREATE TABLE IF NOT EXISTS peers (
   last_ok REAL, updated REAL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS settings (
   node_id TEXT PRIMARY KEY, work_root TEXT, max_jobs INTEGER, updated REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY, key TEXT, name TEXT, group_name TEXT, pinned INTEGER DEFAULT 0, created REAL, updated REAL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_projects_key ON projects(key);
+CREATE TABLE IF NOT EXISTS project_alias (id TEXT PRIMARY KEY, project_id TEXT, updated REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY, tool TEXT, session_id TEXT, node_id TEXT, project_key TEXT, cwd TEXT, git_remote TEXT,
+  git_branch TEXT, title TEXT, started REAL, last_activity REAL, messages INTEGER, tokens INTEGER, state TEXT,
+  remote_control INTEGER DEFAULT 0, pid INTEGER, model TEXT, updated REAL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_sessions_key ON sessions(project_key);
+CREATE TABLE IF NOT EXISTS repos (
+  id TEXT PRIMARY KEY, node_id TEXT, cwd TEXT, git_remote TEXT, project_key TEXT, branch TEXT, dirty INTEGER DEFAULT 0,
+  ahead INTEGER DEFAULT 0, behind INTEGER DEFAULT 0, commits TEXT DEFAULT '[]', updated REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS briefs (
+  id TEXT PRIMARY KEY, project_id TEXT, text TEXT, ts REAL, model TEXT, job_id TEXT, updated REAL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_briefs_project ON briefs(project_id, ts);
+CREATE TABLE IF NOT EXISTS cooldowns (engine TEXT PRIMARY KEY, until REAL, reason TEXT, updated REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS bad_versions (version TEXT PRIMARY KEY, ts REAL, reason TEXT, updated REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS leases (
+  id TEXT PRIMARY KEY, node_id TEXT, version TEXT, granted REAL, expires REAL, reached INTEGER DEFAULT 0,
+  updated REAL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS tombstones (tbl TEXT, id TEXT, updated REAL, PRIMARY KEY(tbl, id));
 """
 
@@ -41,10 +61,19 @@ CREATE TABLE IF NOT EXISTS tombstones (tbl TEXT, id TEXT, updated REAL, PRIMARY 
 MIGRATIONS = (
     ("nodes", "sys_last_seen", "REAL"), ("nodes", "sys_capacity", "INTEGER DEFAULT 0"), ("nodes", "sys_version", "TEXT"),
     ("jobs", "run_as", "TEXT DEFAULT 'user'"), ("jobs", "action", "TEXT"), ("jobs", "args", "TEXT"),
+    # 2.2: resume jobs, models, briefs, scheduler
+    ("jobs", "resume", "TEXT"), ("jobs", "project_id", "TEXT"), ("jobs", "attempts", "INTEGER DEFAULT 0"),
+    ("jobs", "wait_reason", "TEXT"), ("jobs", "model", "TEXT"), ("jobs", "req_engine", "TEXT"),
+    # 2.2.1: who holds a dispatch (stale-update fencing), job kind (code|text), canary flag for the rollout lease
+    ("jobs", "dispatched_to", "TEXT"), ("jobs", "kind", "TEXT"), ("settings", "canary", "INTEGER DEFAULT 0"),
+    ("jobs", "prev_holder", "TEXT"), ("jobs", "requeued_at", "REAL"),
 )
 
 # replicated table -> primary key column
-REPLICATED = {"peers": "id", "nodes": "id", "jobs": "id", "events": "id", "settings": "node_id"}
+REPLICATED = {"peers": "id", "nodes": "id", "jobs": "id", "events": "id", "settings": "node_id",
+              # 2.2 (transcripts and watchers are ephemeral: in memory on the leader, never replicated)
+              "projects": "id", "project_alias": "id", "sessions": "id", "repos": "id", "briefs": "id",
+              "cooldowns": "engine", "bad_versions": "version", "leases": "id"}
 
 
 def new_id(clock: Clock = time.time) -> str:
@@ -104,6 +133,11 @@ class Store:
         with self.lock:
             return self.db.execute(sql, args).lastrowid
 
+    def xc(self, sql: str, args: tuple = ()) -> int:
+        """Execute and return the number of rows changed (for conditional check-and-set UPDATEs)."""
+        with self.lock:
+            return self.db.execute(sql, args).rowcount
+
     @contextlib.contextmanager
     def tx(self) -> Iterator[None]:
         with self.lock:
@@ -116,9 +150,15 @@ class Store:
             self.db.execute("COMMIT")
 
     # ---- row helpers that always stamp `updated` ----
-    def touch(self, table: str, pk: str, key: str, sets: str, args: tuple = ()) -> None:
-        """UPDATE <table> SET <sets>, updated=? WHERE <pk>=?"""
-        self.x(f"UPDATE {table} SET {sets}, updated=? WHERE {pk}=?", (*args, self.now(), key))
+    # `updated` never goes backwards for a row (max(now, previous + 1 ms)): a row last written by a hub whose clock ran
+    # ahead still gets a strictly newer stamp from a slower hub, so last-write-wins replication keeps the newest write.
+    STAMP = "updated=MAX(?, COALESCE(updated, 0) + 0.001)"
+
+    def touch(self, table: str, pk: str, key: str, sets: str, args: tuple = (), where: str = "",
+              wargs: tuple = ()) -> int:
+        """UPDATE <table> SET <sets>, updated=<monotonic now> WHERE <pk>=? [AND <where>]; returns rows changed."""
+        return self.xc(f"UPDATE {table} SET {sets}, {self.STAMP} WHERE {pk}=?" + (f" AND {where}" if where else ""),
+                       (*args, self.now(), key, *wargs))
 
     def event(self, node_id: Optional[str], level: str, msg: str) -> None:
         ts = self.now()
@@ -142,29 +182,40 @@ class Store:
         return [dict(r) for r in self.q(
             f"SELECT * FROM {table} WHERE updated > ? ORDER BY updated, {REPLICATED[table]} LIMIT ?", (since, limit))]
 
-    def upsert_rows(self, table: str, rows: list[dict]) -> int:
-        """Insert/replace rows whose incoming `updated` >= local `updated`. Returns rows applied."""
+    def upsert_rows(self, table: str, rows: list[dict], force: bool = False, restamp: Optional[float] = None) -> int:
+        """Insert/replace rows whose incoming `updated` >= local `updated` (any row if `force`: the sender is
+        authoritative, used after a demoted leader's own writes must be discarded). Returns rows applied.
+        `restamp` (leader merge pulls): applied rows get updated = max(theirs, restamp), so standbys whose sync cursor
+        is already past the row's original stamp still pull it from the leader."""
         pk, cols, n = REPLICATED[table], self.columns(table), 0
         marks = ",".join("?" * len(cols))
         for row in rows:
             cur = self.q(f"SELECT updated FROM {table} WHERE {pk}=?", (row.get(pk),))
-            if cur and (cur[0]["updated"] or 0) > (row.get("updated") or 0):
+            if cur and not force and (cur[0]["updated"] or 0) > (row.get("updated") or 0):
                 continue
             tomb = self.q("SELECT updated FROM tombstones WHERE tbl=? AND id=?", (table, row.get(pk)))
-            if tomb and tomb[0]["updated"] > (row.get("updated") or 0):
+            if tomb and not force and tomb[0]["updated"] > (row.get("updated") or 0):
                 continue
+            if restamp is not None:
+                if cur and (cur[0]["updated"] or 0) == (row.get("updated") or 0):
+                    continue                      # same version we already have: nothing to re-announce
+                row = dict(row, updated=max(row.get("updated") or 0, restamp))
             self.x(f"INSERT OR REPLACE INTO {table}({','.join(cols)}) VALUES({marks})",
                    tuple(row.get(c) for c in cols))
             n += 1
         return n
 
-    def apply_deleted(self, items: list[dict]) -> None:
+    def apply_deleted(self, items: list[dict], force: bool = False, restamp: Optional[float] = None) -> None:
         for it in items:
             t, k, u = it.get("table"), it.get("id"), it.get("updated") or 0
             if t not in REPLICATED:
                 continue
             cur = self.q(f"SELECT updated FROM {t} WHERE {REPLICATED[t]}=?", (k,))
-            if cur and (cur[0]["updated"] or 0) > u:
+            if cur and not force and (cur[0]["updated"] or 0) > u:
                 continue  # re-created after the delete
+            if restamp is not None:
+                if not cur:
+                    continue                      # nothing to delete here: keep our own tombstone (if any) as is
+                u = max(u, restamp)
             self.x(f"DELETE FROM {t} WHERE {REPLICATED[t]}=?", (k,))
             self.x("INSERT OR REPLACE INTO tombstones(tbl,id,updated) VALUES(?,?,?)", (t, k, u))
