@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -26,13 +27,21 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from forge_actions import ActionError, find_action, load_catalog, summary as action_summary, validate_args
+from forge_actions import ActionError, action_lane, find_action, load_catalog, summary as action_summary, validate_args
 from forge_bundle import VERSION_RE, BundleError, Releases, parse_version
 from forge_cluster import Cluster
+from forge_ctx import HubContext
 from forge_lease import UpdateLease
 from forge_phase2 import KINDS, MODEL_RE, STALE_CANCEL_TTL, Phase2, to_ts
 from forge_sched import agent_is_new, should_requeue
 from forge_store import Clock, Store, jloads, new_id
+# Phase 3 workstream modules (CONTRACT-phase3.md §2): each exposes register(app, ctx)
+import forge_alerts
+import forge_chat
+import forge_reliability
+import forge_security
+import forge_ui
+import forge_upkeep
 
 BASE = Path(__file__).resolve().parent
 ONLINE_SECS = 30
@@ -46,13 +55,15 @@ TOMBSTONE_KEEP_SECS = 7 * 86400
 RETENTION_EVERY = 600
 CLOCK_SKEW_ALERT_S = 5.0
 TICK_SECS = 3
+NODE_WRITE_EVERY = 60          # 2.3 R4: the replicated nodes row is rewritten at most this often (presence is local)
 USER_ENGINES = {"claude", "codex", "shell", "ollama"}   # user lane only; "any" is a scheduling alias (see place_jobs)
 SYSTEM_ENGINES = {"action", "admin"}              # SYSTEM lane only (run_as forced to "system")
 ENGINES = USER_ENGINES | SYSTEM_ENGINES | {"any"}
 ACTIVE = ("queued", "starting", "running")
 # paths a standby answers itself instead of forwarding to the leader
 LOCAL_PREFIXES = ("/cluster/", "/static/", "/agent/")
-LOCAL_PATHS = {"/", "/healthz", "/api/login", "/api/logout", "/api/enroll", "/favicon.ico"}
+BAD_VERSION_NODE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+LOCAL_PATHS = {"/", "/healthz", "/api/login", "/api/logout", "/api/claim", "/favicon.ico"}   # A-S2: /api/enroll -> leader
 
 
 class JobIn(BaseModel):
@@ -71,6 +82,9 @@ class JobIn(BaseModel):
     force: bool = False                   # resume: take over a session that is live in a terminal
     project_id: Optional[str] = Field(default=None, max_length=64)
     kind: Optional[str] = None            # "code" (default) | "text": only text jobs may resolve engine "any" to ollama
+    notify: bool = False                  # A-N2: notify me when this task finishes (N2)
+    attachments: list[str] = Field(default_factory=list, max_length=8)   # 2.4 chat: upload ids (photos)
+    reply_to: Optional[str] = Field(default=None, max_length=64)        # 2.4 chat: continue this conversation
 
 
 class JobUpdate(BaseModel):
@@ -100,16 +114,8 @@ def default_node_id() -> str:
 
 
 def load_config(data_dir: Path) -> dict:
-    data_dir.mkdir(parents=True, exist_ok=True)
-    p = data_dir / "config.json"
-    cfg = json.loads(p.read_text(encoding="utf-8-sig")) if p.exists() else {}
-    changed = False
-    for key, nbytes in (("ui_token", 18), ("agent_token", 24), ("cluster_token", 24)):
-        if not cfg.get(key):
-            cfg[key], changed = secrets.token_urlsafe(nbytes), True
-    if changed:
-        p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    return cfg
+    """A-S1: data/config.json merged with data/private/secrets.json; 2.2 secrets are migrated (forge_security)."""
+    return forge_security.load_config(data_dir)
 
 
 def as_list(v: Any) -> list:
@@ -145,17 +151,33 @@ def _disk_pct(metrics: dict) -> Optional[float]:
     return round(max(pcts), 1) if pcts else None
 
 
-def _job_row(r: Any, with_output: bool) -> dict:
+def _job_row(r: Any, with_output: bool, store: Optional[Store] = None) -> dict:
+    """UI job shape. With a store (2.3 R4), output comes from the job_output chunks when the job has any, else from the
+    legacy jobs.output column (mixed fleet reader rule)."""
     d = dict(r)
     d["run_as"] = d.get("run_as") or "user"
     if "args" in d:
         d["args"] = jloads(d["args"], None)
     if "resume" in d:
         d["resume"] = jloads(d["resume"], None)
-    if not with_output:
-        out = d.pop("output") or ""
-        d["tail"] = out[-400:]
+    for k, dflt in (("attachments", []), ("session", None)):     # 2.4 chat
+        if k in d:
+            d[k] = jloads(d[k], dflt)
+    legacy = d.pop("output", None) or ""
+    for k in ("output_len", "output_min_seq"):
+        d.pop(k, None)
+    d["output_seq"] = d.get("output_seq") or 0
+    if with_output:
+        d["output"] = store.job_output_text(d["id"], legacy) if store is not None else legacy
+    else:
+        d["tail"] = store.job_output_tail(d["id"], 400, legacy) if store is not None else legacy[-400:]
     return d
+
+
+def _hidden_sources_sql(include_brief: bool, include_sync: bool) -> str:
+    """WHERE clause hiding brief jobs and (2.3 F3, hook A-F2) repo-sync jobs unless asked for."""
+    hidden = [s for s, inc in (("brief", include_brief), ("sync", include_sync)) if not inc]
+    return ("WHERE COALESCE(source,'') NOT IN (" + ",".join(f"'{h}'" for h in hidden) + ") ") if hidden else ""
 
 
 def _parse_ts(v: Any) -> Optional[float]:
@@ -196,36 +218,68 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
     releases_dir = Path(releases_dir or os.environ.get("FORGE_RELEASES_DIR") or data_dir.parent / "releases")
     cfg = load_config(data_dir)
     me = (node_id or cfg.get("node_id") or default_node_id()).strip().lower()
-    store = Store(data_dir / "forge.db", clock)
+    db_path = forge_security.db_path(data_dir)                    # A-S1: data/private/forge.db when data/private exists
+    db_state = forge_reliability.prepare_db(db_path, cfg, clock)     # R3: PRAGMA quick_check; corrupt -> moved aside
+    store = Store(db_path, clock)
     releases = Releases(release_dir, releases_dir)
     cluster = Cluster(store, cfg, me, clock, client_factory, releases)
+    if db_state.get("reseed_pending"):
+        # stay ineligible until one full sync from a leader succeeded; persisted in forge.db.reseed-pending so a
+        # restart before that sync cannot turn the empty copy into a self-elected leader
+        cluster.reseed_pending = True
+    cluster.on_reseeded = lambda: forge_reliability.clear_reseed_marker(db_path)
     actions_catalog = load_catalog()
     app = FastAPI(title="Forge Control", docs_url=None, redoc_url=None)
     app.state.store, app.state.cfg, app.state.cluster, app.state.releases = store, cfg, cluster, releases
     app.state.node_id = me
+    app.state.db_state, app.state.start_monitor = db_state, start_monitor
     p2 = Phase2(store, cfg, cluster, clock)
     lease = UpdateLease(store, cluster, clock, lambda: releases.running_version)
     app.state.p2, app.state.lease = p2, lease
+    # Phase 3 plug-in context (hub/forge_ctx.py); helpers are filled in below, modules register at the end
+    ctx = HubContext(app=app, store=store, cluster=cluster, clock=clock, cfg=cfg, node_id=me, data_dir=data_dir,
+                     release_dir=release_dir, releases_dir=releases_dir, releases=releases, lease=lease, p2=p2,
+                     actions_catalog=actions_catalog, local_paths=set(LOCAL_PATHS), local_prefixes=list(LOCAL_PREFIXES))
+    app.state.ctx = ctx
+
+    def job_row(r: Any, with_output: bool) -> dict:
+        return _job_row(r, with_output, store)
 
     # ---------- auth ----------
     def require_ui(request: Request) -> None:
+        if ctx.ui_auth is not None:              # S4: per-device sessions (forge_security)
+            principal = ctx.ui_auth(request)
+            if not principal:
+                raise HTTPException(401, "login required")
+            request.state.principal = principal
+            return
         tok = request.cookies.get("forge_token") or request.headers.get("authorization", "").removeprefix("Bearer ")
         if not tok or not secrets.compare_digest(tok, cfg["ui_token"]):
             raise HTTPException(401, "login required")
 
+    def agent_token_ok(tok: str) -> bool:
+        if ctx.check_agent_token is not None:    # S5: current or previous (grace) token
+            return bool(ctx.check_agent_token(tok))
+        return secrets.compare_digest(tok, cfg["agent_token"])
+
+    def cluster_token_ok(tok: str) -> bool:
+        if ctx.check_cluster_token is not None:
+            return bool(ctx.check_cluster_token(tok))
+        return secrets.compare_digest(tok, cfg["cluster_token"])
+
     def require_agent(request: Request) -> None:
-        tok = request.headers.get("x-agent-token", "")
-        if not secrets.compare_digest(tok, cfg["agent_token"]):
+        if not agent_token_ok(request.headers.get("x-agent-token", "")):
             raise HTTPException(401, "bad agent token")
 
     def require_cluster(request: Request) -> None:
-        tok = request.headers.get("x-cluster-token", "")
-        if not secrets.compare_digest(tok, cfg["cluster_token"]):
+        if not cluster_token_ok(request.headers.get("x-cluster-token", "")):
             raise HTTPException(401, "bad cluster token")
+
+    ctx.require_ui, ctx.require_agent, ctx.require_cluster = require_ui, require_agent, require_cluster
 
     # ---------- forwarding (standby -> leader) ----------
     def is_local_path(path: str) -> bool:
-        return path in LOCAL_PATHS or path.startswith(LOCAL_PREFIXES)
+        return path in ctx.local_paths or path.startswith(tuple(ctx.local_prefixes))
 
     def to_response(r: httpx.Response) -> Response:
         out = Response(content=r.content, status_code=r.status_code)
@@ -264,43 +318,74 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                                request.client.host if request.client else None)
         return to_response(resp) if resp is not None else no_leader()
 
+    # ---------- job output (2.3 R4: ctx.append_output / ctx.job_output; None = the 2.2 jobs.output column) ----------
+    def out_append(jid: str, text: str, now: float) -> None:
+        if not text:
+            return
+        if ctx.append_output is not None:
+            ctx.append_output(jid, text, now)
+            return
+        r = store.q("SELECT output FROM jobs WHERE id=?", (jid,))
+        out = ((r[0]["output"] if r else "") or "") + text
+        if len(out) > OUTPUT_CAP:
+            out = "[...truncated...]\n" + out[-OUTPUT_CAP:]
+        store.touch("jobs", "id", jid, "output=?", (out,))
+
+    def out_text(jid: str) -> str:
+        if ctx.job_output is not None:
+            return ctx.job_output(jid)
+        r = store.q("SELECT output FROM jobs WHERE id=?", (jid,))
+        return ((r[0]["output"] if r else "") or "")
+
+    def out_len(j: Any) -> int:
+        keys = j.keys() if hasattr(j, "keys") else []
+        if "output_seq" in keys and (j["output_seq"] or 0) > 0:
+            return int(j["output_len"] or 0)
+        return len(j["output"] or "")
+
     # ---------- presence / maintenance (leader duties) ----------
     def lose_job(j: Any, now: float, alive_until: float, why: str, requeue: bool = True) -> None:
         """A running job lost its agent. Requeue once if it barely started (< 1 KB output, < 60 s of life),
         else fail it. System-lane jobs are never requeued (not idempotent)."""
         ran = max(0.0, alive_until - (j["started"] or alive_until))
         live = "status IN ('starting','running') AND node_id=?"        # still where we saw it (sched_lock held too)
-        if requeue and j["run_as"] != "system" and should_requeue(len(j["output"] or ""), ran, j["attempts"] or 0,
-                                                       bool(j["cancel_requested"])):
+        if requeue and j["run_as"] != "system" and should_requeue(out_len(j), ran, j["attempts"] or 0,
+                                                                  bool(j["cancel_requested"])):
             # prev_holder/requeued_at are replicated, so the fence survives a leader change: that node is told to
             # kill its copy on every report while the job is active elsewhere, and is not handed it back for a while
             sets, args = ["status='queued'", "started=NULL", "pid=NULL", "attempts=COALESCE(attempts,0)+1",
-                          "wait_reason=NULL", "output=output||?", "prev_holder=?", "requeued_at=?"], \
-                [f"\n[hub] {why}; job requeued\n", j["dispatched_to"] or j["node_id"], now]
+                          "wait_reason=NULL", "prev_holder=?", "requeued_at=?"], \
+                [j["dispatched_to"] or j["node_id"], now]
             if j["requested"] == "auto":
                 sets.append("node_id='auto'")
                 if j["req_engine"] == "any":
                     sets.append("engine='any'")
             if store.touch("jobs", "id", j["id"], ", ".join(sets), tuple(args), live, (j["node_id"],)):
+                out_append(j["id"], f"\n[hub] {why}; job requeued\n", now)
                 store.event(j["node_id"], "warn", f"job {j['id'][:8]} ({j['engine']}) requeued: {why}")
         else:
-            if store.touch("jobs", "id", j["id"], "status='failed', finished=?, output=output||?",
-                           (now, f"\n[hub] {why}; job lost\n"), live, (j["node_id"],)):
+            if store.touch("jobs", "id", j["id"], "status='failed', finished=?", (now,), live, (j["node_id"],)):
+                out_append(j["id"], f"\n[hub] {why}; job lost\n", now)
                 store.event(j["node_id"], "error", f"job {j['id'][:8]} ({j['engine']}) failed: {why}")
+                ctx.run_hooks(ctx.on_job_finished, dict(j), "failed", out_text(j["id"]), now)
 
     def check_presence(now: Optional[float] = None) -> None:
         now = clock() if now is None else now
-        for r in store.q("SELECT id,last_seen,online FROM nodes"):
+        for r in store.q("SELECT id,last_seen,online FROM nodes_live"):
             is_on = int(now - (r["last_seen"] or 0) < ONLINE_SECS)
             if is_on != r["online"]:
                 store.touch("nodes", "id", r["id"], "online=?", (is_on,))
                 store.event(r["id"], "ok" if is_on else "warn", "came online" if is_on else "went offline")
+        # A new leader only has the replicated nodes.last_seen (written every NODE_WRITE_EVERY s, so up to ~60 s old
+        # plus sync lag) until the workers find it: for the job-lost judgement no node counts as seen earlier than
+        # the moment we took over, so every worker gets the full NODE_LOST_SECS to reconnect after a failover.
+        since = cluster.leader_since or 0
         with p2.sched_lock:
             for j in store.q(
                     "SELECT j.*, COALESCE(CASE WHEN j.run_as='system' THEN n.sys_last_seen ELSE n.last_seen END, 0) AS seen "
-                    "FROM jobs j JOIN nodes n ON n.id=j.node_id "
-                    "WHERE j.status IN ('starting','running') AND ? - COALESCE(CASE WHEN j.run_as='system' "
-                    "THEN n.sys_last_seen ELSE n.last_seen END, 0) > ?", (now, NODE_LOST_SECS)):
+                    "FROM jobs j JOIN nodes_live n ON n.id=j.node_id "
+                    "WHERE j.status IN ('starting','running') AND ? - MAX(COALESCE(CASE WHEN j.run_as='system' "
+                    "THEN n.sys_last_seen ELSE n.last_seen END, 0), ?) > ?", (now, since, NODE_LOST_SECS)):
                 lose_job(j, now, j["seen"], "node offline")
         p2.place_jobs(now)
 
@@ -333,6 +418,7 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             if settled:
                 p2.tick(now)
         trim(now, settled)
+        ctx.run_hooks(ctx.on_tick, now, settled)       # Phase 3 modules (each checks leadership itself)
 
     app.state.check_presence, app.state.tick, app.state.trim = check_presence, tick, trim
     app.state.retention = retention
@@ -397,6 +483,8 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             return [], []
         stale = set(p2.stale_for(nid, now))      # jobs this node must kill: never hand them back to it meanwhile
         jobs = []
+        dr = store.q("SELECT drain FROM settings WHERE node_id=?", (nid,))
+        draining = bool(dr and dr[0]["drain"])   # 2.3 R6: a draining (retiring) node gets only its retire job
         if cap:
             cds = p2.cooldowns(now) if lane == "user" else {}
             for j in store.q(f"SELECT * FROM jobs WHERE node_id=? AND status='queued' AND {lane_sql} ORDER BY id", (nid,)):
@@ -404,8 +492,12 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                     break
                 if j["id"] in stale or (j["prev_holder"] == nid and (j["requeued_at"] or 0) > now - STALE_CANCEL_TTL):
                     continue                     # this node may still run an old copy: let the cancel land first
+                if draining and j["source"] != "retire":
+                    continue
                 if lane == "user" and not p2.dispatchable(j, agent_version, cds):
                     continue
+                if lane == "user" and not app.state.chat.agent_ok(j, agent_version):
+                    continue                     # 2.4: photos / follow-up folder need a 2.4 agent
                 if not store.touch("jobs", "id", j["id"], "status='starting', started=?, wait_reason=NULL, dispatched_to=?, "
                                    "prev_holder=CASE WHEN prev_holder=? THEN NULL ELSE prev_holder END",
                                    (now, nid, nid), "status='queued' AND node_id=?", (nid,)):
@@ -422,6 +514,7 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                         item["resume"] = jloads(j["resume"], None)
                     if j["source"] == "brief":
                         item["source"] = "brief"
+                    item |= app.state.chat.dispatch_extras(j, agent_version)   # 2.4 session_id / attachments
                 jobs.append(item)
                 store.event(nid, "info", f"job {j['id'][:8]} ({j['engine']}) dispatched"
                             + (" to system lane" if lane == "system" else ""))
@@ -440,15 +533,24 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         cap = max(0, int(body.get("capacity") or 0))
         if not store.q("SELECT 1 FROM nodes WHERE id=?", (nid,)):
             store.x("INSERT INTO nodes(id,created,updated) VALUES(?,?,?)", (nid, now, now))
-        prev = store.q("SELECT sys_last_seen FROM nodes WHERE id=?", (nid,))[0]["sys_last_seen"]
+        cur = store.q("SELECT n.sys_last_seen nseen, l.sys_last_seen lseen, l.sys_version lver FROM nodes n "
+                      "JOIN nodes_live l ON l.id=n.id WHERE n.id=?", (nid,))[0]
+        prev = cur["lseen"]
         if prev is None or now - prev >= ONLINE_SECS:
             store.event(nid, "ok", "system lane online")
-        store.touch("nodes", "id", nid, "sys_last_seen=?, sys_capacity=?, sys_version=?",
-                    (now, cap, str(body.get("agent_version") or "")[:32] or None))
+        ver = str(body.get("agent_version") or "")[:32] or None
+        # 2.3 R4: every heartbeat goes to the local presence row; the replicated nodes row only every 60 s / on change
+        store.x("INSERT INTO presence(node_id,sys_last_seen,sys_capacity,sys_version) VALUES(?,?,?,?) "
+                "ON CONFLICT(node_id) DO UPDATE SET sys_last_seen=excluded.sys_last_seen, "
+                "sys_capacity=excluded.sys_capacity, sys_version=excluded.sys_version", (nid, now, cap, ver))
+        if cur["nseen"] is None or now - cur["nseen"] >= NODE_WRITE_EVERY or ver != cur["lver"]:
+            store.touch("nodes", "id", nid, "sys_last_seen=?, sys_capacity=?, sys_version=?", (now, cap, ver))
         jobs, cancel = dispatch(nid, "system", cap, bool(body.get("boot")), now)
-        return {"jobs": jobs, "cancel": cancel, "server_time": now, "lane": "system",
+        resp = {"jobs": jobs, "cancel": cancel, "server_time": now, "lane": "system",
                 "settings": effective_settings(nid), "hub_urls": cluster.hub_urls(),
                 "bundle_version": releases.latest_version()}
+        ctx.run_hooks(ctx.on_system_report, nid, body, resp, now)
+        return resp
 
     @app.post("/api/agent/report", dependencies=[Depends(require_agent)])
     def agent_report(body: dict, request: Request) -> dict:
@@ -468,13 +570,20 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         addr = request.client.host if request.client else None
         if "x-forge-via" in request.headers and request.headers.get("x-forwarded-for"):
             addr = request.headers["x-forwarded-for"].split(",")[0].strip()
-        row = store.q("SELECT info FROM nodes WHERE id=?", (nid,))
+        row = store.q("SELECT info, last_seen FROM nodes WHERE id=?", (nid,))
         if not row:
             store.x("INSERT INTO nodes(id,created,last_seen,updated) VALUES(?,?,?,?)", (nid, now, now, now))
             store.event(nid, "ok", "joined the fleet")
-        store.touch("nodes", "id", nid, "last_seen=?, addr=?, metrics=?, procs=?, agents=?, capacity=?",
-                    (now, addr, json.dumps(metrics), json.dumps(body.get("procs") or []),
-                     json.dumps(body.get("agents") or []), int(body.get("capacity") or 0)))
+        vals = (now, addr, json.dumps(metrics), json.dumps(body.get("procs") or []), json.dumps(body.get("agents") or []),
+                int(body.get("capacity") or 0))
+        # 2.3 R4: metrics / procs / agents go to the local `presence` row on every report; the replicated nodes row is
+        # rewritten only every NODE_WRITE_EVERY s (or when the node comes back after being unseen), keeping sync quiet.
+        store.x("INSERT INTO presence(node_id,last_seen,addr,metrics,procs,agents,capacity) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, addr=excluded.addr, "
+                "metrics=excluded.metrics, procs=excluded.procs, agents=excluded.agents, capacity=excluded.capacity",
+                (nid, *vals))
+        if not row or row[0]["last_seen"] is None or now - row[0]["last_seen"] >= NODE_WRITE_EVERY:
+            store.touch("nodes", "id", nid, "last_seen=?, addr=?, metrics=?, procs=?, agents=?, capacity=?", vals)
         if body.get("info"):
             store.touch("nodes", "id", nid, "info=?", (json.dumps(body["info"]),))
         av = str(body.get("agent_version") or "")[:32] or None
@@ -494,10 +603,12 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             av = jloads(store.q("SELECT info FROM nodes WHERE id=?", (nid,))[0]["info"], {}).get("agent_version")
         jobs, cancel = dispatch(nid, "user", max(0, int(body.get("capacity") or 0)), bool(body.get("boot")), now, av)
         info = row[0]["info"] if row else "{}"
-        return {"jobs": jobs, "cancel": cancel, "need_info": info in ("", "{}"), "server_time": now,
+        resp = {"jobs": jobs, "cancel": cancel, "need_info": info in ("", "{}"), "server_time": now,
                 "agent_version": agent_version(), "settings": effective_settings(nid),
                 "hub_urls": cluster.hub_urls(), "bundle_version": releases.latest_version(),
                 "watch": p2.eph.watch_list(nid, now)}
+        ctx.run_hooks(ctx.on_report, nid, body, resp, now)
+        return resp
 
     @app.post("/api/agent/jobs/{jid}/update", dependencies=[Depends(require_agent)])
     def agent_job_update(jid: str, u: JobUpdate):
@@ -526,12 +637,9 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                 store.event(reporter or holder, "warn", f"stale update for job {jid[:8]} rejected (job {j['status']}"
                             + (f" on {j['node_id']}" if j["node_id"] != (reporter or holder) else "") + ")")
             return JSONResponse({"detail": "job reassigned", "status": j["status"]}, status_code=409)
-        out = j["output"] or ""
         if u.append:
-            out = out + u.append
-            if len(out) > OUTPUT_CAP:
-                out = "[...truncated...]\n" + out[-OUTPUT_CAP:]
-        sets, args = ["output=?"], [out]
+            out_append(jid, u.append, now)       # 2.3 R4: append-only chunk rows, never a rewrite of jobs.output
+        sets, args = [], []
         if u.pid is not None:
             sets.append("pid=?"); args.append(u.pid)
         if u.status:
@@ -545,10 +653,15 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                             + (f" (exit {u.exit_code})" if u.exit_code is not None else ""))
         if u.exit_code is not None:
             sets.append("exit_code=?"); args.append(u.exit_code)
-        store.touch("jobs", "id", jid, ", ".join(sets), tuple(args))
+        if sets:
+            store.touch("jobs", "id", jid, ", ".join(sets), tuple(args))
+        final = u.status in ("done", "failed", "cancelled")
+        out = out_text(jid) if final else ""     # full text only where it is used (final status)
         p2.check_limit(j, u.append, u.status, u.exit_code, out, now)
         if u.status == "done":
             p2.on_job_done(j, out, now)
+        if final:
+            ctx.run_hooks(ctx.on_job_finished, dict(j), u.status, out, now)
         return {"ok": True}
 
     # ---------- UI API ----------
@@ -565,14 +678,14 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         return {"ok": True}
 
     @app.get("/api/state", dependencies=[Depends(require_ui)])
-    def state(request: Request, include_brief: bool = False) -> dict:
+    def state(request: Request, include_brief: bool = False, include_sync: bool = False) -> dict:
         now = clock()
         running = {r["node_id"]: r["n"] for r in store.q(
             "SELECT node_id, COUNT(*) n FROM jobs WHERE status IN ('queued','starting','running') GROUP BY node_id")}
         settings = {r["node_id"]: {"work_root": r["work_root"], "max_jobs": r["max_jobs"], "canary": bool(r["canary"])}
                     for r in store.q("SELECT * FROM settings")}
         nodes = []
-        for r in store.q("SELECT * FROM nodes ORDER BY id"):
+        for r in store.q("SELECT * FROM nodes_live ORDER BY id"):
             m = jloads(r["metrics"], {})
             nodes.append({
                 "system_lane": system_lane(r, now),
@@ -584,19 +697,21 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                 "spark": [dict(x) for x in store.q(
                     "SELECT ts,cpu,mem FROM metrics WHERE node_id=? AND ts>? ORDER BY ts", (r["id"], now - 900))][::3],
             })
-        jobs = [_job_row(r, False) for r in store.q(
-            "SELECT * FROM jobs " + ("" if include_brief else "WHERE COALESCE(source,'')<>'brief' ") + "ORDER BY id DESC LIMIT 40")]
+        jobs = [job_row(r, False) for r in store.q(
+            "SELECT * FROM jobs " + _hidden_sources_sql(include_brief, include_sync) + "ORDER BY id DESC LIMIT 40")]
         events = [dict(r) for r in store.q("SELECT * FROM events ORDER BY id DESC LIMIT 60")]
         viewing = request.headers.get("x-forge-via") or me
-        return {"now": now, "nodes": nodes, "jobs": jobs, "events": events,
-                "cluster": cluster.cluster_block(viewing)}
+        out = {"now": now, "nodes": nodes, "jobs": jobs, "events": events,
+               "cluster": cluster.cluster_block(viewing)}
+        ctx.run_hooks(ctx.state_extras, out, now)
+        return out
 
     @app.get("/api/health", dependencies=[Depends(require_ui)])
     def health_report() -> dict:
         now = clock()
-        alerts, nodes_out = [], []
+        nodes_out = []
         mine = releases.running_version
-        for r in store.q("SELECT * FROM nodes ORDER BY id"):
+        for r in store.q("SELECT * FROM nodes_live ORDER BY id"):
             m, info = jloads(r["metrics"], {}), jloads(r["info"], {})
             online = now - (r["last_seen"] or 0) < ONLINE_SECS
             ver = m.get("bundle_version") or info.get("bundle_version")
@@ -606,31 +721,8 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             nodes_out.append({"id": r["id"], "online": online, "bundle_version": ver, "system_lane": system_lane(r, now),
                               "behind": bool(ver and parse_version(ver) < parse_version(mine)),
                               "watchdog_last_run": wd_run, "watchdog_last_action": actions[-1] if actions else None})
-            if not online:
-                alerts.append({"level": "error", "kind": "node_offline", "node_id": r["id"],
-                               "msg": f"{r['id']} is offline"})
-                continue
-            pct = _disk_pct(m)
-            if pct is not None and pct >= DISK_ALERT_PCT:
-                alerts.append({"level": "warn", "kind": "disk_full", "node_id": r["id"],
-                               "msg": f"{r['id']} disk at {pct}%"})
-            if ver and parse_version(ver) < parse_version(mine):
-                alerts.append({"level": "warn", "kind": "version_behind", "node_id": r["id"],
-                               "msg": f"{r['id']} runs {ver}, leader runs {mine}"})
-            skew = m.get("clock_skew_s")
-            if isinstance(skew, (int, float)) and abs(skew) > CLOCK_SKEW_ALERT_S:
-                alerts.append({"level": "warn", "kind": "clock_skew", "node_id": r["id"],
-                               "msg": f"{r['id']} clock is {abs(skew):.0f}s {'ahead of' if skew > 0 else 'behind'} the hub"})
-            if wd is not None and (wd_run is None or now - wd_run > WATCHDOG_STALE_SECS):
-                alerts.append({"level": "warn", "kind": "watchdog_stale", "node_id": r["id"],
-                               "msg": f"{r['id']} watchdog has not run for {'a long time' if wd_run is None else str(int(now - wd_run)) + 's'}"})
+        alerts = forge_alerts.current_conditions(ctx, now)      # A-N1: core alerts + alert_sources + raised (N1)
         block = cluster.cluster_block(me)
-        for p in block["peers"]:
-            if not p["healthy"]:
-                alerts.append({"level": "error", "kind": "hub_down", "node_id": p["id"], "msg": f"hub {p['id']} is unreachable"})
-            elif p["version"] and parse_version(p["version"]) < parse_version(mine):
-                alerts.append({"level": "warn", "kind": "version_behind", "node_id": p["id"],
-                               "msg": f"hub {p['id']} runs {p['version']}, leader runs {mine}"})
         target = releases.latest_version()
         rollout = []
         for p in block["peers"]:
@@ -639,16 +731,13 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                       else "current" if parse_version(v) >= parse_version(target or v) else "updating")
             rollout.append({"node_id": p["id"], "version": v, "status": status})
         bad = lease.bad_versions()
-        for v in bad:
-            alerts.append({"level": "error", "kind": "fleet_bad_version", "node_id": None,
-                           "msg": f"version {v} is marked fleet-bad (a canary rolled it back); watchdogs will not install it"})
         return {"now": now, "alerts": alerts, "nodes": nodes_out, "cluster": block, "leader_id": cluster.leader_id,
                 "running_version": mine, "bundle_version": target, "rollout": rollout,
                 "bad_versions": bad, "update_lease": lease.view(), "cooldowns": p2.scheduler_view(now)["cooldowns"]}
 
     @app.get("/api/nodes/{nid}", dependencies=[Depends(require_ui)])
-    def node_detail(nid: str, minutes: int = 60) -> dict:
-        r = store.q("SELECT * FROM nodes WHERE id=?", (nid,))
+    def node_detail(nid: str, minutes: int = 60, include_sync: bool = False) -> dict:
+        r = store.q("SELECT * FROM nodes_live WHERE id=?", (nid,))
         if not r:
             raise HTTPException(404, "no such node")
         r = r[0]
@@ -663,8 +752,9 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             "procs": jloads(r["procs"], []), "agents": jloads(r["agents"], []), "history": hist[::step],
             "settings": effective_settings(nid),
             "logs": [dict(x) for x in store.q("SELECT name,ts,text FROM logs WHERE node_id=? ORDER BY name", (nid,))],
-            "jobs": [_job_row(x, False) for x in store.q(
-                "SELECT * FROM jobs WHERE node_id=? AND COALESCE(source,'')<>'brief' ORDER BY id DESC LIMIT 25", (nid,))],
+            "jobs": [job_row(x, False) for x in store.q(
+                "SELECT * FROM jobs WHERE node_id=? AND COALESCE(source,'')<>'brief' "
+                + ("" if include_sync else "AND COALESCE(source,'')<>'sync' ") + "ORDER BY id DESC LIMIT 25", (nid,))],
         }
 
     @app.put("/api/nodes/{nid}/settings", dependencies=[Depends(require_ui)])
@@ -686,8 +776,17 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             if not isinstance(body["canary"], bool):
                 raise HTTPException(400, "canary must be true or false")
             cur["canary"] = body["canary"]
-        store.x("INSERT OR REPLACE INTO settings(node_id,work_root,max_jobs,canary,updated) VALUES(?,?,?,?,?)",
-                (nid, cur["work_root"], cur["max_jobs"], int(cur["canary"]), clock()))
+        sets, vals = "work_root=?, max_jobs=?, canary=?", [cur["work_root"], cur["max_jobs"], int(cur["canary"])]
+        if "wu_window" in body:                  # 2.3 F4: per-node Windows Update window ("HH:MM-HH:MM" | "off" | null)
+            wu = forge_upkeep.normalize_wu_window(body["wu_window"])     # raises HTTPException(400)
+            sets += ", wu_window=?"; vals.append(wu)
+            cur["wu_window"] = wu
+        # update in place (INSERT OR REPLACE would wipe the 2.3 columns other workstreams own: drain, wu_*)
+        if not store.touch("settings", "node_id", nid, sets, tuple(vals)):
+            store.x("INSERT INTO settings(node_id,work_root,max_jobs,canary,updated) VALUES(?,?,?,?,?)",
+                    (nid, cur["work_root"], cur["max_jobs"], int(cur["canary"]), clock()))
+            if "wu_window" in cur:
+                store.touch("settings", "node_id", nid, "wu_window=?", (cur["wu_window"],))
         return cur
 
     def admin_enabled() -> bool:
@@ -698,10 +797,20 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         return actions_catalog | {"admin_lane_enabled": admin_enabled()}
 
     @app.post("/api/jobs", dependencies=[Depends(require_ui)])
-    def create_job(j: JobIn) -> dict:
+    def create_job(j: JobIn, request: Request) -> dict:
         now = clock()
+        chat = app.state.chat                      # 2.4: follow-ups (reply_to) and photos (attachments)
+        attachments = chat.check_attachments(j.attachments)
+        thread_id, scratch_of, chat_text, trusted = None, None, None, None
+        if j.reply_to:
+            plan = chat.plan_reply(j.reply_to, j.prompt)        # 404 / 409 (still working) / 400
+            chat_text = j.prompt
+            j = j.model_copy(update=plan["job"] | {"resume": None, "full_access": plan["job"]["full_access"] or j.full_access})
+            thread_id, scratch_of, trusted = plan["thread_id"], plan["scratch_of"], plan["resume"]
         engine, node_id, cwd, resume = j.engine, (j.node_id or "auto"), j.cwd, None
-        if j.resume:
+        if trusted:                                # resume the conversation's own CLI session (same node + folder)
+            engine, resume = trusted["tool"], trusted
+        elif j.resume:
             tool, node_id, rcwd = p2.resolve_resume(j.resume, node_id, j.force, now)   # 400/404/409
             if engine in (None, "any"):
                 engine = tool
@@ -718,11 +827,28 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             raise HTTPException(400, "bad model name")
         if j.kind is not None and j.kind not in KINDS:
             raise HTTPException(400, f"kind must be one of {list(KINDS)}")
-        system = engine in SYSTEM_ENGINES          # action/admin always run as SYSTEM
+        system = engine in SYSTEM_ENGINES          # action/admin run as SYSTEM, except "lane": "user" actions (A-F1)
+        user_action = None
+        if engine == "action":
+            ua = find_action(actions_catalog, j.action)
+            if ua is not None and action_lane(ua) == "user":
+                if j.run_as == "system":
+                    raise HTTPException(400, f"action {ua['name']} runs in the user lane")
+                user_action, system = ua, False
         if not system and j.run_as == "system":
             raise HTTPException(400, f"engine {engine} runs in the user lane only; use engine 'admin' or 'action'")
         auto = node_id == "auto"
         action, args, prompt = None, None, j.prompt
+        if user_action is not None:                # 2.3 F2: tool updates / git_sync / ollama_pull, as the node's user
+            try:
+                args = validate_args(user_action, j.args)
+            except ActionError as e:
+                raise HTTPException(400, str(e))
+            action, prompt, cwd = user_action["name"], action_summary(user_action["name"], args), None
+            if user_action.get("destructive"):
+                if not j.confirm:
+                    raise HTTPException(400, "confirmation required")
+                ctx.require_step_up(request)
         if system:
             if auto:
                 raise HTTPException(400, "system-lane jobs need a specific machine (not auto)")
@@ -742,6 +868,8 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
                 needs_confirm = True
             if needs_confirm and not j.confirm:
                 raise HTTPException(400, "confirmation required")
+            if needs_confirm:
+                ctx.require_step_up(request)       # S7 admin PIN (no-op until forge_security sets it)
         if not prompt.strip():
             raise HTTPException(400, "prompt required")
         if not auto and not store.q("SELECT 1 FROM nodes WHERE id=?", (node_id,)):
@@ -751,10 +879,13 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
             status, finished = "failed", now
             output = "[hub] admin lane is disabled on this hub (config.json admin_lane_enabled=false); job not run\n"
         jid = p2.insert_job(node_id=node_id, engine=engine, prompt=prompt, cwd=None if system else (cwd or None),
-                            full_access=j.full_access and not system, status=status, finished=finished, output=output,
+                            full_access=j.full_access and not system and user_action is None, status=status, finished=finished, output=output,
                             source=j.source, requested="auto" if auto else None, run_as="system" if system else "user",
                             action=action, args=args, resume=resume, project_id=j.project_id, model=j.model,
-                            req_engine="any" if engine == "any" else None, kind=j.kind)
+                            req_engine="any" if engine == "any" else None, kind=j.kind,
+                            notify=j.notify)
+        if not system:
+            chat.after_insert(jid, thread_id, attachments, scratch_of, chat_text)
         if system:
             what = f"ACTION {action}" if action else "ADMIN"
             store.event(node_id, "warn", f"{what} job {jid[:8]} queued for system lane (source {j.source})"
@@ -773,7 +904,7 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         r = store.q("SELECT * FROM jobs WHERE id=?", (jid,))
         if not r:
             raise HTTPException(404, "no such job")
-        return _job_row(r[0], True)
+        return job_row(r[0], True)
 
     @app.post("/api/jobs/{jid}/cancel", dependencies=[Depends(require_ui)])
     def cancel_job(jid: str) -> dict:
@@ -794,7 +925,7 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         for t in ("sessions", "repos"):
             for r in store.q(f"SELECT id FROM {t} WHERE node_id=?", (nid,)):
                 store.delete_row(t, r["id"])
-        for t in ("metrics WHERE node_id", "logs WHERE node_id"):
+        for t in ("metrics WHERE node_id", "logs WHERE node_id", "presence WHERE node_id"):
             store.x(f"DELETE FROM {t}=?", (nid,))
         return {"ok": True}
 
@@ -811,7 +942,8 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         return {"id": pid, "priority": body.priority}
 
     @app.delete("/api/peers/{pid}", dependencies=[Depends(require_ui)])
-    def delete_peer(pid: str) -> dict:
+    def delete_peer(pid: str, request: Request) -> dict:
+        ctx.require_step_up(request)               # A-S3: S7 admin PIN (removing a hub is destructive)
         if pid == me:
             raise HTTPException(400, "cannot remove the hub you are talking to; remove it from another hub")
         if not store.q("SELECT 1 FROM peers WHERE id=?", (pid,)):
@@ -822,7 +954,11 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
     # ---------- cluster API ----------
     @app.get("/cluster/status", dependencies=[Depends(require_cluster)])
     def cluster_status() -> dict:
-        return cluster.status() | {"bad_versions": lease.bad_versions(), "update_lease": lease.view()}
+        out = cluster.status() | {"bad_versions": lease.bad_versions(), "update_lease": lease.view()}
+        for extra in ctx.run_hooks(ctx.status_extras):          # R1/R3: local_agent, db
+            if isinstance(extra, dict):
+                out.update(extra)
+        return out
 
     @app.get("/cluster/sync", dependencies=[Depends(require_cluster)])
     def cluster_sync(since: float = -1.0) -> dict:
@@ -853,7 +989,7 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
     def _bundle_auth(request: Request) -> None:
         tok = request.headers.get("x-cluster-token") or request.headers.get("x-agent-token") \
             or request.query_params.get("t") or ""
-        if not (secrets.compare_digest(tok, cfg["cluster_token"]) or secrets.compare_digest(tok, cfg["agent_token"])):
+        if not (cluster_token_ok(tok) or agent_token_ok(tok)):
             raise HTTPException(401, "bad token")
 
     @app.get("/cluster/bundle", dependencies=[Depends(_bundle_auth)])
@@ -918,8 +1054,17 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         ver = str(body.get("version") or "").strip()
         if not VERSION_RE.match(ver):
             raise HTTPException(422, "version (x.y.z) required")
-        lease.mark_bad(ver, str(body.get("reason") or f"rolled back on {body.get('node_id') or 'a node'}")[:200])
-        lease.release(str(body.get("node_id") or ""))
+        who = str(body.get("node_id") or "").strip().lower()[:64]
+        who = who if BAD_VERSION_NODE_RE.match(who) else None      # only a plain node id reaches alerts and URLs
+        lease.mark_bad(ver, str(body.get("reason") or f"rolled back on {who or 'a node'}")[:200])
+        lease.release(who or "")
+        # 2.3 R1: a rollback is an auto-repair the user should hear about once (N dedupes per key)
+        ctx.safe_call(ctx.raise_alert, "rolled_back", key=f"rolled_back:{who or '-'}:{ver}", node_id=who, level="error",
+                      msg=f"{who or 'a machine'} rolled back from {ver}; {ver} will not be installed again",
+                      data={"version": ver})
+        ctx.safe_call(ctx.notify, "rolled_back", f"Update {ver} rolled back",
+                      f"{who or 'A machine'} could not run {ver} and went back to the previous version.",
+                      node_id=who, url=f"#/machine/{quote(who, safe='')}" if who else "#/machines")
         return {"ok": True, "bad_versions": lease.bad_versions()}
 
     @app.delete("/cluster/bad-version/{version}", dependencies=[Depends(require_cluster)])
@@ -993,9 +1138,9 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         return {"ok": True, "cleared": p2.clear_cooldown(engine)}
 
     @app.get("/api/jobs", dependencies=[Depends(require_ui)])
-    def list_jobs(include_brief: bool = False, limit: int = 40) -> list:
-        sql = "SELECT * FROM jobs " + ("" if include_brief else "WHERE COALESCE(source,'')<>'brief' ") + "ORDER BY id DESC LIMIT ?"
-        return [_job_row(r, False) for r in store.q(sql, (max(1, min(limit, 200)),))]
+    def list_jobs(include_brief: bool = False, limit: int = 40, include_sync: bool = False) -> list:
+        sql = "SELECT * FROM jobs " + _hidden_sources_sql(include_brief, include_sync) + "ORDER BY id DESC LIMIT ?"
+        return [job_row(r, False) for r in store.q(sql, (max(1, min(limit, 200)),))]
 
     # ---------- agent distribution ----------
     @app.get("/agent/forge-agent.ps1", response_class=PlainTextResponse)
@@ -1025,9 +1170,24 @@ def create_app(data_dir: Optional[Path] = None, start_monitor: bool = True, *,
         return FileResponse(BASE / "static" / "index.html", headers={"Cache-Control": "no-store"})
 
     @app.get("/healthz")
-    def health() -> dict:
+    def health():
+        if ctx.healthz is not None:              # R1: DB write probe + free space (503 when unhealthy)
+            code, body = ctx.healthz()
+            return JSONResponse(body, status_code=code)
         return {"ok": True, "node_id": me, "role": cluster.role}
 
+    # ---------- Phase 3 workstream modules (CONTRACT-phase3.md §2) ----------
+    ctx.leader_json, ctx.leader_only_or_forward = _leader_json, leader_only_or_forward
+    ctx.node_settings, ctx.effective_settings, ctx.job_row = node_settings, effective_settings, job_row
+    n_core = len(app.router.routes)
+    forge_security.register(app, ctx)      # S
+    forge_reliability.register(app, ctx)   # R
+    forge_alerts.register(app, ctx)        # N
+    forge_upkeep.register(app, ctx)        # F
+    forge_ui.register(app, ctx)            # U
+    forge_chat.register(app, ctx)          # 2.4 chat: uploads, threads, follow-ups
+    # module routes go first, so a module may replace a core route (method + path) where the contract allows it
+    app.router.routes[:] = app.router.routes[n_core:] + app.router.routes[:n_core]
     return app
 
 

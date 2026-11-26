@@ -251,3 +251,279 @@ tokens `sk-…` (incl. `sk-ant-`), `ghp_/gho_/ghu_/ghs_/ghr_`, `github_pat_`, `g
 PEM blocks `-----BEGIN …----- … -----END …-----` (unterminated: to the end of the text); key=value secrets `password|passwd|pwd|
 accountkey|sharedaccesskey|client_secret|api_key = value` (connection strings `Password=…;`, `AccountKey=…;`) keep the key and
 redact the value. Forge-job transcripts are redacted before being split into 4000-char events.
+
+# 2.3.0 (hub), workstream R: reliability (CONTRACT-phase3.md §5 R)
+
+## R1 health gate
+- `GET /healthz` (no auth, answered locally by standbys): `{ok, node_id, role, version, running_version, db_ok, free_gb,
+  checks: {db_write, disk}}`. **503** with the same body when the DB write probe (`healthz_probe` upsert) fails or the data
+  drive has less than `healthz_min_free_gb` (config, default 1.0) free. The watchdog treats a 503 with a health body as
+  "up but unhealthy" and does not restart the hub for it.
+- `GET /cluster/status` adds `local_agent: {online (reported within 90 s), agent_version, bundle_version, last_seen,
+  draining_to}` for this hub's own node, `db: {quick_check: "ok"|"reseeded", reseed_pending, last_backup}` and
+  `disk: {free_gb, ok}`.
+- Release healthy (watchdog probation) = healthz ok AND `eligible` AND `local_agent.bundle_version >= release` within
+  `release_health_s` (180). These cases are not judged yet and do not count as a strike: the hub is still syncing (< 180 s),
+  the agent is restarting (< 180 s), the agent is `draining_to` the release (< `drain_timeout_s` + 180 s), or the disk is low.
+  The agent rule applies only when the agent was reporting before the flip.
+- `POST /cluster/bad-version` also raises alert `rolled_back` (key `rolled_back:<node>:<ver>`) and calls
+  `ctx.notify("rolled_back", ...)`.
+
+## R3 database safety
+- At start, `PRAGMA quick_check` runs before the store opens. If it is not ok, `forge.db(-wal,-shm)` is renamed to
+  `forge.db.corrupt-<stamp>`. With peers configured the hub starts empty and stays `eligible=false` (no solo self-election)
+  until one full sync from a leader succeeds. Alert `db_reseeded`: error while waiting, warn for 1 h after. Without peers the
+  hub restores the newest backup that passes `quick_check` (internally `"restored"`, reported as `"reseeded"`).
+- The settled leader runs a backup once a day after `backup_time` (local, default `02:30`):
+  `VACUUM INTO <db dir>\backup\forge-YYYYMMDD.db` on a second connection, so writers are not blocked. It keeps `backup_keep`
+  (7) files. The db dir becomes `data\private` once S moves the database there.
+- `GET /api/backups` (UI) -> `{backups: [{file, size, ts}], last_backup, dir}` (newest first).
+
+## R4 data model
+- Job output is stored as append-only `job_output` rows `<job_id>:<seq 8 digits>` (<= 64 000 chars; larger appends are
+  split). When the kept text passes 256 000 chars, the oldest chunks are deleted and `jobs.output_min_seq` moves up. Standbys
+  delete the same chunks after each sync page, and drop a job's chunks when they apply its `jobs` tombstone (retention uses
+  `Store.delete_job_cascade`). `jobs.output` is no longer written except at insert. Readers use the chunks when any exist,
+  else `jobs.output` (a job that a 2.2 leader wrote). The first append to such a job copies the legacy text into chunk 1.
+- `GET /api/jobs/{id}` keeps `output` (concatenated, with a `[...truncated...]\n` prefix once trimmed) and adds `output_seq`;
+  list rows keep `tail`. `GET /api/jobs/{id}/output?since_seq=N` (UI) -> `{chunks: [{seq, ts, text}] (seq > N), next_seq,
+  status, truncated}`. `truncated` means chunks after N were already trimmed. A 2.2-written job answers as one chunk, seq 1.
+- Presence: every agent report writes the local, unreplicated `presence` row. That includes the system lane
+  (`sys_last_seen`, `sys_capacity`, `sys_version`). The replicated `nodes` row is rewritten only when its `last_seen` is
+  >= 60 s old (and on an online/offline change by the presence check). The view `nodes_live` lays presence over `nodes`;
+  `/api/state`, `/api/nodes/{id}`, `/api/health`, the scheduler, the lease and the presence check read it.
+
+## R5 upgrades
+- The user-lane report response carries `drain_timeout_s` (config, default 1800).
+
+## R6 machines lifecycle
+- Every hub (real servers only) checks its URL set every 60 s: MagicDNS name and Tailscale IPv4 from
+  `tailscale status --json`, plus LAN IPv4s. If tailscale is installed but does not answer, the round is skipped. When the
+  set changed, or every `announce_every_s` (300), the hub sends `POST /cluster/join {id, urls}` to the leader. The leader
+  replaces the peer's urls and writes nothing when they are unchanged.
+- `POST /api/machines/{id}/retire` (UI + step-up) `{confirm: true, uninstall: true, rotate_tokens: false}` -> 202
+  `{ok, state: "draining"}`. 400 `confirmation required`; 404 unknown machine; 409 if the machine is already being removed,
+  is the only hub, is the hub answering the request and `uninstall` is false, or `uninstall` is requested while
+  `forge_uninstall` is not in the catalog.
+- `GET /api/machines/{id}/retire` -> `{node_id, state, started, finished, job_id, error}`. `DELETE` cancels while the state
+  is `draining` (or after `failed`): drain is turned off and the row is removed.
+- Flow (settled leader tick):
+  1. `settings.drain=1`: no dispatch and no auto placement. Queued auto jobs go back to the pool; pinned ones are cancelled.
+  2. Running jobs finish. After `drain_timeout_s` they get `cancel_requested`.
+  3. With `uninstall`: the system job `forge_uninstall {keep_data: false}` runs (`source: "retire"`, the only job a
+     draining node gets). The flow waits until the job is done or the node has been silent for 5 min.
+  4. The `nodes`, `settings`, `peers`, `sessions` and `repos` rows are deleted (tombstones), along with the local
+     presence/metrics/logs. Leftover jobs are failed.
+  5. With `rotate_tokens`: `forge_security.rotate(ctx, ["agent","cluster"])`. Then the state is `done`.
+  A failed uninstall job (with the node still online), or 30 min without a result, sets `failed` and raises alert
+  `retire_failed`.
+
+# 2.3.0 Security (workstream S; full shapes in CONTRACT-phase3.md §5 "Workstream S")
+
+## Secrets and files (S2)
+- `data\config.json`: `node_id`, `agent_token`, `port`, `seed_peers`, non-secret keys (user-readable).
+- `data\private\secrets.json` (Admins+SYSTEM only): `ui_token_hash` (`sha256:<hex>`), `cluster_token`, `cluster_token_prev`,
+  `rotated`, `signing_pubkey`, `admin_pin_hash`. The hub moves 2.2 `ui_token` / `cluster_token` here once at start (backup
+  `data\private\config.json.pre23.bak`) and moves `data\forge.db*` to `data\private\forge.db*` (ACL reset to inherit).
+  Without `data\private` (dev checkouts, tests) everything stays in config.json as in 2.2.
+- Fleet-wide truth is the replicated `secrets` table (leader writes); every hub adopts newer rows on its tick and rewrites
+  both files, so the watchdog (`Merge-WdSecrets`) and agents follow.
+
+## Auth (S4)
+- UI: cookie `forge_sid` (random 32-byte secret; DB keeps sha256). Legacy `forge_token` cookie / `Authorization: Bearer
+  <ui_token>` still work (hash compare); a legacy cookie from a browser (`Mozilla/` user agent) is upgraded to a session,
+  reusing the same session per (ip, user agent) for 10 min and minting at most 20 per hour.
+- Rate limits key on the client address. `X-Forwarded-For` counts only on a hop that carries `X-Forge-Via` plus
+  `X-Forge-Proxy: <cluster token>` (what `Cluster.forward` sends), and then only its LAST entry.
+- `POST /api/login {token, label?}` · `POST /api/claim {code, label?}` · `POST /api/logout` · `GET /api/devices` ·
+  `PATCH|DELETE /api/devices/{id12}`. Login/claim/logout are standby-local and forwarded to the leader by S (with no
+  leader the standby answers itself; the session then lives only on that hub). 10 failed logins/min/IP -> 429.
+
+## Enrollment (S3)
+- `POST /api/enroll {kind: machine|device, label?}` -> `{id, code: "XXXX-XXXX", kind, expires, hub, command|url}`; `GET
+  /api/enroll` = legacy machine form. `GET|DELETE /api/enroll/{id}` (state pending|redeemed|joined|expired).
+- Codes: 8 Crockford base32 chars, case/dash-insensitive (I/L->1, O->0), stored as `sha256(normalized)`; TTL `enroll_ttl_s`.
+- `GET /agent/install.ps1?code=` checks (does not consume) and substitutes `__HUB__`, `__CODE__` (`__TOKEN__` -> empty).
+  `?t=<agent_token>` still works.
+- `GET /cluster/bootstrap?code=<code>[&node=<id>]` redeems once on the leader (standbys forward) ->
+  `{agent_token, cluster_token, signing_pubkey, ui_token_hash, peers, bundle_version, bundle_sha256, node_hint}`.
+  `?t=<agent_token>` returns only `{agent_token, peers, bundle_version, bundle_sha256, node_hint}` (the agent token is
+  readable by filtered jobs, so it must not buy the cluster token); config `legacy_bootstrap_secrets: true` restores
+  `cluster_token` / `signing_pubkey` / `ui_token_hash` there for 2.2 installers. **No `ui_token` any more.**
+  10 failures/min/IP -> 429.
+- First run (F): `data\private\firstrun-claim.json {code_sha256, expires, label}` is imported by the leader as a device
+  code and deleted; `code_sha256` = sha256 hex of the normalized code.
+
+## Rotation (S5)
+- `POST /api/tokens/rotate {which?, confirm: true, force?}` (UI + PIN) -> `{ok, rotated, grace_until}`; 409 lists agents
+  (reported in the last 10 min with agent < 2.3) / hubs (< 2.3) that would be locked out. `GET /api/tokens`.
+- Old value accepted until `rotated + token_grace_s` (600). During the grace every report response (both lanes) carries
+  `rotate: {agent_token, grace_until}`. `forge_security.rotate(ctx, which)` is the R6 entry point.
+- Offline nodes that miss the whole grace window must be re-enrolled (their stored tokens are stale).
+
+## Signed bundles (S6)
+- `bundle.sig` (zip root) = `{v, version, manifest_sha256, sig, key_id}`; RSA-3072 PKCS#1 v1.5 SHA-256 over the manifest
+  (`<sha256> <path>\n`, ordinal sort; skipped: root `bundle.sig|zip|sha256`, `venv/`, `__pycache__/`, `*.pyc`).
+- With `signing_pubkey` pinned, `POST /cluster/publish` answers 400 `bundle not signed` / `bundle signature invalid` /
+  `bundle contains unsigned code: <path>` (any `__pycache__`, `*.pyc`, `*.pyo` or top-level `venv/` in a fresh
+  extraction: the manifest skips them, so they would run unverified), 500 `signing key invalid` for a corrupt pinned
+  key (alert `bundle_unsigned`). The hub's re-zip of the running release includes `bundle.sig`. `/cluster/status.signing`.
+- `GET /api/security/signing-key` · `PUT /api/security/signing-key {pubkey_xml, replace?}` (UI + PIN; >= 3072 bits; 409
+  on a different pinned key without `replace`).
+
+## Step-up (S7)
+- `GET /api/stepup` · `POST /api/stepup {pin}` (10 min per session; wrong PINs per 10 min: 5 per session (all
+  legacy-token callers are one principal), 10 per IP, 20 per hub -> 429) · `PUT /api/stepup/pin
+  {pin, old_pin?}` (needs `old_pin` or a valid step-up once a PIN exists; setting a PIN also steps the session up).
+- Protected: admin / destructive `POST /api/jobs`, `POST /api/tokens/rotate`, `PUT /api/security/signing-key`,
+  `DELETE /api/peers/{id}` (+ R retire, F maintenance runs). 403 `{"detail": "admin PIN required"|"admin PIN not set",
+  "step_up": "required"|"setup"}`. API clients without a session send the PIN per request as `X-Admin-Pin: <6 digits>`.
+- Forgotten PIN: `tools\reset-admin-pin.ps1` (elevated, on the leader) writes `data\private\pin-reset.json`; the leader
+  clears the replicated PIN and all step-up windows and deletes the file (event `admin PIN cleared ...`).
+
+## Job token (S1) alerts
+- Report `metrics.job_token` = `filtered|full|unavailable` (+ `job_token_error`). `/api/health` alerts:
+  `job_token_full` (error) for anything but `filtered`, `job_token_unknown` (warn) when missing (pre-2.3 agent),
+  `bundle_unsigned` (error) for refused publishes (24 h) and `metrics.watchdog.signature_refused`.
+
+# 2.3.0 (hub) N: alerts and notifications (`hub/forge_alerts.py`, `hub/forge_webpush.py`)
+
+## N1 alert engine (settled leader, every 3 s tick)
+Conditions = the core checks (`node_offline`, `disk_full`, `version_behind`, `watchdog_stale`, `clock_skew`, `hub_down`,
+`fleet_bad_version`) + `ctx.alert_sources` + alerts raised with `ctx.raise_alert`. Each condition has a `key`
+`<kind>:<node_id or ->[:<subject>]` (hub `version_behind` uses subject `hub`, `fleet_bad_version` the version). One open
+row per key in the replicated `alerts` table. A condition that has been gone for 2 ticks is resolved (`resolved_by: "auto"`).
+Raised alerts are not auto-resolved: they stay open until `ctx.resolve_alert(key)` or a user ack. `task_*` alerts close after
+24 h, and any other raised alert closes after 7 days. Resolved rows are deleted after 30 days.
+Self-healing (`rollout_in_progress`, `service_restarting`, `version_behind` while the update lease is held, `node_offline` of
+the lease holder, or `self_healing: true` from a source) never notifies before `alert_selfheal_grace_s` (900).
+- `GET /api/alerts?open=1&limit=100&since=<epoch>` (UI): `{alerts: [{id, key, kind, node_id, level, msg, opened, resolved,
+  resolved_by, self_healing, last_notified, data, action}]}`, newest first. `open=0` includes resolved rows, and `since` filters
+  on the row's `updated`. `action` = `{label, kind, target}` or null. Defaults: `task_failed` gives `retry_job {job_id}`,
+  `task_finished` gives `open_job`, `node_offline` gives `wake_machine {node_id}`, any other alert with a node gives `open_machine`.
+  `data.notify_state` is `sent` or `suppressed:rule|dedup|no_channel` once the notification decision has been made.
+- `POST /api/alerts/{id}/ack` (UI) -> `{ok}` (404 for an unknown id). Sets `resolved_by: "user"`. A condition that is still true
+  reopens as a new row 1 h after the ack.
+- `GET /api/health`: `alerts[]` keeps the 2.2 entries and gains `key`, `id`, `opened`, `self_healing` and `action`, followed by
+  the open raised alerts.
+
+## N2 notifiers
+Notifications go out for: a failed user-lane job (source not `brief`/`sync`), a `done` job with `notify=1`, `node_offline`
+open longer than `machine_down_notify_s` (600), and `rolled_back` / `upkeep_failed` / `fleet_bad_version`. Each alert row
+is decided once. At most one notification goes out per key per 6 h, so a flapping machine does not page twice.
+`ctx.notify(kind, ...)` uses the same rules (key `<kind>:<node>[:<job>]`), and kinds outside these rules are dropped.
+Sends run on a background worker thread.
+Prefs (`prefs` table, replicated, so they follow the leader): `notify.ntfy {enabled, server, topic}`, `notify.webpush {enabled}`,
+`notify.rules {task_failed, task_finished, machine_down, autorepair}`, `notify.deadman {enabled, url, send_fail}`, plus
+`notify.deadman_state {last_ping, last_ok, last_error}`.
+- `GET /api/notify/settings` (UI) -> `{ntfy: {enabled, server, topic, subscribe_url}, webpush: {enabled, vapid_public_key,
+  available, devices}, deadman: {enabled, url, send_fail, last_ping, last_ok, last_error}, rules}`. The first GET on the
+  leader creates the VAPID P-256 key pair (`secrets` rows `vapid_private_key` / `vapid_public_key`, base64url; the public key
+  is the 65-byte uncompressed point).
+- `PUT /api/notify/settings` (UI): takes a partial of the same shape and returns the full shape. It answers 400 for a bad
+  server or dead-man URL, a topic that does not match `^[A-Za-z0-9_-]{8,64}$`, a non-boolean flag, an unknown rule, or an
+  enable without a topic or URL.
+- `POST /api/notify/ntfy/topic` (UI) -> `{topic: "hm-<20 base32>", subscribe_url}` (not saved). The UI shows the URL and a QR
+  code for it.
+- `POST /api/notify/test` (UI) `{channel?: ntfy|webpush|all}` -> `{ok, results: {ntfy?: "ok"|"<error>", webpush?: {sent, failed}}}`.
+- `POST /api/push/subscribe` (UI) `{endpoint (https), keys: {p256dh, auth}, label?}` -> `{ok, id = sha256(endpoint)[:32]}`.
+  Invalid keys give 400; a hub without `cryptography` gives 503. `DELETE /api/push/subscribe` `{endpoint}` -> `{ok, removed}`.
+  A push service answer of 404/410, or 5 failures in a row, deletes the subscription.
+- ntfy is published as JSON to `<server>/` (`{topic, title, message, tags, priority: 4 for errors else 3, click}`), with
+  `click = <public_url>/#/...`. `public_url` comes from config, else the leader's first `*.ts.net` peer URL, else its first
+  non-loopback URL.
+- Web Push uses RFC 8291 aes128gcm with VAPID ES256 (`sub` = config `vapid_subject`, default `mailto:hivemind@example.com`),
+  `TTL: 86400`, `Urgency: high` for errors, and `Topic` = a hash of the alert key. The payload is
+  `{title, body, url: "#/...", tag: <alert key>}`.
+- `POST /api/jobs` accepts `notify: bool` (default false). Job rows carry `notify` (0/1).
+
+## N3 dead-man switch
+When `notify.deadman.enabled`, the settled leader GETs `url` every `deadman_every_s` (300 s, timeout 10 s). If `send_fail` is
+set and any `error` alert is open, it GETs `url + "/fail"` instead. The result is shown under `deadman` in the settings response.
+
+## N4 morning brief
+The roll-up prompt (`p2.digest_extras`) ends with the overnight alerts and finished tasks since 18:00 local time the previous
+day (redacted). `GET /api/brief/all` (replaced by `forge_alerts`, amendment N-1) keeps its body and adds
+`overnight: {alerts: [{kind, node_id, msg, opened, resolved}], finished: [{id, prompt (<= 80), status, node_id, finished}]}`
+(at most 30 of each; `task_finished` alerts are left out because they appear under `finished`).
+
+# 2.3.0 workstream F: first run + upkeep (CONTRACT-phase3.md section 5 "Workstream F")
+
+All routes are UI-authenticated and are answered by the leader (standbys forward them). Fleet decisions run only on the
+settled leader (`ctx.settled_leader()`).
+
+## Actions catalog
+`hub/actions.json` entries carry `"lane": "system"|"user"` (default system) and args may be `type: "bool"`. New actions:
+`update_claude`, `update_codex`, `update_t3`, `git_sync {cwd}`, `ollama_pull {model}` (user lane); `update_ollama`,
+`windows_update {reboot: "never"}`, `free_disk`, `forge_uninstall {keep_data}` (system; free_disk and uninstall are destructive).
+`POST /api/jobs` with engine `action` and a user-lane action queues a user-lane job (`run_as: "user"`, `node_id` may be
+`auto`, it is dispatched only to agents >= 2.3.0, otherwise `wait_reason: "needs agent 2.3"`); the dispatch item gets
+`run_as: "user"`, `action`, `args`. Output ends with `##RESULT <json>`.
+
+## Maintenance runs
+- `GET /api/maintenance/actions` -> `{actions: [{name, title, description, steps, lane, destructive, args}]}` for
+  `update_app` (winget_upgrade {id}), `update_ai_tools`, `restart_hivemind`, `free_disk`, `restart_machine`. Runs and previews
+  also accept a raw catalog action name (except `forge_uninstall`).
+- `POST /api/maintenance/preview {action, args?, targets: "all"|[ids]}` -> `{order, skipped: [{node_id, reason}],
+  destructive, needs_step_up, online}`. reason: `offline` | `needs agent 2.3`.
+- `POST /api/maintenance/runs {action, args?, targets, confirm: true}` -> `{id, order}`; step-up (S7) when destructive or
+  system lane; 400 unknown action / bad args / `confirmation required`; 409 another active run overlaps.
+- `GET /api/maintenance/runs?limit=20` -> `{runs}`; `GET /api/maintenance/runs/{id}` -> `{id, action, title, args, targets, idx,
+  status, current: {node_id, job_id}|null, results: [{node_id, job_id, step, status, summary, finished}], source, created,
+  started, finished}`; `POST /api/maintenance/runs/{id}/cancel` -> `{ok}` (409 when not active).
+- Jobs of a run have `source: "upkeep"` and `run_id`. A failed step raises `upkeep_failed` and `ctx.notify("upkeep_failed")`.
+- `GET /api/upkeep/settings` -> `{schedule: {enabled, day, time, actions}, windows_update: {enabled, window, stagger_min},
+  repo_sync_every_s, wu_slots: [{node_id, window, slot, rank}]}`; `PUT` takes a partial and returns the same shape.
+
+## Repo sync
+`PUT /api/projects/{id}/sync {nodes: [ids]}` -> `{ok, sync_nodes}`; projects carry `sync_nodes`. Jobs `source: "sync"` are
+hidden from `/api/state`, `/api/jobs` and `/api/nodes/{id}` unless `include_sync=1`. `repo_conflict` alert key:
+`repo_conflict:<node>:<project_id>` (action `open_project`).
+
+## Windows Update
+`PUT /api/nodes/{id}/settings {wu_window: "HH:MM-HH:MM"|"off"|null}` (400 otherwise; the update no longer wipes other
+settings columns). `/api/state` nodes carry `settings.wu_window` and `upkeep: {wu_last, wake}`. `settings.wu_last` =
+`{date, state, job_id, ts, installed, failed, reboot_required, kb, reboot: "queued"|"pending"|"done"}`. Alerts:
+`windows_update_failed:<node>`, `reboot_pending:<node>`.
+
+## Wake-on-LAN
+`POST /api/machines/{id}/wake` -> `{ok, via, mac}`; 404 unknown, 409 `already online`, 422 `no MAC known`, 503
+`no online machine on the same network`. The helpers receive `wol: [{mac, broadcast, port: 9}]` in their next user-lane report
+response (60 s). MACs are kept in prefs `upkeep.macs.<node>` (written only when they change).
+
+# Phase 3 (hub 2.3.0), workstream U: UI routes (`hub/forge_ui.py`)
+
+Full contract: `CONTRACT-phase3.md` §5 "Workstream U". All three groups are registered by `forge_ui.register(app, ctx)`.
+
+## PWA (no auth; standbys answer these themselves: `ctx.local_paths` / `ctx.local_prefixes`)
+- `GET /manifest.webmanifest` → `application/manifest+json`: `{name, short_name: "Hivemind", start_url: "/#/today", scope: "/",
+  display: "standalone", background_color, theme_color, icons: [192, 512, maskable 512]}`.
+- `GET /sw.js` → `hub/static/sw.js` with `Service-Worker-Allowed: /` and `Cache-Control: no-cache`. It caches the shell
+  (`/`, manifest, icons) and the last good `/api/state` and `/api/today`. When the network fails it serves those copies with
+  `X-HM-Offline: 1` + `X-HM-Cached-At: <ms>`; the page then shows "Offline · data from HH:MM". It shows N2 push payloads
+  `{title, body, url: "#/…", tag}` and opens `url` on click. Sign-out posts `{type: "clear-data"}` to drop the data cache.
+- `GET /icons/<name>.png` → `hub/static/icons/` (`icon-192.png`, `icon-512.png`, `maskable-512.png`, `badge-72.png`); any
+  other name is 404.
+
+## `GET /api/today?q=` (UI)
+`{now, status: {level: ok|warn|error, sentence}, needs_you: {items: [≤3 alerts, N1 shape], total}, happening: [{kind: session|job,
+id, tool, title, node_id, project_id, since, state}], recent: {today, yesterday, earlier} (≤20 non-live sessions each, newest
+first, LOCAL calendar days, each row {tool, session_id, title, node_id, project_id, project_name, state, last_activity, started,
+git_branch, messages}), brief: {text, ts, model}|null (latest roll-up), first_run: {machines, projects}}`.
+- `needs_you` source: the `alerts` table (open rows) once N is active (`ctx.raise_alert` is set); before that the
+  `GET /api/health` alert list plus user-lane UI tasks that failed in the last 12 h (`kind: task_failed`, `data.job_id`).
+  Only `warn`/`error`; self-healing alerts are hidden until they are older than `alert_selfheal_grace_s` (900); a
+  `version_behind` alert counts as self-healing while a rollout is in progress. Errors first, then newest.
+- Every item has `action` (N1 shape). When the alert has none the hub fills a default: `node_offline`/`machine_down` →
+  `wake_machine`, `task_failed` → `retry_job`, `repo_conflict` → `open_project`, `fleet_bad_version`/`rolled_back`/`bundle_unsigned`
+  → `fix` (`#/machines/advanced`), anything else with a node → `open_machine`.
+- `?q=` filters `recent` (case-insensitive substring of title, project name, node id or hostname).
+
+## `GET /api/ask?q=&limit=8` (UI; `limit` 1-50)
+`{results: [{type: project|session|machine|action|maintenance|run, id, title, subtitle, score, target}]}`. Fuzzy only
+(`forge_ui.fuzzy_score`, the same algorithm as the UI's `UI.fuzzyScore`; shared cases in `tests/js/fuzzy_cases.json`): 1.0 exact,
+.95 prefix, .9 word start, .8 substring, .7 all words, .3-.6 letters in order. Sources: named UI actions (`target.route`),
+maintenance actions (`forge_upkeep.MAINTENANCE` when F defines it, else the five friendly names; `target {route, action}`),
+machines, projects, the 40 newest sessions per project. At most `limit-1` matches, then always the run entry
+`{type: "run", title: "Run '<q>' on any free machine", target: {prompt, engine: "any", node_id: "auto"}}`. Nothing runs from
+Ask: the UI opens the Run-a-task preview. Empty `q` → `{results: []}` (no run entry).

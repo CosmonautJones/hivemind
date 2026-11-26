@@ -80,3 +80,21 @@ I3. Remove legacy icons ("Install Hivemind.cmd", "Hivemind.url"); never delete u
 - Hive proposes an admin action → Approve/Deny card; nothing runs without approval.
 - Kill Hive's node → next message to Hive works (restarted elsewhere with context summary).
 - First-visit coach marks + example prompts appear once; ≤ 3 taps for each acceptance flow on a 390 px phone.
+
+## P. Photos + Chat UI (delivered 2026-11-25, branch p4-chat)
+User ask: "send photos along into chats… follow up on tasks… modern UI like ChatGPT but with our stuff".
+- **Chat view** `#/chat`, `#/chat/<id>` (new first tab "Chat"; "+ New chat" replaces "Run a task" in the top bar and on
+  Today; Ask's "Run '<q>'" opens a prefilled chat; the task view has "Open as chat"). Sidebar of conversations grouped
+  Today / Yesterday / Previous 7 days / Older with search; bubbles with safe markdown (code fences, `code`, **bold**,
+  headings, links); typing indicator while a machine works; Stop; Copy; Raw log. Phone: full-screen, slide-out list.
+- **Photos**: 📎 button (phone camera / library via `accept=image/*`), paste, drag-drop; up to 8 per message. The
+  browser re-encodes big or HEIC images to JPEG ≤ 2048 px. Hub `POST /api/uploads` sniffs PNG/JPEG/WebP/GIF from the
+  bytes (≤ 8 MB), stores them in the replicated `uploads` table (pruned after 30 days unless a running job uses them).
+  The agent downloads them (`GET /api/agent/uploads/<id>`) to `<jobdir>\attachments\` and passes them to Claude
+  (`--add-dir` + paths in the prompt) or Codex (`--image=`).
+- **Follow-ups** (C1/C2 for Claude + Codex): new Claude tasks get a hub-assigned `--session-id`; `POST /api/jobs
+  {reply_to}` resumes that session (Codex: the `session id:` it prints) on the same machine and folder (`scratch_of`
+  for tasks without a folder). PowerShell replies run the next command on the same machine; Ollama / pre-2.4 agents
+  get a new turn seeded with the earlier turns. A reply typed while a turn runs is queued in the UI.
+- Jobs with photos / a follow-up folder are held for 2.4 agents (wait reason says so). Not yet: live token streaming
+  (C3: replies appear when the turn ends), Hive (H), coach marks (T1).

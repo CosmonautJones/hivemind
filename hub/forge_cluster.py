@@ -22,6 +22,7 @@ MERGE_RIVAL_EVERY = 10.0  # leader: merge-pull from a peer that still claims lea
 FORCE_WAIT_MAX = 60.0     # demoted hub: force-resync anyway if the leader has not confirmed merging us by then
 HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "upgrade",
               "te", "trailer", "proxy-authorization", "proxy-authenticate", "x-forwarded-for"}
+PROXY_HEADERS = {"x-forge-via", "x-forge-proxy"}      # set by forward() itself; client copies are dropped
 
 ClientFactory = Callable[[], httpx.Client]
 
@@ -63,6 +64,11 @@ class Cluster:
         self.stepdown_seq = 0                     # bumped each time we stop being leader
         self.merged_seq: dict[str, int] = {}      # leader: peer -> its stepdown_seq covered by our last merge of it
         self._force_wait_since: Optional[float] = None
+        # 2.3 R3: True after the database failed PRAGMA quick_check and was replaced by an empty one. While peers are
+        # configured we stay ineligible (never self-elect on an empty copy) until one full sync from a leader succeeded.
+        self.reseed_pending = False
+        self.on_reseeded: Optional[Callable[[], None]] = None     # R3: clears the forge.db.reseed-pending marker
+        self.reseeded_at: Optional[float] = None
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
         self._seed(cfg.get("seed_peers") or [])
         self._ensure_self()
@@ -98,9 +104,11 @@ class Cluster:
     def join(self, pid: str, urls: list[str]) -> dict:
         """Upsert a peer; priority = existing or max+1. Must run on the leader."""
         pid = pid.strip().lower()
-        row = self.store.q("SELECT priority FROM peers WHERE id=?", (pid,))
+        row = self.store.q("SELECT priority, urls FROM peers WHERE id=?", (pid,))
         if row:
-            self.store.touch("peers", "id", pid, "urls=?", (json.dumps(urls),))
+            if jloads(row[0]["urls"], None) != urls:        # 2.3 R6 re-announce: replace the url set, quietly when unchanged
+                self.store.touch("peers", "id", pid, "urls=?", (json.dumps(urls),))
+                self.store.event(pid, "info", f"hub {pid} urls: {', '.join(urls) or '(none)'}")
             prio = row[0]["priority"]
         else:
             prio = (self.store.q("SELECT MAX(priority) m FROM peers")[0]["m"] or 0) + 1
@@ -218,7 +226,8 @@ class Cluster:
         with self.lock:
             if not self.eligible:
                 claimed = any(s.healthy and s.status.get("role") == "leader" for s in self.ps.values())
-                if not self._others() or (now - self.started >= SOLO_WAIT and not claimed):
+                solo_ok = not self.reseed_pending        # R3: an empty (reseeded) copy must sync before it may lead
+                if not self._others() or (solo_ok and now - self.started >= SOLO_WAIT and not claimed):
                     self._set_eligible(now)
             prev = self.leader_id
             new = self.compute_leader(now)
@@ -249,6 +258,14 @@ class Cluster:
         if new and new != self.id:
             if self.sync_from(new):
                 with self.lock:
+                    if self.reseed_pending:
+                        self.reseed_pending, self.reseeded_at = False, self.clock()
+                        self.store.event(self.id, "ok", f"{self.id} database reseeded from leader {new}")
+                        if self.on_reseeded is not None:
+                            try:
+                                self.on_reseeded()
+                            except Exception:
+                                pass
                     self._set_eligible(self.clock())
         elif new == self.id:
             self._merge_rivals(now)
@@ -360,6 +377,7 @@ class Cluster:
                     for t in REPLICATED:
                         self.store.upsert_rows(t, data["tables"].get(t) or [], force=force, restamp=restamp)
                     self.store.apply_deleted(data.get("deleted") or [], force=force, restamp=restamp)
+                    self._cleanup_chunks(data)
                 if data.get("more"):
                     since = data["next_since"] - 0.001
                     continue
@@ -372,6 +390,18 @@ class Cluster:
         except (httpx.HTTPError, ValueError, KeyError):
             return False
         return False
+
+    def _cleanup_chunks(self, data: dict) -> None:
+        """2.3 R4: job_output chunks have no tombstones of their own. After a page, drop the chunks of jobs deleted in it,
+        chunks below their job's output_min_seq (trimmed on the leader) and chunks of already-deleted jobs."""
+        tables = data.get("tables") or {}
+        ids = {r.get("id") for r in tables.get("jobs") or [] if (r.get("output_min_seq") or 0) > 1}
+        ids |= {r.get("job_id") for r in tables.get("job_output") or []}
+        gone = {d.get("id") for d in data.get("deleted") or [] if d.get("table") == "jobs"}
+        ids.discard(None)
+        gone.discard(None)
+        if ids or gone:
+            self.store.cleanup_chunks(ids, gone)
 
     def _record_peer_observations(self) -> None:
         """Leader writes what it observed (version/role/last_ok) into the replicated peers table."""
@@ -402,10 +432,14 @@ class Cluster:
     def forward(self, method: str, path_qs: str, headers: dict, body: bytes, client_host: Optional[str]
                 ) -> Optional[httpx.Response]:
         """Reverse-proxy one request to the leader. None if there is no reachable leader."""
-        out = {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
+        out = {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in PROXY_HEADERS}
         xff = headers.get("x-forwarded-for")
         out["X-Forwarded-For"] = f"{xff}, {client_host}" if xff and client_host else (client_host or xff or "")
         out["X-Forge-Via"] = self.id
+        # S-R2: proves to the leader that this hop (and so the LAST X-Forwarded-For entry) is a peer hub; a client
+        # cannot set it (any copy it sent is dropped above). The leader's rate limits key on that entry.
+        if self.cfg.get("cluster_token"):
+            out["X-Forge-Proxy"] = str(self.cfg["cluster_token"])
         for url in self.leader_urls():
             try:
                 return self.client().request(method, url.rstrip("/") + path_qs, headers=out, content=body,

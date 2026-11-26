@@ -7,7 +7,10 @@
 #   { name, when_tool, start, env, health }  GET health (2xx = ok); unhealthy -> start hidden with env.
 #                                            when_tool: only if that tool was found; "<tool.exe>" in start is
 #                                            replaced by the resolved tool path.
-# Reported as metrics.services: [{name, ok, since}] (since = epoch seconds of the last ok/not-ok change).
+# Reported as metrics.services: [{name, ok, since, state}] (since = epoch seconds of the last ok/not-ok change).
+# 2.3 F6c: state = ok | starting (within starting_grace_s, default 60, of a (re)start) | down; ok = (state -eq 'ok').
+# 2.3 F6b: the ollama service gets OLLAMA_MODELS = <work_root>\ollama\models (agent-config ollama_models_dir wins)
+#          when work_root is not on the system drive and OLLAMA_MODELS is not already set for the machine or user.
 
 function Get-DefaultForgeServices {
     @(
@@ -24,11 +27,28 @@ function ConvertTo-ForgeServiceDef($S) {
     $e = & $get 'env'
     if ($e -is [System.Collections.IDictionary]) { foreach ($k in $e.Keys) { $env[[string]$k] = [string]$e[$k] } }
     elseif ($e) { foreach ($p in $e.PSObject.Properties) { $env[$p.Name] = [string]$p.Value } }
+    $grace = 60; $g = & $get 'starting_grace_s'; if ($null -ne $g -and "$g" -match '^\d+$') { $grace = [int]$g }
     @{ name = $name; check = [string](& $get 'check'); when_tool = [string](& $get 'when_tool'); start = [string](& $get 'start')
-       health = [string](& $get 'health'); env = $env }
+       health = [string](& $get 'health'); env = $env; starting_grace_s = $grace }
 }
 
-function Get-ForgeServices($Config) {
+# F6b: models folder for the ollama service, or $null (leave ollama's default). -Existing = an OLLAMA_MODELS value
+# already set machine-wide / for the user (then we never override it).
+function Get-OllamaModelsDir {
+    param($Config, [string]$WorkRoot, [string]$Existing = $null, [string]$SystemDrive = $env:SystemDrive)
+    if ($PSBoundParameters.ContainsKey('Existing') -eq $false) {
+        $Existing = [Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'Machine')
+        if (-not $Existing) { $Existing = [Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'User') }
+    }
+    if ($Existing) { return $null }
+    if ($Config -and $Config.PSObject.Properties['ollama_models_dir'] -and $Config.ollama_models_dir) { return [string]$Config.ollama_models_dir }
+    if (-not $WorkRoot) { return $null }
+    $drive = [IO.Path]::GetPathRoot($WorkRoot).TrimEnd('\')
+    if (-not $drive -or $drive -ieq "$SystemDrive".TrimEnd('\')) { return $null }
+    $WorkRoot.TrimEnd('\') + '\ollama\models'      # (Join-Path fails on drives that do not exist here)
+}
+
+function Get-ForgeServices($Config, [string]$WorkRoot = $null) {
     $raw = $null
     if ($Config -and $Config.PSObject.Properties['services'] -and $null -ne $Config.services) { $raw = @($Config.services) } else { $raw = Get-DefaultForgeServices }
     $out = New-Object System.Collections.Generic.List[object]
@@ -36,6 +56,10 @@ function Get-ForgeServices($Config) {
         $d = ConvertTo-ForgeServiceDef $s
         if (-not $d) { continue }
         if ($d.name -eq 't3' -and $Config -and $Config.PSObject.Properties['t3_autostart'] -and $Config.t3_autostart -eq $false) { continue }
+        if ($d.name -eq 'ollama' -and $d.start -and -not $d.env.ContainsKey('OLLAMA_MODELS')) {
+            $md = Get-OllamaModelsDir -Config $Config -WorkRoot $WorkRoot
+            if ($md) { $d.env['OLLAMA_MODELS'] = $md }
+        }
         $out.Add($d)
     }
     , $out.ToArray()
@@ -80,8 +104,23 @@ function Update-ServiceStatus([hashtable]$Table, [string]$Name, [bool]$Ok, [doub
     $true
 }
 
-function Get-ServiceMetrics([hashtable]$Table) {
-    , @($Table.Keys | Sort-Object | ForEach-Object { [ordered]@{ name = $_; ok = [bool]$Table[$_].ok; since = $Table[$_].since } })
+# F6c: 'ok' | 'starting' (not ok yet, within its grace after a start) | 'down'
+function Get-ServiceState([bool]$Ok, [double]$LastStart = 0, [double]$Now = 0, [int]$Grace = 60) {
+    if ($Ok) { return 'ok' }
+    if ($LastStart -gt 0 -and ($Now - $LastStart) -lt $Grace) { return 'starting' }
+    'down'
+}
+
+# -Runtime: name -> @{ last_start; grace } (the agent's $script:SvcRuntime); -Now: epoch seconds.
+function Get-ServiceMetrics([hashtable]$Table, [hashtable]$Runtime = $null, [double]$Now = 0) {
+    if ($null -eq $Runtime) { $Runtime = $script:SvcRuntime }
+    if ($null -eq $Runtime) { $Runtime = @{} }
+    if ($Now -le 0) { $Now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 }
+    , @($Table.Keys | Sort-Object | ForEach-Object {
+        $rt = $Runtime[$_]; $ls = 0.0; $gr = 60
+        if ($rt) { if ($rt.last_start) { $ls = [double]$rt.last_start }; if ($rt.grace) { $gr = [int]$rt.grace } }
+        $st = Get-ServiceState -Ok ([bool]$Table[$_].ok) -LastStart $ls -Now $Now -Grace $gr
+        [ordered]@{ name = $_; ok = ($st -eq 'ok'); since = $Table[$_].since; state = $st } })
 }
 
 function Test-ServiceHealth([string]$Url, [int]$TimeoutSec = 3) {
@@ -91,6 +130,9 @@ function Test-ServiceHealth([string]$Url, [int]$TimeoutSec = 3) {
 
 # Start hidden with extra environment variables (PS 5.1 Start-Process has no -Environment: set, start, restore).
 function Start-ForgeServiceProcess([string]$Exe, [string]$Arguments, [hashtable]$Env = @{}) {
+    if ($Env['OLLAMA_MODELS'] -and -not (Test-Path -LiteralPath $Env['OLLAMA_MODELS'])) {
+        try { New-Item -ItemType Directory -Force $Env['OLLAMA_MODELS'] | Out-Null } catch {}
+    }
     $saved = @{}
     foreach ($k in $Env.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process'); [Environment]::SetEnvironmentVariable($k, $Env[$k], 'Process') }
     try {

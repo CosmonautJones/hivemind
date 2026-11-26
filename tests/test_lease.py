@@ -54,6 +54,8 @@ def test_decide_fleet_bad_and_unknown_peer():
 @pytest.fixture
 def fleet(tmp_path):
     f = Fleet(tmp_path)
+    for h in f.hubs.values():           # the rollout target below is 2.3.0: start every hub on 2.2.0 whatever VERSION says
+        h.state.releases.running_version = "2.2.0"
     f.converge(6)
     return f
 
@@ -210,3 +212,23 @@ def test_lease_survives_leader_failover(fleet):
     assert fleet.leaders() == ["b"]
     r = ask(fleet, "b", "b")
     assert r["granted"] is False and r["holder"] == "c"                   # b inherited the replicated lease
+
+
+def test_lease_is_kept_through_a_25_minute_drain_when_the_watchdog_renews_it(fleet):
+    """R-05: the holder's agent drains for 25 min (> LEASE_TTL); the watchdog re-POSTs for the same node + version
+    each minute while its probation is pending, so the lease never expires and the next node keeps waiting."""
+    assert ask(fleet, "a", "c")["granted"] is True
+    run_version(fleet, "c", "2.3.0")                     # hub flipped; its agent still drains its jobs on 2.2.0
+    granted = fleet.hubs["a"].state.store.q("SELECT granted FROM leases")[0]["granted"]
+    for minute in range(25):
+        for _ in range(6):
+            agent_on(fleet, "c", "2.2.0")
+            fleet.round(10)
+        assert ask(fleet, "b", "c")["granted"] is True, f"renewal at minute {minute}"
+        r = ask(fleet, "a", "b")
+        assert r["granted"] is False and r["holder"] == "c", f"minute {minute}: {r}"
+    st = fleet.hubs["a"].state.store
+    assert st.q("SELECT granted FROM leases")[0]["granted"] == granted, "a renewal keeps the original grant time"
+    rounds(fleet, 8, agents=[("c", "2.3.0")])           # agent restarted on 2.3.0: released after 60 s healthy
+    assert fleet.hubs["a"].state.lease.view() is None
+    assert ask(fleet, "a", "b")["granted"] is True

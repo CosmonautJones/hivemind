@@ -57,6 +57,53 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE TABLE IF NOT EXISTS tombstones (tbl TEXT, id TEXT, updated REAL, PRIMARY KEY(tbl, id));
 """
 
+# ---- Phase 3 (2.3.0) tables: CONTRACT-phase3.md §3. One block per workstream; each team edits ONLY its own block. ----
+SCHEMA_P3 = """
+-- [S] security (all replicated)
+CREATE TABLE IF NOT EXISTS ui_sessions (
+  id TEXT PRIMARY KEY, label TEXT, created REAL, last_seen REAL, expires REAL, revoked INTEGER DEFAULT 0,
+  stepup_until REAL, user_agent TEXT, ip TEXT, updated REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS enroll_codes (
+  id TEXT PRIMARY KEY, kind TEXT, label TEXT, created REAL, expires REAL, used REAL, used_by TEXT, created_by TEXT,
+  updated REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS secrets (
+  name TEXT PRIMARY KEY, value TEXT, prev_value TEXT, rotated REAL, updated REAL DEFAULT 0);
+-- [R] reliability
+CREATE TABLE IF NOT EXISTS job_output (
+  id TEXT PRIMARY KEY, job_id TEXT, seq INTEGER, ts REAL, text TEXT, updated REAL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_job_output ON job_output(job_id, seq);
+CREATE INDEX IF NOT EXISTS ix_job_output_updated ON job_output(updated);
+CREATE TABLE IF NOT EXISTS presence (
+  node_id TEXT PRIMARY KEY, last_seen REAL, addr TEXT, metrics TEXT DEFAULT '{}', procs TEXT DEFAULT '[]',
+  agents TEXT DEFAULT '[]', capacity INTEGER DEFAULT 0, sys_last_seen REAL, sys_capacity INTEGER, sys_version TEXT);
+CREATE TABLE IF NOT EXISTS healthz_probe (id INTEGER PRIMARY KEY, ts REAL);
+CREATE TABLE IF NOT EXISTS retirements (
+  node_id TEXT PRIMARY KEY, state TEXT, started REAL, finished REAL, job_id TEXT, rotate INTEGER DEFAULT 0,
+  error TEXT, requested_by TEXT, prev_drain INTEGER DEFAULT 0, updated REAL DEFAULT 0);
+-- [N] notifications
+CREATE TABLE IF NOT EXISTS alerts (
+  id TEXT PRIMARY KEY, key TEXT, kind TEXT, node_id TEXT, level TEXT, msg TEXT, opened REAL, resolved REAL,
+  resolved_by TEXT, self_healing INTEGER DEFAULT 0, last_notified REAL, notify_count INTEGER DEFAULT 0,
+  data TEXT DEFAULT '{}', updated REAL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_alerts_key ON alerts(key, resolved);
+CREATE TABLE IF NOT EXISTS push_subs (
+  id TEXT PRIMARY KEY, endpoint TEXT, p256dh TEXT, auth TEXT, session_id TEXT, label TEXT, created REAL,
+  last_ok REAL, fails INTEGER DEFAULT 0, updated REAL DEFAULT 0);
+-- [shared, lead-owned] hub-wide preferences, namespaced keys: notify.* (N), upkeep.* (F), ui.* (U), security.* (S)
+CREATE TABLE IF NOT EXISTS prefs (key TEXT PRIMARY KEY, value TEXT, updated REAL DEFAULT 0);
+-- [F] first run + upkeep
+CREATE TABLE IF NOT EXISTS maintenance_runs (
+  id TEXT PRIMARY KEY, action TEXT, args TEXT DEFAULT '{}', targets TEXT DEFAULT '[]', idx INTEGER DEFAULT 0,
+  status TEXT, current_job TEXT, results TEXT DEFAULT '[]', source TEXT, created REAL, started REAL, finished REAL,
+  stop_on_failure INTEGER DEFAULT 1, created_by TEXT, updated REAL DEFAULT 0);
+"""
+
+# ---- Phase 4 (2.4.0): chat conversations with image attachments (hub/forge_chat.py) ----
+SCHEMA_P4 = """
+CREATE TABLE IF NOT EXISTS uploads (
+  id TEXT PRIMARY KEY, mime TEXT, name TEXT, size INTEGER, sha256 TEXT, data TEXT, created REAL, updated REAL DEFAULT 0);
+"""
+
 # columns added after 2.0 (ALTER TABLE on existing databases; replication tolerates either side lacking them)
 MIGRATIONS = (
     ("nodes", "sys_last_seen", "REAL"), ("nodes", "sys_capacity", "INTEGER DEFAULT 0"), ("nodes", "sys_version", "TEXT"),
@@ -67,13 +114,41 @@ MIGRATIONS = (
     # 2.2.1: who holds a dispatch (stale-update fencing), job kind (code|text), canary flag for the rollout lease
     ("jobs", "dispatched_to", "TEXT"), ("jobs", "kind", "TEXT"), ("settings", "canary", "INTEGER DEFAULT 0"),
     ("jobs", "prev_holder", "TEXT"), ("jobs", "requeued_at", "REAL"),
+    # ---- 2.3 (CONTRACT-phase3.md §3.2); one line per workstream ----
+    ("jobs", "output_seq", "INTEGER DEFAULT 0"), ("jobs", "output_len", "INTEGER DEFAULT 0"),            # [R] R4
+    ("jobs", "output_min_seq", "INTEGER DEFAULT 0"), ("settings", "drain", "INTEGER DEFAULT 0"),         # [R] R4, R6
+    ("retirements", "prev_drain", "INTEGER DEFAULT 0"),                                                  # [R] R6
+    ("jobs", "notify", "INTEGER DEFAULT 0"),                                                             # [N] N2
+    ("jobs", "run_id", "TEXT"), ("projects", "sync_nodes", "TEXT"),                                      # [F] F2, F3
+    ("settings", "wu_window", "TEXT"), ("settings", "wu_last", "TEXT"),                                  # [F] F4
+    # ---- 2.4: chat (forge_chat.py): conversation thread, image attachments, hub-assigned CLI session ----
+    ("jobs", "thread_id", "TEXT"), ("jobs", "attachments", "TEXT"), ("jobs", "session", "TEXT"),
+    ("jobs", "scratch_of", "TEXT"), ("jobs", "chat_text", "TEXT"),
 )
 
 # replicated table -> primary key column
 REPLICATED = {"peers": "id", "nodes": "id", "jobs": "id", "events": "id", "settings": "node_id",
               # 2.2 (transcripts and watchers are ephemeral: in memory on the leader, never replicated)
               "projects": "id", "project_alias": "id", "sessions": "id", "repos": "id", "briefs": "id",
-              "cooldowns": "engine", "bad_versions": "version", "leases": "id"}
+              "cooldowns": "engine", "bad_versions": "version", "leases": "id",
+              # 2.3 (presence and healthz_probe are local only, never replicated)
+              "ui_sessions": "id", "enroll_codes": "id", "secrets": "name",                          # [S]
+              "job_output": "id", "retirements": "node_id",                                         # [R]
+              "alerts": "id", "push_subs": "id",                                                    # [N]
+              "prefs": "key", "maintenance_runs": "id",                                              # [shared] [F]
+              "uploads": "id"}                                                                      # 2.4 chat
+
+
+def _nodes_live_sql() -> str:
+    """[R] R4: the `nodes_live` view (see Store.ensure_views)."""
+    fresh = "p.last_seen IS NOT NULL AND p.last_seen >= COALESCE(n.last_seen, 0)"
+    sfresh = "p.sys_last_seen IS NOT NULL AND p.sys_last_seen >= COALESCE(n.sys_last_seen, 0)"
+    cols = [f"CASE WHEN {fresh} THEN p.{c} ELSE n.{c} END AS {c}"
+            for c in ("last_seen", "addr", "metrics", "procs", "agents", "capacity")]
+    cols += [f"CASE WHEN {sfresh} THEN p.{c} ELSE n.{c} END AS {c}" for c in ("sys_last_seen", "sys_capacity", "sys_version")]
+    return ("DROP VIEW IF EXISTS nodes_live; " "CREATE VIEW nodes_live AS SELECT n.id AS id, n.created AS created, "
+            "n.online AS online, n.info AS info, n.updated AS updated, " + ", ".join(cols)
+            + " FROM nodes n LEFT JOIN presence p ON p.node_id = n.id;")
 
 
 def new_id(clock: Clock = time.time) -> str:
@@ -96,9 +171,12 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        self.db.executescript(SCHEMA_P3)
+        self.db.executescript(SCHEMA_P4)
         self.lock = threading.RLock()
         self._cols: dict[str, list[str]] = {}
         self._migrate()
+        self.ensure_views()                      # [R] R4 nodes_live (after the migrations: it names migrated columns)
 
     def _migrate(self) -> None:
         for table, col, decl in MIGRATIONS:
@@ -219,3 +297,115 @@ class Store:
                 u = max(u, restamp)
             self.x(f"DELETE FROM {t} WHERE {REPLICATED[t]}=?", (k,))
             self.x("INSERT OR REPLACE INTO tombstones(tbl,id,updated) VALUES(?,?,?)", (t, k, u))
+
+    # ---- [R] reliability helpers (CONTRACT-phase3.md §1.2: R may add helpers at the end of Store) ----
+    # R4 presence: `nodes_live` = the replicated `nodes` row with the local, unreplicated `presence` row laid over it
+    # whenever presence is at least as fresh (agents report to the leader every few seconds; `nodes` itself is only
+    # rewritten every 60 s). Every reader of last_seen / metrics / procs / agents / capacity / addr / sys_* uses it.
+    def ensure_views(self) -> None:
+        with self.lock:
+            self.db.executescript(_nodes_live_sql())
+
+    # R4 job output: append-only chunk rows `<job_id>:<seq 8 digits>` (<= CHUNK_MAX chars each). Chunks before
+    # jobs.output_min_seq are trimmed (deleted locally on every hub) once the kept text passes OUTPUT_KEEP chars.
+    CHUNK_MAX = 64_000
+    OUTPUT_KEEP = 256_000
+
+    def append_chunk(self, job_id: str, text: str, now: float) -> int:
+        """Append `text` to a job's output as new chunk rows; returns the last seq (0 = nothing appended). The first
+        append of a job that still has a legacy jobs.output (written by a 2.2 leader, or by the hub at insert) seeds
+        chunk 1 with it, so the reader rule "chunks if any, else jobs.output" never drops text. Callers serialize
+        appends per job (p2.sched_lock)."""
+        if not text:
+            return 0
+        with self.lock:
+            r = self.db.execute("SELECT output, output_seq, output_len, output_min_seq FROM jobs WHERE id=?",
+                                (job_id,)).fetchone()
+            if r is None:
+                return 0
+            seq, total, min_seq = r["output_seq"] or 0, r["output_len"] or 0, r["output_min_seq"] or 0
+            # after a failover the replicated jobs row can lag its job_output rows: never reuse a seq that exists
+            top = self.db.execute("SELECT COALESCE(MAX(seq),0) m FROM job_output WHERE job_id=?", (job_id,)).fetchone()["m"]
+            seeded = top > 0
+            seq = max(seq, top)
+            parts = []
+            if seq == 0 and not seeded and r["output"]:
+                parts.append(r["output"])
+            parts += [text[i:i + self.CHUNK_MAX] for i in range(0, len(text), self.CHUNK_MAX)]
+            self.db.execute("BEGIN")
+            try:
+                for part in parts:
+                    seq += 1
+                    total += len(part)
+                    self.db.execute("INSERT OR REPLACE INTO job_output(id,job_id,seq,ts,text,updated) VALUES(?,?,?,?,?,?)",
+                                    (f"{job_id}:{seq:08d}", job_id, seq, now, part, now))
+                min_seq = max(min_seq, 1)
+                keep = self._trim_point(job_id, min_seq, seq)
+                if keep > min_seq:
+                    self.db.execute("DELETE FROM job_output WHERE job_id=? AND seq<?", (job_id, keep))
+                    min_seq = keep
+                self.db.execute(f"UPDATE jobs SET output_seq=?, output_len=?, output_min_seq=?, {self.STAMP} WHERE id=?",
+                                (seq, total, min_seq, now, job_id))
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+            self.db.execute("COMMIT")
+            return seq
+
+    def _trim_point(self, job_id: str, min_seq: int, last: int) -> int:
+        """First seq to keep so that the kept chunks hold at most OUTPUT_KEEP chars (the newest chunk always stays)."""
+        rows = self.db.execute("SELECT seq, LENGTH(text) n FROM job_output WHERE job_id=? AND seq>=? ORDER BY seq DESC",
+                               (job_id, min_seq)).fetchall()
+        kept, first = 0, last
+        for row in rows:
+            if row["seq"] != last and kept + (row["n"] or 0) > self.OUTPUT_KEEP:
+                break
+            kept += row["n"] or 0
+            first = row["seq"]
+        return max(first, min_seq)
+
+    def job_chunks(self, job_id: str, since_seq: int = 0, limit: int = 10_000) -> list:
+        return [dict(r) for r in self.q("SELECT seq, ts, text FROM job_output WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?",
+                                        (job_id, since_seq, limit))]
+
+    def job_output_text(self, job_id: str, legacy: Optional[str] = None) -> str:
+        """Reader rule (mixed fleet): the chunks if any exist for the job, else jobs.output. Trimmed output starts
+        with "[...truncated...]" (as in 2.2)."""
+        rows = self.q("SELECT seq, text FROM job_output WHERE job_id=? ORDER BY seq", (job_id,))
+        if not rows:
+            if legacy is None:
+                r = self.q("SELECT output FROM jobs WHERE id=?", (job_id,))
+                legacy = (r[0]["output"] if r else "") or ""
+            return legacy
+        out = "".join(r["text"] or "" for r in rows)
+        return ("[...truncated...]\n" + out) if rows[0]["seq"] > 1 else out
+
+    def job_output_tail(self, job_id: str, n: int = 400, legacy: Optional[str] = None) -> str:
+        rows = self.q("SELECT text FROM job_output WHERE job_id=? ORDER BY seq DESC LIMIT 2", (job_id,))
+        if not rows:
+            return (legacy if legacy is not None else self.job_output_text(job_id))[-n:]
+        return "".join(r["text"] or "" for r in reversed(rows))[-n:]
+
+    def delete_job_cascade(self, job_id: str) -> None:
+        """Delete a job (with a tombstone) and its chunk rows. Standbys drop the chunks when they apply the tombstone."""
+        self.delete_row("jobs", job_id)
+        self.x("DELETE FROM job_output WHERE job_id=?", (job_id,))
+
+    def cleanup_chunks(self, job_ids: set, deleted_jobs: set) -> int:
+        """Standby side of trimming / retention, after a sync page: drop the chunks of deleted jobs, chunks below their
+        job's output_min_seq, and chunks whose job was deleted (tombstoned) before they arrived. Returns rows deleted."""
+        n = 0
+        for jid in deleted_jobs:
+            n += self.xc("DELETE FROM job_output WHERE job_id=?", (jid,))
+        for jid in set(job_ids) - set(deleted_jobs):
+            r = self.q("SELECT output_min_seq FROM jobs WHERE id=?", (jid,))
+            if r:
+                n += self.xc("DELETE FROM job_output WHERE job_id=? AND seq<?", (jid, r[0]["output_min_seq"] or 0))
+            elif self.q("SELECT 1 FROM tombstones WHERE tbl='jobs' AND id=?", (jid,)):
+                n += self.xc("DELETE FROM job_output WHERE job_id=?", (jid,))
+        return n
+
+    def db_path(self) -> Optional[Path]:
+        r = self.q("PRAGMA database_list")
+        f = next((x["file"] for x in r if x["name"] == "main"), None)
+        return Path(f) if f else None

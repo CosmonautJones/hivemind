@@ -7,7 +7,7 @@
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\dry-run.ps1 [-Scratch <dir>] [-Port 19052]
 param([string]$Scratch = (Join-Path ([IO.Path]::GetTempPath()) "forge-dryrun-$([guid]::NewGuid().ToString('n').Substring(0,8))"), [int]$Port = 19052)
 $ErrorActionPreference = 'Stop'
-if ($Port -lt 19000 -or $Port -gt 19099) { throw 'test servers use ports 19000-19099 only (never the live 8787)' }
+if ($Port -lt 19000 -or $Port -gt 19299) { throw 'test servers use ports 19000-19299 only (never the live 8787; Phase 3 team ranges: CONTRACT-phase3 9)' }
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 New-Item -ItemType Directory -Force $Scratch | Out-Null
 . (Join-Path $Repo 'tools\build-bundle.ps1') -NoRun
@@ -20,6 +20,28 @@ $fxPath = Join-Path $Scratch 'bootstrap.json'
 [IO.File]::WriteAllText($fxPath, (ConvertTo-Json -InputObject $fx -Depth 6), (New-Object Text.UTF8Encoding($false)))
 & (Join-Path $Repo 'agent\install.ps1') -DryRun -Hub 'http://forge-01.example.ts.net:8787' -Token 'agent-FAKE-test-token' `
     -ForgeHome (Join-Path $Scratch 'Forge-install') -BootstrapFile $fxPath -BundleFile $b.path
+
+Write-Host "`n########## installer -NewFleet dry run (2.3 F1) ##########" -ForegroundColor Magenta
+$nfHome = Join-Path $Scratch 'Forge-newfleet'
+$nfArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'agent\install.ps1'), '-NewFleet', '-DryRun', '-NoBrowser',
+            '-ForgeHome', $nfHome, '-BundleFile', $b.path)
+$nfOut = (& powershell.exe @($nfArgs + @('-AdminPin', '123456')) 2>&1 | Out-String)
+Write-Host $nfOut
+$nfPrompt = (& powershell.exe @nfArgs 2>&1 | Out-String)      # no -AdminPin: the dry run must not prompt
+$script:NewFleetChecks = [ordered]@{
+    'new fleet: tokens generated, no peers, local bundle'  = ($nfOut -match 'generated agent_token \+ cluster_token' -and $nfOut -match "first hub of a new fleet \(no peers\), bundle $([regex]::Escape($b.version))")
+    'new fleet: signing key step'                          = ($nfOut -match 'New-ForgeSigningKey' -or $nfOut -match 'signing key: reusing')
+    'new fleet: admin PIN accepted (-AdminPin)'           = ($nfOut -match 'admin PIN (set|accepted)')
+    'new fleet: no PIN prompt in a dry run without -AdminPin' = ($nfPrompt -match '\[dry-run\] prompt for a 6-digit admin PIN')
+    'new fleet: first-run claim + claim URL'               = ($nfOut -match 'firstrun-claim\.json' -and $nfOut -match '\[dry-run\] open http://localhost:8787/\?claim=[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}')
+    'new fleet: joins through the local hub'               = ($nfOut -match '\[dry-run\] join \S+ via local hub')
+    'new fleet: nothing written'                           = (-not (Test-Path -LiteralPath $nfHome))
+    # with S's Set-ForgeDataAcl (2.3) the root steps stay icacls (3) and data\ + data\private\ + bin\ come from one
+    # Set-ForgeDataAcl step; without it the 2.2-style plan prints 5 icacls steps
+    'new fleet: ACL steps printed one per line'            = $(if ($nfOut -match '\[dry-run\] Set-ForgeDataAcl: ') { [regex]::Matches($nfOut, '\[dry-run\] icacls ').Count -eq 3 -and $nfOut -match 'Set-ForgeDataAcl: [^;]+\\data \[' } else { [regex]::Matches($nfOut, '\[dry-run\] icacls ').Count -eq 5 })
+    'new fleet: data\private secured before secrets/claim' = ($nfOut.IndexOf('[dry-run] secure ') -ge 0 -and $nfOut.IndexOf('[dry-run] secure ') -lt $nfOut.IndexOf('firstrun-claim.json'))
+    'new fleet: no exception'                              = ($nfOut -notmatch 'FAILED|Exception|error' -and $nfPrompt -notmatch 'FAILED|Exception')
+}
 
 Write-Host "`n########## watchdog dry run ##########" -ForegroundColor Magenta
 $fh = Join-Path $Scratch 'Forge-wd'
@@ -48,7 +70,9 @@ try {
         'watchdog picks 8.0.0, never the fleet-bad 9.9.9'  = ($wdOut -match [regex]::Escape("update $($b.version) -> $peerVer from atlas") -and $wdOut -notmatch '-> 9\.9\.9')
         'update lease requested from the leader first'     = ($wdOut -match [regex]::Escape("[dry-run] request update lease for $peerVer from $leader"))
         'activation still flips current after the lease'   = ($wdOut -match [regex]::Escape("[dry-run] switch current -> releases\$peerVer"))
-        'old job dirs pruned (1: fresh + running kept)'    = ($wdOut -match [regex]::Escape("[dry-run] remove 1 job dir(s) older than 14 days under $wrk\jobs") -and (Test-Path (Join-Path $wrk 'jobs\old-job')))
+        '2.3: frozen launcher + agent loop go to <FH>\bin' = ($wdOut -match [regex]::Escape('[dry-run] install bin\wd-launcher.ps1') -and $wdOut -match [regex]::Escape('[dry-run] install bin\agent-loop.cmd') -and -not (Test-Path (Join-Path $fh 'bin')))
+        '2.3: live tasks of another ForgeHome never migrated' = ($wdOut -notmatch 'migrate Forge')
+        'old job dirs pruned (1: fresh + running kept)'    =($wdOut -match [regex]::Escape("[dry-run] remove 1 job dir(s) older than 14 days under $wrk\jobs") -and (Test-Path (Join-Path $wrk 'jobs\old-job')))
     }
     & {
         . (Join-Path $Repo 'watchdog\watchdog.ps1') -NoRun
@@ -63,6 +87,7 @@ try {
         $checks['fleet-bad report (POST /cluster/bad-version)'] = (Send-BadVersion $leader 'c' 'grant-node' '2.0.1')
         $checks['fleet-bad report fails cleanly on a pre-2.2 hub'] = (-not (Send-BadVersion $fakeBase 'c' 'n' '2.0.1'))
     }
+    foreach ($k in $script:NewFleetChecks.Keys) { $checks[$k] = $script:NewFleetChecks[$k] }
     $fail = 0
     foreach ($k in $checks.Keys) { if ($checks[$k]) { Write-Host "  ok   $k" -ForegroundColor Green } else { $fail++; Write-Host "  FAIL $k" -ForegroundColor Red } }
     Write-Host "$($checks.Count - $fail) passed, $fail failed"

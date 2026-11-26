@@ -9,16 +9,19 @@ from fastapi.testclient import TestClient
 from app import create_app
 from cluster_net import TOKENS, FakeClock
 from forge_actions import ActionError, find_action, load_catalog, validate_args
+from forge_security import hash_pin
 from forge_store import Store
 
-UI = {"Authorization": f"Bearer {TOKENS['ui_token']}"}
+# 2.3 S7: admin / destructive jobs need the admin PIN; Bearer clients send it as X-Admin-Pin
+PIN_HASH = hash_pin("123456", iterations=1000)
+UI = {"Authorization": f"Bearer {TOKENS['ui_token']}", "X-Admin-Pin": "123456"}
 AGENT = {"X-Agent-Token": TOKENS["agent_token"]}
 
 
 def make_hub(tmp_path, **cfg_extra):
     data = tmp_path / "data"
     data.mkdir(exist_ok=True)
-    (data / "config.json").write_text(json.dumps(TOKENS | {"node_id": "hub1"} | cfg_extra), encoding="utf-8")
+    (data / "config.json").write_text(json.dumps(TOKENS | {"node_id": "hub1", "admin_pin_hash": PIN_HASH} | cfg_extra), encoding="utf-8")
     clock = FakeClock()
     app = create_app(data, start_monitor=False, clock=clock, releases_dir=tmp_path / "releases")
     return TestClient(app), app, clock
@@ -125,12 +128,17 @@ def test_catalog_shape_destructive_flags_and_unique_names():
     names = [a["name"] for a in CAT["actions"]]
     assert len(names) == len(set(names))
     assert set(names) == {"winget_install", "winget_upgrade", "npm_global_install", "restart_task", "restart_service",
-                          "reboot", "ensure_task"}
+                          "reboot", "ensure_task",
+                          # 2.3 workstream F (F2-F4, R6 forge_uninstall)
+                          "update_claude", "update_codex", "update_t3", "update_ollama", "git_sync", "ollama_pull",
+                          "windows_update", "free_disk", "forge_uninstall"}
     assert find_action(CAT, "reboot")["destructive"] is True
+    assert find_action(CAT, "forge_uninstall")["destructive"] is True
     assert find_action(CAT, "winget_install")["destructive"] is False
     for a in CAT["actions"]:
+        assert a.get("lane") in ("system", "user")
         for rule in a["args"].values():
-            assert rule["type"] in ("string", "int") and isinstance(rule.get("required", False), bool)
+            assert rule["type"] in ("string", "int", "bool") and isinstance(rule.get("required", False), bool)
 
 
 # ---------------------------------------------------------------- job creation

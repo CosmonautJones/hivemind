@@ -1,24 +1,38 @@
-"""Mock hub for UI development. Serves hub/static/index.html + canned JSON shaped like the p2-hub (2.2.0) responses.
+"""Mock hub for UI development. Serves hub/static (index.html, sw.js, icons) + canned JSON shaped like the 2.3 hub
+(CONTRACT-phase3.md), so the UI can be built and browser-tested without a fleet.
 
-Run: python tools/mock_ui_server.py   (port MOCK_UI_PORT, default 19080; must be 19000-19099; never touches the live hub on 8787)
-Toggles: POST /mock/503 and /mock/ok switch a "no leader" state; POST /mock/reset-transcript simulates a hub restart
-(transcript seq numbers start again at 1, so the UI must notice the cursor going down). MOCK_DEMO=1 drops edge-case fixtures.
+Run: python tools/mock_ui_server.py   (port MOCK_UI_PORT, default 19210; must be 19210-19249 = workstream U's test range;
+never touches the live hub on 8787)
+Toggles (POST): /mock/503 and /mock/ok switch a "no leader" state; /mock/reset-transcript simulates a hub restart
+(transcript seq numbers start again at 1); /mock/empty and /mock/full switch to a brand-new fleet (first run) and back;
+/mock/nopin forgets the admin PIN (step-up answers "setup"); /mock/v22 makes the 2.3 endpoints answer 404 like a 2.2 leader
+(and /mock/v23 undoes it). MOCK_DEMO=1 drops edge-case fixtures. The mock admin PIN is 123456.
 """
+import hashlib
 import json
 import os
+import re
+import secrets
+import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PORT = int(os.environ.get("MOCK_UI_PORT", "19080"))
-assert 19000 <= PORT <= 19099, "MOCK_UI_PORT must be in the test range 19000-19099"
-INDEX = Path(__file__).resolve().parent.parent / "hub" / "static" / "index.html"
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "hub"))
+import forge_ui as fu  # noqa: E402  (pure helpers: fuzzy matching, Today buckets, alert actions; no FastAPI needed)
+
+PORT = int(os.environ.get("MOCK_UI_PORT", "19210"))
+assert 19210 <= PORT <= 19249, "MOCK_UI_PORT must be in workstream U's test range 19210-19249"
+STATIC = ROOT / "hub" / "static"
+INDEX = STATIC / "index.html"
 T0 = time.time()
 LOCK = threading.Lock()
 STATE = {"no_leader": False, "extra_jobs": [], "cancelled": set(), "priorities": {"forge-01": 1, "forge-02": 2, "forge-03": 3},
-         "tx_reset_at": None}
-OVERRIDES = {}   # project id -> {brief, name, pinned, group_name}: survives build_projects()
+         "tx_reset_at": None, "empty": False, "v22": False}
+OVERRIDES = {}   # project id -> {brief, name, pinned, group_name, sync_nodes}: survives build_projects()
 PROJECT_FIELDS = ("name", "pinned", "group_name")
 
 STREAM = [
@@ -54,7 +68,10 @@ def node(id_, host, online, cpu, mem, disk, ver, gpu=False, role_agents=(), addr
                     "uptime_s": 86400 * 3 if online else None,
                     "battery": None, "procs_total": 212, "work_root": "D:\\forge", "work_root_free_gb": 1400,
                     "watchdog": {"last_run": now - 120, "actions": ["none needed"] if id_ != "forge-03" else ["restarted agent"]},
-                    **({"services": [{"name": "t3", "ok": True, "since": now - 7200}, {"name": "ollama", "ok": id_ == "forge-01", "since": now - 3000}]} if id_ in ("forge-01", "forge-02") else {})} if online else {},
+                    "job_token": "filtered" if id_ != "forge-03" else "full",
+                    **({"services": [{"name": "t3", "ok": True, "state": "ok", "since": now - 7200},
+                                     {"name": "ollama", "ok": id_ == "forge-01", "state": "ok" if id_ == "forge-01" else "starting", "since": now - 30}]}
+                       if id_ in ("forge-01", "forge-02") else {})} if online else {},
         "disk_pct": disk, "agents": [{"kind": k, "pid": 1000 + i, "started": None, "cmd": k + " --run", "job": None} for i, k in enumerate(role_agents)],
         "active_jobs": 1 if id_ == "forge-02" else 0, "capacity": 2, "spark": spark(cpu) if online else [],
         "system_lane": {"online": online and id_ != "forge-03", "last_seen": now - 5 if online else None, "capacity": 1, "version": ver},
@@ -97,6 +114,9 @@ def state():
         node("forge-03", "forge-03", True, 9, 30, 55, "1.9.0"),
         node("forge-04", "closet-laptop", False, 0, 0, 60, "2.0.1"),
     ]
+    jn = joined_node()
+    if jn:
+        nodes.append(jn)
     jobs = [j for j in all_jobs() if j.get("source") != "brief"]     # the hub hides brief jobs from /api/state
     events = [
         {"id": "e1", "ts": now - 30, "node_id": "forge-02", "level": "warn", "msg": "disk 93% full"},
@@ -145,7 +165,7 @@ def detail(nid):
     n["procs"] = [{"name": "claude.exe", "pid": 4120, "cpu": 12.5, "mem_mb": 480}, {"name": "node.exe", "pid": 5310, "cpu": 3.1, "mem_mb": 210}]
     n["logs"] = [{"name": "agent.log", "ts": time.time() - 3, "text": "agent started\nreport ok\nreport ok\n"}]
     n["jobs"] = [j for j in s["jobs"] if j["node_id"] == nid]
-    n["settings"] = {"work_root": None, "max_jobs": None}
+    n["settings"] = {"work_root": None, "max_jobs": None, "wu_window": None}
     return n
 
 
@@ -158,7 +178,8 @@ def job_detail(jid):
         j["output"] = "Pairing URL (valid 10 minutes):\nhttp://192.168.1.%s:3773/pair#token=Xk3-9fQ2LmPz7aVbT0\n" % j["node_id"][-1]
     elif jid == "019ac3f2b1a4f3c2d1":
         k = min(len(STREAM), int((time.time() - T0) / 2) % (len(STREAM) + 4) + 1)
-        j["output"] = "\n".join(STREAM[:k])
+        j["output"] = "".join(x + "\n" for x in STREAM[:k])
+        j["output_seq"] = k                  # R4: the live view continues with GET /api/jobs/{id}/output?since_seq=k
     else:
         j["output"] = "output for " + jid + "\n<script>alert(1)</script>"
     return j
@@ -223,6 +244,9 @@ def build_projects():
     ]
     if os.environ.get("MOCK_DEMO"):   # clean showcase data for README screenshots: drop the edge-case fixtures
         proj = [p for p in proj if p["id"] not in ("p3", "p5")]
+    for p in proj:
+        if "sessions" in p:
+            p.setdefault("sync_nodes", [])
     with LOCK:
         for p in proj:
             p.update(OVERRIDES.get(p["id"], {}))
@@ -279,6 +303,249 @@ def transcript(tool, sid, since):
     return {"events": [ev_at(i) for i in range(max(0, since), total)], "cursor": total, "done": s["state"] != "live", "available": True}
 
 
+
+# ---------------------------------------------------------------- Phase 3 (2.3) data
+PIN = {"hash": hashlib.sha256(b"123456").hexdigest(), "until": 0.0, "fails": []}
+DEVICES = {}
+ENROLL = {}         # id -> {kind, code, created, expires, cancelled}
+RUNS = {}           # maintenance runs: id -> run dict (progress is computed from time)
+RETIRE = {}         # node id -> {state, started, ...}
+ACKED = set()
+NOTIFY = {"ntfy": {"enabled": False, "server": "https://ntfy.sh", "topic": None},
+          "webpush": {"enabled": True, "vapid_public_key": "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U", "devices": 0},
+          "deadman": {"enabled": False, "url": None, "send_fail": False, "last_ping": None, "last_ok": None},
+          "rules": {"task_failed": True, "task_finished": True, "machine_down": True, "autorepair": True}}
+UPKEEP = {"schedule": {"enabled": True, "day": "sun", "time": "04:00", "actions": ["update_ai_tools", "update_t3", "update_ollama", "winget_upgrade"]},
+          "windows_update": {"enabled": True, "window": "03:00-05:00", "stagger_min": 30}, "repo_sync_every_s": 1800}
+TOKENS = {"agent": {"rotated": None, "grace_until": None}, "cluster": {"rotated": None, "grace_until": None}}
+SUBS = set()
+MAINT = [
+    {"name": "update_app", "title": "Update an app", "description": "Upgrade one winget package, or all of them.", "steps": ["winget_upgrade"],
+     "lane": "system", "destructive": False, "args": {"id": {"type": "string", "required": False, "label": "Package id (empty = all apps)", "max_len": 128}}},
+    {"name": "install_app", "title": "Install an app", "description": "Install one winget package on every machine.", "steps": ["winget_install"],
+     "lane": "system", "destructive": False, "args": {"id": {"type": "string", "required": True, "label": "Package id", "max_len": 128}}},
+    {"name": "update_ai_tools", "title": "Update Claude Code & Codex", "description": "claude update, npm i -g @openai/codex@latest.",
+     "steps": ["update_claude", "update_codex"], "lane": "user", "destructive": False, "args": {}},
+    {"name": "restart_hivemind", "title": "Restart Hivemind", "description": "Restart the hub and the agent on each machine.",
+     "steps": ["restart_task"], "lane": "system", "destructive": False, "args": {}},
+    {"name": "free_disk", "title": "Free disk space", "description": "Empty temp folders, old scratch folders and the recycle bin.",
+     "steps": ["free_disk"], "lane": "system", "destructive": False, "args": {}},
+    {"name": "restart_machine", "title": "Restart machine", "description": "Reboot the machine (running tasks are stopped).",
+     "steps": ["reboot"], "lane": "system", "destructive": True, "args": {}},
+]
+
+
+def maint_args_error(a, args):
+    """Like F's arg check: required args present, strings within max_len, ints within min/max, enums valid."""
+    args = args if isinstance(args, dict) else {}
+    for k, r in (a.get("args") or {}).items():
+        v = args.get(k)
+        lab = r.get("label") or k
+        if v in (None, ""):
+            if r.get("required"):
+                return f"{lab} is required"
+            continue
+        if r.get("enum") and v not in r["enum"]:
+            return f"{lab}: pick one of {', '.join(r['enum'])}"
+        if r.get("type") == "int":
+            if not isinstance(v, int) or (r.get("min") is not None and v < r["min"]) or (r.get("max") is not None and v > r["max"]):
+                return f"{lab}: out of range"
+        elif r.get("type") == "string" and len(str(v)) > int(r.get("max_len") or 256):
+            return f"{lab}: too long"
+    return None
+
+
+STEP_S = 4.0        # each machine of a mock maintenance run takes 4 s
+
+
+def init_devices():
+    now = time.time()
+    DEVICES.clear()
+    for i, (lbl, ip, age) in enumerate([("Chrome on Windows", "100.64.0.1", 3), ("Safari on iPhone", "100.64.0.7", 600), ("Old laptop", "192.168.1.40", 86400 * 20)]):
+        did = hashlib.sha256(lbl.encode()).hexdigest()[:12]
+        DEVICES[did] = {"id": did, "label": lbl, "created": now - 86400 * (30 - i * 5), "last_seen": now - age, "expires": now + 86400 * 80,
+                        "current": i == 0, "ip": ip, "user_agent": lbl}
+
+
+init_devices()
+
+
+def nodes_now():
+    return [] if STATE["empty"] else state()["nodes"]
+
+
+def joined_node():
+    """A machine added through the wizard shows up in /api/state once its code is 'joined'."""
+    for e in ENROLL.values():
+        if e["kind"] == "machine" and enroll_state(e)[0] == "joined":
+            return node("forge-05", "studio-pc", True, 4, 21, 12, "2.3.0")
+    return None
+
+
+def enroll_state(e):
+    now = time.time()
+    if e.get("cancelled") or now > e["expires"]:
+        return "expired", None
+    t = now - e["created"]
+    if e["kind"] == "device":
+        return ("redeemed", None) if t > 6 else ("pending", None)
+    if t > 10:
+        return "joined", "forge-05"
+    return ("redeemed", None) if t > 6 else ("pending", None)
+
+
+def enroll_view(eid):
+    e = ENROLL[eid]
+    st, nid = enroll_state(e)
+    out = {"id": eid, "kind": e["kind"], "state": st, "expires": e["expires"]}
+    if nid:
+        out["node_id"] = nid
+    return out
+
+
+def mock_alerts():
+    """Alerts in the N1 shape (what /api/alerts returns once N lands)."""
+    now = time.time()
+    if STATE["empty"]:
+        return []
+    out = []
+    for a in health()["alerts"]:
+        if a["level"] not in ("warn", "error"):
+            continue
+        heal = a["kind"] == "version_behind"          # the mock fleet holds an update lease: version_behind heals itself
+        out.append(fu.n1_alert(a, opened=now - 1800, self_healing=heal))
+    out.append(fu.n1_alert({"kind": "task_failed", "node_id": "forge-03", "level": "warn", "opened": now - 3900,
+                            "key": "task_failed:forge-03:019ac3d0aa11bb22cd", "msg": "Task failed: Explain why tests fail on CI",
+                            "data": {"job_id": "019ac3d0aa11bb22cd"}}))
+    out.append(fu.n1_alert({"kind": "repo_conflict", "node_id": "forge-02", "level": "warn", "opened": now - 7200,
+                            "key": "repo_conflict:forge-02:p1", "msg": "hivemind on forge-02 has diverged from origin",
+                            "data": {"project_id": "p1"}}))
+    return [a for a in out if a["id"] not in ACKED]
+
+
+def mock_today(q="", all_needs=False):
+    now = time.time()
+    if STATE["empty"]:
+        return {"now": now, "status": fu.status_sentence(0, 0, []), "needs_you": {"items": [], "total": 0}, "happening": [],
+                "recent": {"today": [], "yesterday": [], "earlier": []}, "brief": None, "first_run": {"machines": 0, "projects": 0}}
+    build_projects()
+    nodes = state()["nodes"]
+    host = {n["id"]: n["info"]["hostname"] for n in nodes}
+    needs = fu.filter_needs(mock_alerts(), now)
+    happening, recent_rows = [], []
+    with LOCK:
+        projs = list(PROJ)
+    for p in projs:
+        for s in p.get("sessions", []):
+            if s["tool"] == "forge":
+                continue
+            if s["state"] == "live":
+                happening.append({"kind": "session", "id": s["session_id"], "tool": s["tool"], "title": s["title"], "node_id": s["node_id"],
+                                  "project_id": p["id"], "since": s["started"], "state": "live"})
+            else:
+                recent_rows.append({"tool": s["tool"], "session_id": s["session_id"], "title": s["title"], "node_id": s["node_id"],
+                                    "project_id": p["id"], "project_name": p["name"], "state": s["state"], "last_activity": s["last_activity"],
+                                    "started": s["started"], "git_branch": s.get("git_branch"), "messages": s.get("messages")})
+    for j in all_jobs():
+        if j["status"] in ("queued", "starting", "running") and j.get("source") not in ("brief", "sync"):
+            happening.append({"kind": "job", "id": j["id"], "tool": j["engine"], "title": j["prompt"] or j.get("action") or "", "node_id": j["node_id"],
+                              "project_id": j.get("project_id"), "since": j.get("started") or j["created"], "state": j["status"]})
+    happening.sort(key=lambda h: -(h["since"] or 0))
+    qn = (q or "").strip().lower()
+    if qn:
+        recent_rows = [s for s in recent_rows if qn in " ".join([s["title"], s["project_name"] or "", s["node_id"], host.get(s["node_id"], "")]).lower()]
+    recent_rows.sort(key=lambda s: -(s["last_activity"] or 0))
+    recent = {"today": [], "yesterday": [], "earlier": []}
+    for s in recent_rows:
+        b = recent[fu.day_bucket(s["last_activity"], now)]
+        if len(b) < fu.RECENT_MAX:
+            b.append(s)
+    online = sum(1 for n in nodes if n["online"])
+    return {"now": now, "status": fu.status_sentence(len(nodes), online, needs), "needs_you": {"items": needs[:fu.NEEDS_ALL_MAX if all_needs else fu.NEEDS_MAX], "total": len(needs)},
+            "happening": happening, "recent": recent, "brief": {k: BRIEFS_ALL[k] for k in ("text", "ts", "model")},
+            "first_run": {"machines": len(nodes), "projects": len(projs)}}
+
+
+def mock_ask(q, limit=8):
+    text = (q or "").strip()[:200]
+    if not text:
+        return {"results": []}
+    res = []
+    for a in fu.NAMED_ACTIONS:
+        res.append({"type": "action", "id": a["id"], "title": a["title"], "subtitle": a["subtitle"], "score": fu.best_score(text, a["title"], a["words"]),
+                    "target": {"route": a["route"]}})
+    for m in MAINT:
+        res.append({"type": "maintenance", "id": m["name"], "title": m["title"], "subtitle": "Maintenance · all machines",
+                    "score": fu.best_score(text, m["title"], m["name"].replace("_", " "), m["description"]), "target": {"route": "#/machines/maintenance", "action": m["name"]}})
+    for n in nodes_now():
+        res.append({"type": "machine", "id": n["id"], "title": n["info"]["hostname"], "subtitle": "Online" if n["online"] else "Offline",
+                    "score": fu.best_score(text, n["info"]["hostname"], n["id"]), "target": {"node_id": n["id"]}})
+    if not STATE["empty"]:
+        build_projects()
+        with LOCK:
+            projs = list(PROJ)
+        for p in projs:
+            res.append({"type": "project", "id": p["id"], "title": p["name"], "subtitle": p.get("group_name") or "",
+                        "score": fu.best_score(text, p["name"], p.get("group_name"), p.get("key")), "target": {"project_id": p["id"]}})
+            for s in p.get("sessions", []):
+                if s["tool"] != "forge":
+                    res.append({"type": "session", "id": s["session_id"], "title": s["title"], "subtitle": f"{s['tool']} · {s['node_id']} · {p['name']}",
+                                "score": fu.best_score(text, s["title"], p["name"]) * 0.95,
+                                "target": {"tool": s["tool"], "session_id": s["session_id"], "project_id": p["id"]}})
+    out = fu.ask_rank(res, max(1, min(limit, 50)) - 1)
+    out.append(fu.run_entry(text))
+    return {"results": out}
+
+
+def rollout_order(targets):
+    nodes = [n for n in nodes_now() if targets == "all" or n["id"] in targets]
+    prio = STATE["priorities"]
+    on = [n["id"] for n in nodes if n["online"]]
+    on.sort(key=lambda i: (i == "forge-01", -prio.get(i, 99)))      # canary/highest number first, leader last
+    skipped = [{"node_id": n["id"], "reason": "offline"} for n in nodes if not n["online"]]
+    return on, skipped
+
+
+def run_view(rid):
+    r = dict(RUNS[rid])
+    now = time.time()
+    n = len(r["targets"])
+    if r["status"] in ("cancelled",):
+        return r
+    done = min(n, int((now - r["started"]) / STEP_S))
+    results = []
+    status = "running"
+    for i in range(done):
+        nid = r["targets"][i]
+        bad = r["action"] == "free_disk" and nid == "forge-02"        # one scripted failure, to show "stop on first failure"
+        results.append({"node_id": nid, "job_id": f"{rid}-{i}", "status": "failed" if bad else "done",
+                        "summary": "disk still 93% full" if bad else ("updated 3 packages" if r["action"] == "update_app" else "ok"),
+                        "finished": r["started"] + (i + 1) * STEP_S})
+        if bad:
+            status = "failed"
+            break
+    if status != "failed" and done >= n:
+        status = "done"
+    r["results"], r["idx"], r["status"] = results, len(results), status
+    r["current"] = {"node_id": r["targets"][len(results)], "job_id": f"{rid}-{len(results)}"} if status == "running" else None
+    r["finished"] = r["started"] + len(results) * STEP_S if status != "running" else None
+    return r
+
+
+def output_chunks(jid, since):
+    if jid != "019ac3f2b1a4f3c2d1":
+        j = job_detail(jid)
+        return {"chunks": [{"seq": 1, "ts": j["created"], "text": j["output"]}] if since < 1 and j else [], "next_seq": 2, "status": j["status"] if j else None,
+                "truncated": False}
+    k = min(len(STREAM), int((time.time() - T0) / 2) % (len(STREAM) + 4) + 1)
+    chunks = [{"seq": i + 1, "ts": T0 + i * 2, "text": STREAM[i] + "\n"} for i in range(k) if i + 1 > since]
+    return {"chunks": chunks, "next_seq": k + 1, "status": "running", "truncated": False}
+
+
+V23_PREFIXES = ("/api/today", "/api/ask", "/api/alerts", "/api/enroll/", "/api/devices", "/api/tokens", "/api/stepup", "/api/security",
+                "/api/notify", "/api/push", "/api/maintenance", "/api/upkeep", "/api/machines/", "/api/backups", "/api/claim")
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -288,6 +555,16 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def send_file(self, path, ctype, extra=None):
+        b = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
 
@@ -309,35 +586,89 @@ class H(BaseHTTPRequestHandler):
 
     def query(self):
         q = self.path.split("?", 1)[1] if "?" in self.path else ""
-        return dict(kv.split("=", 1) for kv in q.split("&") if "=" in kv)
+        from urllib.parse import unquote_plus
+        return {unquote_plus(k): unquote_plus(v) for k, v in (kv.split("=", 1) for kv in q.split("&") if "=" in kv)}
+
+    def v22_gone(self, p):
+        if STATE["v22"] and self.command == "POST" and p == "/api/enroll":
+            self.send(405, {"detail": "Method Not Allowed"})
+            return True
+        if STATE["v22"] and (p.startswith(V23_PREFIXES) or p in ("/manifest.webmanifest", "/sw.js")):
+            self.send(404, {"detail": "Not Found"})
+            return True
+        return False
+
+    # ---- S7 step-up (contract shape: 403 {"detail", "step_up"})
+    def need_step_up(self):
+        if not PIN["hash"]:
+            self.send(403, {"detail": "admin PIN not set", "step_up": "setup"})
+            return True
+        if PIN["until"] < time.time():
+            self.send(403, {"detail": "admin PIN required", "step_up": "required"})
+            return True
+        return False
 
     def do_GET(self):
         p = self.path.split("?")[0]
+        if self.v22_gone(p):
+            return
+        q = self.query()
         if p in ("/", "/index.html"):
-            b = INDEX.read_bytes()
+            self.send_file(INDEX, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+        elif p == "/sw.js":
+            self.send_file(STATIC / "sw.js", "application/javascript", {"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
+        elif p == "/manifest.webmanifest":
+            b = json.dumps(fu.MANIFEST).encode()
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", "application/manifest+json")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif p.startswith("/icons/"):
+            name = p[len("/icons/"):]
+            f = STATIC / "icons" / name
+            self.send_file(f, "image/png") if fu.ICON_RE.match(name) and f.is_file() else self.send(404, {"detail": "no such icon"})
+        elif p == "/healthz":
+            self.send(200, {"ok": True, "node_id": "forge-01", "role": "leader", "version": "2.3.0", "running_version": "2.3.0", "db_ok": True,
+                            "free_gb": 812.4, "checks": {"db_write": True, "disk": True}})
         elif p == "/api/state":
-            self.send(503, {"detail": "no leader"}) if STATE["no_leader"] else self.send(200, state())
+            if STATE["no_leader"]:
+                return self.send(503, {"detail": "no leader"})
+            s = state()
+            if STATE["empty"]:
+                s.update(nodes=[], jobs=[], events=[])
+            self.send(200, s)
         elif p == "/api/health":
             self.send(200, health())
+        elif p == "/api/today":
+            self.send(503, {"detail": "no leader"}) if STATE["no_leader"] else self.send(200, mock_today(q.get("q", ""), q.get("all") == "1"))
+        elif p == "/api/ask":
+            lim = int(q["limit"]) if q.get("limit", "").isdigit() else 8
+            self.send(200, mock_ask(q.get("q", ""), lim))
+        elif p == "/api/alerts":
+            al = mock_alerts()
+            lim = int(q["limit"]) if q.get("limit", "").isdigit() else 100
+            self.send(200, {"alerts": al[:lim]})
         elif p.startswith("/api/nodes/"):
             d = detail(p.split("/")[3])
             self.send(200, d) if d else self.send(404, {"detail": "no such node"})
         elif p == "/api/jobs":
-            q = self.query()
             inc = q.get("include_brief", "").lower() in ("1", "true", "yes", "on")
             lim = max(1, min(int(q["limit"]) if q.get("limit", "").isdigit() else 40, 200))
             self.send(200, [j for j in all_jobs() if inc or j.get("source") != "brief"][:lim])
+        elif re.fullmatch(r"/api/jobs/[^/]+/output", p):
+            since = int(q["since_seq"]) if q.get("since_seq", "").lstrip("-").isdigit() else 0
+            jid = p.split("/")[3]
+            self.send(200, output_chunks(jid, since)) if job_detail(jid) else self.send(404, {"detail": "no such job"})
         elif p.startswith("/api/jobs/"):
             d = job_detail(p.split("/")[3])
             self.send(200, d) if d else self.send(404, {"detail": "no such job"})
         elif p == "/api/projects":
+            if STATE["empty"]:
+                return self.send(200, [])
             build_projects()
-            keys = ("id", "key", "name", "group_name", "pinned", "machines", "live_sessions", "sessions_24h", "last_activity", "brief", "dirty_any", "branches")
+            keys = ("id", "key", "name", "group_name", "pinned", "machines", "live_sessions", "sessions_24h", "last_activity", "brief", "dirty_any",
+                    "branches", "sync_nodes")
             with LOCK:
                 self.send(200, [{k: x[k] for k in keys if k in x} for x in PROJ])
         elif p.startswith("/api/projects/"):
@@ -354,21 +685,79 @@ class H(BaseHTTPRequestHandler):
                                                   "shell": [{"node_id": "forge-03", "score": 86.5}], "any": {"engine": "codex", "node_id": "forge-01"}}})
         elif p.startswith("/api/sessions/") and p.endswith("/transcript"):
             parts = p.split("/")
-            s = self.query().get("since", "0")
+            s = q.get("since", "0")
             d = transcript(parts[3], parts[4], int(s) if s.isdigit() else 0)
             self.send(200, d) if d else self.send(404, {"detail": "no such session"})
-        elif p == "/api/enroll":
+        elif p == "/api/enroll":      # 2.2 shape (S replaces it with the POST shape)
             self.send(200, {"hub": "http://forge-01:8787", "command": "irm http://forge-01:8787/agent/install.ps1 | iex"})
+        elif p.startswith("/api/enroll/"):
+            eid = p.split("/")[3]
+            self.send(200, enroll_view(eid)) if eid in ENROLL else self.send(404, {"detail": "no such code"})
+        elif p == "/api/devices":
+            self.send(200, {"devices": sorted(DEVICES.values(), key=lambda d: -d["last_seen"])})
+        elif p == "/api/tokens":
+            self.send(200, TOKENS)
+        elif p == "/api/stepup":
+            self.send(200, {"pin_set": bool(PIN["hash"]), "valid_until": PIN["until"] if PIN["until"] > time.time() else None})
+        elif p == "/api/security/signing-key":
+            self.send(200, {"pinned": True, "key_id": "3f9a1c0d5e7b2a84"})
+        elif p == "/api/backups":
+            now = time.time()
+            self.send(200, {"backups": [{"file": time.strftime("forge-%Y%m%d.db", time.localtime(now - 86400 * i)), "size": 4_200_000 + i * 1000, "ts": now - 86400 * i - 3600}
+                                        for i in range(3)], "last_backup": now - 3600})
+        elif p == "/api/notify/settings":
+            self.send(200, notify_view())
+        elif p == "/api/actions":            # 2.2 allowlist (hub/actions.json); the 2.3 UI falls back to it on a 2.2 leader
+            cat = json.loads((ROOT / "hub" / "actions.json").read_text(encoding="utf-8"))
+            self.send(200, {**cat, "admin_lane_enabled": True})
+        elif p == "/api/maintenance/actions":
+            self.send(200, {"actions": MAINT})
+        elif p == "/api/maintenance/runs":
+            self.send(200, {"runs": sorted((run_view(r) for r in RUNS), key=lambda r: -r["created"])[:20]})
+        elif p.startswith("/api/maintenance/runs/"):
+            rid = p.split("/")[4]
+            self.send(200, run_view(rid)) if rid in RUNS else self.send(404, {"detail": "no such run"})
+        elif p == "/api/upkeep/settings":
+            self.send(200, UPKEEP)
+        elif re.fullmatch(r"/api/machines/[^/]+/retire", p):
+            nid = p.split("/")[3]
+            if not any(x["id"] == nid for x in nodes_now()):
+                return self.send(404, {"detail": "no such node"})
+            self.send(200, retire_view(nid) if nid in RETIRE else {"node_id": nid, "state": None, "started": None, "finished": None,
+                                                                    "job_id": None, "error": None})
         else:
-            self.send(404, {"detail": "not found"})
+            self.send(404, {"detail": "Not Found"})
 
     def do_POST(self):
         p = self.path.split("?")[0]
         b = self.body()
-        if b is None:
+        if b is None or self.v22_gone(p):
             return
         if p == "/api/login":
+            self.send(200, {"ok": True, "session": {"id": "a1b2c3d4e5f6", "label": b.get("label") or "browser"}})
+        elif p == "/api/claim":
+            code = re.sub(r"[^A-Z0-9]", "", str(b.get("code") or "").upper())
+            ok = code == "ABCDEFGH" or any(re.sub(r"[^A-Z0-9]", "", e["code"]) == code and e["kind"] == "device" and enroll_state(e)[0] != "expired"
+                                           for e in ENROLL.values())
+            self.send(200, {"ok": True, "session": {"id": "c1aim0000001", "label": b.get("label") or "device"}}) if ok else self.send(401, {"detail": "bad or expired code"})
+        elif p == "/api/logout":
             self.send(200, {"ok": True})
+        elif p == "/api/enroll":
+            kind = b.get("kind") or "machine"
+            if kind not in ("machine", "device"):
+                return self.send(400, {"detail": "kind must be machine or device"})
+            eid = secrets.token_hex(8)
+            code = "".join(secrets.choice("0123456789ABCDEFGHJKMNPQRSTVWXYZ") for _ in range(8))
+            code = code[:4] + "-" + code[4:]
+            hub = "http://forge-01.tail1234.ts.net:8787"
+            now = time.time()
+            ENROLL[eid] = {"kind": kind, "code": code, "created": now, "expires": now + 600, "label": b.get("label")}
+            out = {"id": eid, "code": code, "kind": kind, "expires": now + 600, "hub": hub}
+            if kind == "machine":
+                out["command"] = f"irm '{hub}/agent/install.ps1?code={code}' | iex"
+            else:
+                out["url"] = f"{hub}/?claim={code}"
+            self.send(200, out)
         elif p.startswith("/api/sessions/") and p.endswith("/watch"):
             s = SESS.get((p.split("/")[3], p.split("/")[4]))
             self.send(200, {"ok": True, "node_id": s["node_id"], "ttl_s": 30}) if s else self.send(404, {"detail": "no such session"})
@@ -387,6 +776,100 @@ class H(BaseHTTPRequestHandler):
         elif p.startswith("/api/jobs/") and p.endswith("/cancel"):
             STATE["cancelled"].add(p.split("/")[3])
             self.send(200, {"ok": True})
+        elif re.fullmatch(r"/api/alerts/[^/]+/ack", p):
+            ACKED.add(urllib.parse.unquote(p.split("/")[3]))
+            self.send(200, {"ok": True})
+        elif p == "/api/stepup":
+            PIN["fails"] = [t for t in PIN["fails"] if t > time.time() - 600]
+            if len(PIN["fails"]) >= 5:
+                return self.send(429, {"detail": "too many wrong PINs"})
+            if not PIN["hash"] or hashlib.sha256(str(b.get("pin") or "").encode()).hexdigest() != PIN["hash"]:
+                PIN["fails"].append(time.time())
+                return self.send(403, {"detail": "wrong PIN"})
+            PIN["until"] = time.time() + 600
+            self.send(200, {"ok": True, "valid_until": PIN["until"]})
+        elif p == "/api/tokens/rotate":
+            if not b.get("confirm"):
+                return self.send(400, {"detail": "confirmation required"})
+            if self.need_step_up():
+                return
+            if not b.get("force"):
+                return self.send(409, {"detail": "agents older than 2.3 would be locked out: forge-03"})
+            now = time.time()
+            for k in ("agent", "cluster"):
+                TOKENS[k] = {"rotated": now, "grace_until": now + 600}
+            self.send(200, {"ok": True, "rotated": ["agent", "cluster"], "grace_until": now + 600})
+        elif p == "/api/notify/ntfy/topic":
+            t = "hm-" + "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz234567") for _ in range(20))
+            self.send(200, {"topic": t, "subscribe_url": f"{NOTIFY['ntfy']['server']}/{t}"})
+        elif p == "/api/notify/test":
+            res = {}
+            if NOTIFY["ntfy"]["enabled"]:
+                res["ntfy"] = "ok"
+            res["webpush"] = {"sent": len(SUBS), "failed": 0}
+            self.send(200, {"ok": True, "results": res})
+        elif p == "/api/push/subscribe":
+            if not b.get("endpoint") or not isinstance(b.get("keys"), dict):
+                return self.send(400, {"detail": "endpoint and keys required"})
+            SUBS.add(b["endpoint"])
+            NOTIFY["webpush"]["devices"] = len(SUBS)
+            self.send(200, {"ok": True, "id": hashlib.sha256(b["endpoint"].encode()).hexdigest()[:32]})
+        elif p == "/api/maintenance/preview":
+            a = next((m for m in MAINT if m["name"] == b.get("action")), None)
+            if not a:
+                return self.send(400, {"detail": "unknown action"})
+            bad = maint_args_error(a, b.get("args"))
+            if bad:
+                return self.send(400, {"detail": bad})
+            order, skipped = rollout_order(b.get("targets") or "all")
+            self.send(200, {"order": order, "skipped": skipped, "destructive": a["destructive"], "needs_step_up": a["destructive"] or a["lane"] == "system",
+                            "online": len(order)})
+        elif p == "/api/maintenance/runs":
+            a = next((m for m in MAINT if m["name"] == b.get("action")), None)
+            if not a:
+                return self.send(400, {"detail": "unknown action"})
+            if not b.get("confirm"):
+                return self.send(400, {"detail": "confirmation required"})
+            bad = maint_args_error(a, b.get("args"))
+            if bad:
+                return self.send(400, {"detail": bad})
+            if (a["destructive"] or a["lane"] == "system") and self.need_step_up():
+                return
+            order, _ = rollout_order(b.get("targets") or "all")
+            if not order:
+                return self.send(400, {"detail": "no online target"})
+            rid = "run" + secrets.token_hex(5)
+            now = time.time()
+            RUNS[rid] = {"id": rid, "action": a["name"], "title": a["title"], "args": b.get("args") or {}, "targets": order, "idx": 0, "status": "running",
+                         "current": None, "results": [], "source": "ui", "created": now, "started": now, "finished": None}
+            self.send(200, {"id": rid, "order": order})
+        elif re.fullmatch(r"/api/maintenance/runs/[^/]+/cancel", p):
+            rid = p.split("/")[4]
+            if rid not in RUNS:
+                return self.send(404, {"detail": "no such run"})
+            v = run_view(rid)
+            RUNS[rid].update(status="cancelled", results=v["results"], current=None, finished=time.time())
+            self.send(200, {"ok": True})
+        elif re.fullmatch(r"/api/machines/[^/]+/wake", p):
+            nid = p.split("/")[3]
+            n = next((x for x in nodes_now() if x["id"] == nid), None)
+            if not n:
+                return self.send(404, {"detail": "no such node"})
+            if n["online"]:
+                return self.send(409, {"detail": "already online"})
+            self.send(200, {"ok": True, "via": ["forge-02"], "mac": "3C-7C-3F-AA-BB-CC"})
+        elif re.fullmatch(r"/api/machines/[^/]+/retire", p):
+            nid = p.split("/")[3]
+            if not any(x["id"] == nid for x in nodes_now()):
+                return self.send(404, {"detail": "no such node"})
+            if not b.get("confirm"):
+                return self.send(400, {"detail": "confirmation required"})
+            if self.need_step_up():
+                return
+            if nid in RETIRE and retire_view(nid)["state"] not in ("done", "failed"):
+                return self.send(409, {"detail": "already retiring"})
+            RETIRE[nid] = {"started": time.time(), "uninstall": bool(b.get("uninstall", True)), "rotate": bool(b.get("rotate_tokens"))}
+            self.send(202, {"ok": True, "state": "draining"})
         elif p == "/mock/503":
             STATE["no_leader"] = True
             self.send(200, {})
@@ -396,8 +879,17 @@ class H(BaseHTTPRequestHandler):
         elif p == "/mock/reset-transcript":
             STATE["tx_reset_at"] = time.time()
             self.send(200, {"ok": True})
+        elif p in ("/mock/empty", "/mock/full"):
+            STATE["empty"] = p == "/mock/empty"
+            self.send(200, {"ok": True})
+        elif p in ("/mock/v22", "/mock/v23"):
+            STATE["v22"] = p == "/mock/v22"
+            self.send(200, {"ok": True})
+        elif p == "/mock/nopin":
+            PIN.update(hash=None, until=0.0)
+            self.send(200, {"ok": True})
         else:
-            self.send(404, {"detail": "not found"})
+            self.send(404, {"detail": "Not Found"})
 
     def create_job(self, b):
         res = b.get("resume") if isinstance(b.get("resume"), dict) else None
@@ -416,6 +908,11 @@ class H(BaseHTTPRequestHandler):
         if not str(b.get("prompt") or "").strip() and engine != "action":
             return self.send(400, {"detail": "prompt required"})
         system = engine in ("action", "admin")
+        if engine == "admin" and node_id == "auto":
+            return self.send(400, {"detail": "admin jobs need a node_id"})
+        destructive = engine == "action" and any(m["name"] == b.get("action") and m["destructive"] for m in MAINT)
+        if (engine == "admin" or destructive) and self.need_step_up():
+            return
         req_any = engine == "any"
         if req_any:
             engine = "codex" if "claude" in COOLDOWNS else "claude"
@@ -425,18 +922,42 @@ class H(BaseHTTPRequestHandler):
                "req_engine": "any" if req_any else None, "prompt": b.get("prompt") or b.get("action"), "action": b.get("action"),
                "cwd": b.get("cwd"), "full_access": bool(b.get("full_access")) and not system, "status": "queued", "created": time.time(),
                "started": None, "finished": None, "exit_code": None, "tail": "", "source": b.get("source") or "ui",
-               "run_as": "system" if system else "user", "resume": res, "project_id": b.get("project_id"), "wait_reason": None}
+               "run_as": "system" if system else "user", "resume": res, "project_id": b.get("project_id"), "wait_reason": None,
+               "notify": bool(b.get("notify"))}
         STATE["extra_jobs"].insert(0, row)
         self.send(200, {k: row[k] for k in ("id", "node_id", "engine", "run_as", "status", "wait_reason")})
 
     def do_DELETE(self):
-        parts = self.path.split("?")[0].split("/")
-        if self.path.startswith("/api/scheduler/cooldowns/") and len(parts) == 5:
+        p = self.path.split("?")[0]
+        parts = p.split("/")
+        if self.v22_gone(p):
+            return
+        if p.startswith("/api/scheduler/cooldowns/") and len(parts) == 5:
             return self.send(200, {"ok": True, "cleared": COOLDOWNS.pop(parts[4], None) is not None})
-        if self.path.startswith("/api/peers/") and len(parts) == 4 and parts[3] in STATE["priorities"]:
+        if p.startswith("/api/peers/") and len(parts) == 4 and parts[3] in STATE["priorities"]:
             STATE["priorities"].pop(parts[3])
             return self.send(200, {"ok": True})
-        self.send(404, {"detail": "not found"})
+        if p.startswith("/api/enroll/") and len(parts) == 4:
+            if parts[3] not in ENROLL:
+                return self.send(404, {"detail": "no such code"})
+            ENROLL[parts[3]]["cancelled"] = True
+            return self.send(200, {"ok": True})
+        if p.startswith("/api/devices/") and len(parts) == 4:
+            return self.send(200, {"ok": True}) if DEVICES.pop(parts[3], None) else self.send(404, {"detail": "no such device"})
+        if p == "/api/push/subscribe":
+            b = self.body()
+            if b is None:
+                return
+            SUBS.discard(b.get("endpoint"))
+            NOTIFY["webpush"]["devices"] = len(SUBS)
+            return self.send(200, {"ok": True})
+        if re.fullmatch(r"/api/machines/[^/]+/retire", p):
+            nid = parts[3]
+            if nid not in RETIRE or retire_view(nid)["state"] != "draining":
+                return self.send(409, {"detail": "only a draining machine can be kept"})
+            RETIRE.pop(nid)
+            return self.send(200, {"ok": True})
+        self.send(404, {"detail": "Not Found"})
 
     def do_PATCH(self):
         b = self.body()
@@ -444,7 +965,7 @@ class H(BaseHTTPRequestHandler):
             return
         parts = self.path.split("?")[0].split("/")
         if len(parts) != 4 or parts[1] != "api" or not parts[3]:
-            return self.send(404, {"detail": "not found"})
+            return self.send(404, {"detail": "Not Found"})
         kind, oid = parts[2], parts[3]
         if kind == "projects":
             if not any(y["id"] == oid for y in PROJ):
@@ -465,14 +986,76 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"detail": "priority must be an integer"})
             STATE["priorities"][oid] = b["priority"]
             return self.send(200, {"ok": True})
-        self.send(404, {"detail": "not found"})
+        if kind == "devices":
+            d = DEVICES.get(oid)
+            if not d:
+                return self.send(404, {"detail": "no such device"})
+            lbl = str(b.get("label") or "").strip()
+            if not lbl or len(lbl) > 64:
+                return self.send(400, {"detail": "label must be 1-64 characters"})
+            d["label"] = lbl
+            return self.send(200, d)
+        self.send(404, {"detail": "Not Found"})
 
     def do_PUT(self):
-        if self.body() is None:
+        b = self.body()
+        if b is None:
             return
-        if self.path.startswith("/api/nodes/") and self.path.endswith("/settings"):
+        p = self.path.split("?")[0]
+        if self.v22_gone(p):
+            return
+        if p.startswith("/api/nodes/") and p.endswith("/settings"):
             return self.send(200, {"ok": True})
-        self.send(404, {"detail": "not found"})
+        if p == "/api/stepup/pin":
+            pin = str(b.get("pin") or "")
+            if not re.fullmatch(r"\d{6}", pin):
+                return self.send(400, {"detail": "the PIN must be exactly 6 digits"})
+            if PIN["hash"] and PIN["until"] < time.time() and hashlib.sha256(str(b.get("old_pin") or "").encode()).hexdigest() != PIN["hash"]:
+                return self.send(403, {"detail": "wrong PIN"})
+            PIN["hash"] = hashlib.sha256(pin.encode()).hexdigest()
+            return self.send(200, {"ok": True})
+        if p == "/api/notify/settings":
+            for k in ("ntfy", "deadman", "rules", "webpush"):
+                if isinstance(b.get(k), dict):
+                    upd = {x: y for x, y in b[k].items() if x not in ("subscribe_url", "vapid_public_key", "devices", "last_ping", "last_ok")}
+                    if k == "ntfy" and upd.get("topic") and not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", str(upd["topic"])):
+                        return self.send(400, {"detail": "bad topic"})
+                    NOTIFY[k].update(upd)
+            return self.send(200, notify_view())
+        if p == "/api/upkeep/settings":
+            for k in ("schedule", "windows_update"):
+                if isinstance(b.get(k), dict):
+                    UPKEEP[k].update(b[k])
+            if isinstance(b.get("repo_sync_every_s"), int):
+                UPKEEP["repo_sync_every_s"] = b["repo_sync_every_s"]
+            return self.send(200, UPKEEP)
+        m = re.fullmatch(r"/api/projects/([^/]+)/sync", p)
+        if m:
+            pid = m.group(1)
+            if not any(y["id"] == pid for y in PROJ):
+                return self.send(404, {"detail": "no such project"})
+            nodes = b.get("nodes")
+            if not isinstance(nodes, list) or not all(isinstance(x, str) for x in nodes):
+                return self.send(400, {"detail": "nodes must be a list of node ids"})
+            with LOCK:
+                OVERRIDES.setdefault(pid, {})["sync_nodes"] = nodes
+            build_projects()
+            return self.send(200, {"ok": True, "sync_nodes": nodes})
+        self.send(404, {"detail": "Not Found"})
+
+
+def notify_view():
+    n = dict(NOTIFY["ntfy"])
+    n["subscribe_url"] = f"{n['server'].rstrip('/')}/{n['topic']}" if n.get("topic") else None
+    return {"ntfy": n, "webpush": dict(NOTIFY["webpush"]), "deadman": dict(NOTIFY["deadman"]), "rules": dict(NOTIFY["rules"])}
+
+
+def retire_view(nid):
+    r = RETIRE[nid]
+    t = time.time() - r["started"]
+    st = "draining" if t < 8 else "uninstalling" if t < 14 and r["uninstall"] else "removing" if t < 18 else "done"
+    return {"node_id": nid, "state": st, "started": r["started"], "finished": r["started"] + 18 if st == "done" else None,
+            "job_id": "019ac3ffretire" if st in ("uninstalling", "removing", "done") and r["uninstall"] else None, "error": None}
 
 
 if __name__ == "__main__":

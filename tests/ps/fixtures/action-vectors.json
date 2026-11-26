@@ -11,7 +11,13 @@
     {"action": "reboot", "args": {}, "expect": {"delay_s": 60}},
     {"action": "reboot", "args": {"delay_s": 3600}, "expect": {"delay_s": 3600}},
     {"action": "ensure_task", "args": {"name": "T3Code", "command": "C:\\Program Files\\nodejs\\node.exe", "args": "C:\\t3\\server.js --port 3773", "run_as": "user", "trigger": "logon"},
-     "expect": {"name": "T3Code", "command": "C:\\Program Files\\nodejs\\node.exe", "args": "C:\\t3\\server.js --port 3773", "run_as": "user", "trigger": "logon"}}
+     "expect": {"name": "T3Code", "command": "C:\\Program Files\\nodejs\\node.exe", "args": "C:\\t3\\server.js --port 3773", "run_as": "user", "trigger": "logon"}},
+    {"action": "update_claude", "args": {}, "expect": {}},
+    {"action": "git_sync", "args": {"cwd": "D:\\code\\my repo"}, "expect": {"cwd": "D:\\code\\my repo"}},
+    {"action": "ollama_pull", "args": {"model": "qwen2.5:14b"}, "expect": {"model": "qwen2.5:14b"}},
+    {"action": "windows_update", "args": {}, "expect": {"reboot": "never"}},
+    {"action": "forge_uninstall", "args": {}, "expect": {"keep_data": false}},
+    {"action": "forge_uninstall", "args": {"keep_data": true}, "expect": {"keep_data": true}}
   ],
   "invalid": [
     {"action": "nope", "args": {}},
@@ -38,6 +44,14 @@
     {"action": "ensure_task", "args": {"name": "T", "command": "x.exe", "run_as": "SYSTEM", "trigger": "startup"}},
     {"action": "ensure_task", "args": {"name": "T", "command": "a\" & calc", "run_as": "system", "trigger": "startup"}},
     {"action": "ensure_task", "args": {"name": "T", "command": "x.exe", "args": "a\tb", "run_as": "system", "trigger": "startup"}},
-    {"action": "ensure_task", "args": {"name": "T", "command": "x.exe", "run_as": "system"}}
+    {"action": "ensure_task", "args": {"name": "T", "command": "x.exe", "run_as": "system"}},
+    {"action": "update_codex", "args": {"pkg": "x"}},
+    {"action": "git_sync", "args": {"cwd": "\\\\server\\share"}},
+    {"action": "git_sync", "args": {"cwd": "C:\\a|b"}},
+    {"action": "git_sync", "args": {"cwd": "C:\\a\nb"}},
+    {"action": "ollama_pull", "args": {"model": "x;y"}},
+    {"action": "windows_update", "args": {"reboot": "now"}},
+    {"action": "forge_uninstall", "args": {"keep_data": 1}},
+    {"action": "forge_uninstall", "args": {"keep_data": "true"}}
   ]
 }

@@ -69,6 +69,9 @@ _MISC_RES = (
     re.compile(r"^[a-z]:\\windows(\\system32)?(\\.*)?$"),                           # system32 and friends
     re.compile(r"(^|\\)temp(\\|$)"),                                               # any temp dir
     re.compile(r"\\forge\\scratch(\\|$)"),                                         # Forge scratch
+    # 2.3 F6a: Claude Desktop scratch workspaces (any depth below) and the user's %TEMP% (8.3 profile names too)
+    re.compile(r"\\claude-data\\[^\\]+\\scratch-workspaces(\\|$)"),
+    re.compile(r"\\appdata\\local\\temp(\\|$)"),
 )
 
 

@@ -1,4 +1,4 @@
-"""Fake hub for the agent smoke test (tests/ps/agent-smoke.ps1). Ports 19000-19099 only (never 8787).
+"""Fake hub for the agent smoke test (tests/ps/agent-smoke.ps1). Ports 19000-19299 only (never 8787).
 usage: python -I fake_agent_hub.py <port> <work_root> <log_jsonl> [<session_id>]
 Every report gets settings + hub_urls. Jobs are handed out one at a time (the next one only after the
 previous one reported a final status):
@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port, work_root, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 sid = sys.argv[4] if len(sys.argv) > 4 else None
-assert 19000 <= port <= 19099
+assert 19000 <= port <= 19299 and port != 8787
 JOBS = [
     {"id": "job-0001", "engine": "shell", "prompt": "Write-Output 'hello from forge job'; exit 3", "cwd": None, "full_access": False},
     {"id": "job-0002", "engine": "claude", "prompt": "please continue the docs", "cwd": None, "full_access": False,

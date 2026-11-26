@@ -49,6 +49,9 @@ def validate_args(spec: dict, args: Any) -> dict:
                 raise ActionError(f"{spec['name']}: '{key}' must be an integer")
             if "min" in rule and val < rule["min"] or "max" in rule and val > rule["max"]:
                 raise ActionError(f"{spec['name']}: '{key}' must be between {rule.get('min')} and {rule.get('max')}")
+        elif typ == "bool":                      # 2.3 (forge_uninstall keep_data)
+            if not isinstance(val, bool):
+                raise ActionError(f"{spec['name']}: '{key}' must be true or false")
         elif typ == "string":
             if not isinstance(val, str):
                 raise ActionError(f"{spec['name']}: '{key}' must be a string")
@@ -66,6 +69,11 @@ def validate_args(spec: dict, args: Any) -> dict:
             raise ActionError(f"{spec['name']}: unsupported arg type {typ}")
         out[key] = val
     return out
+
+
+def action_lane(spec: Optional[dict]) -> str:
+    """'user' for actions that run in the node user's agent (2.3 F2), else 'system' (the default)."""
+    return "user" if (spec or {}).get("lane") == "user" else "system"
 
 
 def summary(name: str, args: dict) -> str:

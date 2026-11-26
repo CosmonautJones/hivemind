@@ -21,6 +21,33 @@ desktop shortcut **Hivemind** → http://localhost:8787.
 To see what it would do without changing anything:
 `.\agent\install.ps1 -DryRun -Hub http://forge-01:8787 -Token <t>`. The test version is `tests\ps\dry-run.ps1`, which uses a fixture.
 
+### 2.3: new fleet, enrollment codes (workstream F1)
+
+Start a **new fleet** on the first machine, from a repo checkout in an elevated PowerShell:
+
+```powershell
+.\agent\install.ps1 -NewFleet            # builds the bundle from the checkout (or pass -BundleFile forge-2.3.0.zip)
+```
+
+It generates the agent and cluster tokens (24 random bytes each; an existing `data\config.json` keeps its tokens, so
+re-running never splits a fleet), creates the bundle signing key with `tools\new-signing-key.ps1` (private key DPAPI-protected
+in `%LOCALAPPDATA%\Hivemind`, reused when it exists), asks twice for a 6-digit **admin PIN** (kept on a re-run unless `-ResetPin`; `-AdminPin` only with `-DryRun`,
+`FORGE_ADMIN_PIN` for unattended runs),
+writes `data\config.json` and `data\private\secrets.json` (S's `Write-ForgeSecrets`; while that is unavailable the secrets
+stay in config.json and the 2.3 hub moves them on first start), applies the ACLs (S's `Set-ForgeDataAcl` when it has a
+plan), installs the bundle and the tasks (R's `Install-WdLauncher` / `Get-ForgeTaskSpecs` when the bundle has them, else the
+2.2 task set), writes `data\private\firstrun-claim.json` (single-use code, 30 min) and, once `/healthz` answers, opens
+`http://localhost:8787/?claim=<XXXX-XXXX>`, which signs this browser in. `-NoBrowser` only prints the link.
+`-NewFleet -DryRun` prints every step and writes nothing.
+
+**Join** a machine with the one-liner from Machines > Add machine. It carries a single-use enrollment code instead of a token:
+
+```powershell
+irm 'http://<hub>:8787/agent/install.ps1?code=<ABCD-EFGH>' | iex     # -Code ABCD-EFGH when run by hand
+```
+
+`GET /cluster/bootstrap?code=` redeems the code once. Old `?t=<agent_token>` links and `-Token` keep working.
+
 ## Layout
 
 ```
@@ -193,6 +220,92 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$F\current\watchdog\watchdo
 Never delete the `current` junction with `Remove-Item -Recurse`. On PS 5.1 that can delete the release behind it. Use
 `cmd /c rmdir`.
 
+## 2.3 reliability (workstream R)
+
+- **Tasks.** `ForgeWatchdog` runs the frozen launcher `<FH>\bin\wd-launcher.ps1`. The launcher runs
+  `current\watchdog\watchdog.ps1`, or the previous release's watchdog when `data\watchdog.json` is older than 10 min, so a
+  broken watchdog in a new release cannot block the rollback. `ForgeAgent` / `ForgeSystemAgent` run
+  `cmd.exe /d /s /c ""<FH>\bin\agent-loop.cmd" user|system"`. The loop starts `forge-agent.ps1 -Child -Lane <lane>`
+  forever with a 5 s pause, and the task restarts on failure (3 x 1 min). `<FH>\bin` inherits the root ACL
+  (Administrators + SYSTEM full, user read + execute); it is never under `data\`. The 2.3 watchdog copies both files there
+  when they are missing or older (`$LauncherVersion`, `rem LoopVersion=`), then re-registers the three tasks once
+  (`ACTION migrate ForgeWatchdog -> bin\wd-launcher.ps1`). Tasks that run another ForgeHome are never touched. A running
+  2.2 supervisor keeps working until the next task restart.
+- **Health gate.** After an update, the release is confirmed only when `/healthz` is ok (DB write + free space), the hub is
+  `eligible`, and the local agent reports the new `bundle_version` within `release_health_s` (180 s; longer while the agent
+  drains jobs toward it). Otherwise the 3-strike rollback applies. A hub that answers 503 for low disk is not restarted,
+  and low disk never counts against a release.
+- **Requirements.** If `requirements.txt` has the same sha as the base venv (`data\requirements.sha256`), there is no pip
+  and no venv. If it differs, `releases\<ver>\venv` is built before the flip (`python -m venv` from the base interpreter,
+  then pip). `run-hub.cmd` uses `%FORGE_RELEASE_DIR%\venv\Scripts\python.exe` when it exists. Once that release is
+  confirmed, the base venv is brought up to date with it, so the next release needs no venv of its own.
+- **Drain timeout.** A worker that sees a new bundle stops taking jobs and reports `metrics.draining_to`. It exits when
+  idle, or after `drain_timeout_s` (agent-config, else the hub's report response, else 1800 s) with
+  `drain timeout: restarting with N job(s) still running`. The next worker re-attaches the jobs from `running.json`.
+- **Database.** The hub checks its database at start (`PRAGMA quick_check`). A damaged file is renamed
+  `forge.db.corrupt-<stamp>`, and the hub copies everything from the leader (a standalone hub restores its newest backup).
+  Every night the leader writes `backup\forge-YYYYMMDD.db` next to the database and keeps 7.
+- **Retire.** Machines -> machine -> Remove: drain, uninstall (system job), forget, and optionally rotate tokens.
+- Tests: `tests\ps\p3-reliability.ps1`, `tests\test_p3_reliability.py`.
+
+## Notifications (2.3, hub only)
+Agents and watchdogs do not change. Alerts, ntfy and Web Push run on the leader hub (`HUB-CONTRACT.md`, "2.3.0 (hub) N").
+Web Push needs the `cryptography` package, which is pinned in `requirements.txt` and lands in the release venv (R5). A hub
+without it still runs: ntfy works, and `webpush.available` is false. Notifier settings are kept in the replicated `prefs`
+table, not in `config.json`. The optional `config.json` keys are `alert_selfheal_grace_s` (900), `machine_down_notify_s` (600),
+`deadman_every_s` (300), `public_url` (the base for notification links) and `vapid_subject` (the Web Push contact, default
+`mailto:hivemind@example.com`).
+
+## Upkeep (2.3, workstream F)
+
+All of this is driven by the leader hub; the agents only run allowlisted actions (`hub\actions.json`, every action ends its
+output with `##RESULT <json>`).
+
+- **User-lane actions.** `actions.json` entries have `"lane": "system"|"user"`. `update_claude` (`claude update` for the
+  native install, else `npm i -g @anthropic-ai/claude-code@latest`), `update_codex` (npm, else `codex update`),
+  `update_t3` (`t3 update`), `git_sync` and `ollama_pull` run in the **user** agent (the user's profile and credentials,
+  filtered token), via `agent\actions.ps1 -ActionRunSpec <job>\spec.json`; spec.json carries the tool paths the agent resolved.
+  The user lane refuses a system-lane action and re-validates the args. `update_ollama` (winget), `windows_update`,
+  `free_disk` and `forge_uninstall` run as SYSTEM.
+- **Maintenance** (Machines > Maintenance, `/api/maintenance/*`): one machine at a time in rollout order (canary first,
+  descending priority number, leader last), stop on the first failure, offline machines skipped. Weekly by default:
+  Sunday 04:00 `update_ai_tools`, `update_t3`, `update_ollama`, `winget_upgrade` (prefs `upkeep.schedule`).
+- **Repo sync** (per project "Keep in sync on"): every 30 min a hidden `git_sync` job per listed machine and repo:
+  `git fetch --prune`, then `git merge --ff-only @{u}` only when the tree is clean, the branch has an upstream and is not
+  ahead. It never pushes. `diverged` / `error` show up as "Needs you" (`repo_conflict`).
+- **Windows Update** (`windows_update`, COM `Microsoft.Update.Session` as SYSTEM, no PSWindowsUpdate): window 03:00-05:00
+  local, staggered 30 min per machine in rollout order, leader last; per-machine override `settings.wu_window`
+  (`"HH:MM-HH:MM"` or `"off"`). The action never reboots. The hub queues `reboot {delay_s: 60}` only when the result says
+  `reboot_required`, another hub is healthy and eligible, and the window is still open; otherwise it raises `reboot_pending`.
+- **Wake-on-LAN.** The user agent reports `metrics.macs` (up physical adapters with an IPv4; `agent-config.json`
+  `"wol_enabled": false` turns it off). Wake asks up to 2 online machines on the same subnet to send the magic packet
+  (UDP 9, directed broadcast + 255.255.255.255). Wake-on-LAN must be enabled in the BIOS/NIC settings.
+- **Ollama models dir.** When `work_root` is not on the system drive, the keep-alive `ollama serve` gets
+  `OLLAMA_MODELS=<work_root>\ollama\models` (`agent-config.json` `ollama_models_dir` wins). This is skipped when
+  `OLLAMA_MODELS` is already set for the machine or the user. It applies only when the agent itself starts `ollama serve`,
+  not to an Ollama tray app that is already running. The brief machine pre-pulls `brief_model` once a day inside
+  `brief_window` when its report (`metrics.ollama_models`) shows the model missing.
+- **Service state.** `metrics.services[].state` is `ok`, `starting` (the first `starting_grace_s`, default 60 s, after a
+  (re)start) or `down`. `ok` stays a bool.
+- **Scratch projects.** Session folders under `...\claude-data\<x>\scratch-workspaces\...` and `...\AppData\Local\Temp\...`
+  belong to `misc:<node>` ("Scratch / misc"). On its first tick the 2.3 leader merges the per-folder projects that 2.2 created.
+
+## The UI (2.3)
+
+Open `http://<any machine>:8787/` (the installed app opens `#/today`). Four tabs: **Today** (status sentence, "Needs you" with
+one button each, what is running, recent sessions, morning brief), **Projects**, **Machines** (compact rows; Maintenance, Add
+machine and Advanced live here) and **Activity** (tasks, maintenance runs, events). Every view has a link: `#/today`,
+`#/projects`, `#/project/<id>`, `#/session/<tool>/<id>`, `#/machines`, `#/machine/<id>`, `#/machines/maintenance`,
+`#/machines/advanced`, `#/activity`, `#/task/<id>`, `#/settings`, `#/add-machine` (the 2.2 `#fleet`, `#jobs`, `#health`
+still work). Ctrl/Cmd+K focuses **Ask Hivemind**. Admin and destructive actions ask for the 6-digit admin PIN (Settings → Admin
+PIN). Theme: Settings → Appearance (stored per browser as `hm.theme`). `/?claim=<code>` signs a phone in with a pairing code
+from Machines → Add machine → Phone. The service worker (offline view, Web Push) only runs on `https://` or `localhost`; over
+plain `http://` to a Tailscale address the UI works normally without it, and ntfy is the way to get phone alerts.
+
+UI development without a fleet: `python tools\mock_ui_server.py` (port 19210, range 19210-19249) serves the real
+`hub\static` with canned 2.3 data; mock admin PIN `123456`; `POST /mock/empty` (first run), `/mock/v22` (2.2 leader),
+`/mock/nopin`, `/mock/503` switch scenarios.
+
 ## Tests
 
 ```powershell
@@ -200,7 +313,43 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\run-tests.ps1    # 
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\dry-run.ps1      # installer + watchdog dry runs + update-lease client + job dir pruning (fake hub on 19052)
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\agent-smoke.ps1  # agent vs fake hub on 19050 + fake ollama on 19051: shell, resume (fake claude), ollama brief, timeout, worker-restart re-attach, sessions, watch, commits, services
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\agent-system-smoke.ps1  # SYSTEM lane (runs as you, actions dry-run) vs fake hub on 19053
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\p3-upkeep.ps1         # 2.3 F: action builders, git_sync on scratch repos, fake-COM Windows Update, WoL (UDP sink 19250), installer -NewFleet helpers
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\p3-upkeep-smoke.ps1   # 2.3 F: user-lane worker vs fake hub on 19265 (git_sync action, refusals, macs/models/service state, WoL)
+
+node --test tests\js\ui_logic.test.mjs tests\js\ui_p3.test.mjs                 # UI pure logic (also run by pytest): routes, Ask, Today fallback, QR codes
 ```
+The smoke and dry-run scripts also accept the Phase 3 team port ranges (19100-19299), e.g. `dry-run.ps1 -Port 19255`.
+`dry-run.ps1` now also runs `install.ps1 -NewFleet -DryRun`.
 The session fixtures are synthetic but follow the real Claude Code / Codex record shapes, and every secret in them is fake.
 The smoke test never reads the real `~/.claude` or `~/.codex`: it points `claude_home` and `codex_sessions_dir` at a
 scratch dir.
+
+## Security (2.3)
+- **Jobs run least-privilege.** The user-lane agent (S4U task, full admin token) starts every job with a SAFER
+  normal-user token: same user and profile (claude / codex / git logins keep working), Medium integrity, Administrators
+  deny-only. The job's first output line says so: `[node] claude started in <cwd> as BOX\user (filtered token, Medium)`.
+  The agent grants the user Modify on `<work_root>\jobs\<id>` and `<work_root>\scratch\<id>` only.
+  Opt-out: `data\config.json` `"job_token_mode": "full"` (admin-written; the same key in `agent-config.json` is
+  ignored, so a job cannot opt the node out; reported, and the hub raises an error alert). If the SAFER token cannot be
+  created, normal jobs still run with the agent's own token, `full_access` jobs are refused, the hub alerts
+  (`job_token_full`), and the agent retries creating it (every 60 s, on the next job). A job whose launch fails with a
+  good token (e.g. a bad cwd) just fails; nothing falls back. `agent.log` start line shows `job_token=...`.
+- **Secrets** live in `data\private\secrets.json` (Administrators + SYSTEM only; the hub, agents and watchdog read it,
+  a filtered job cannot). `data\config.json` keeps `node_id`, `agent_token`, `port`. The DB is `data\private\forge.db`.
+  `agent\secrets.ps1`: `Read-ForgeSecrets`, `Write-ForgeSecrets`, `Set-ForgeDataAcl` (installer / watchdog migration),
+  `New-ForgePinHash`.
+- **Joining** uses a one-time code: Machines > Add machine shows `irm '<hub>/agent/install.ps1?code=XXXX-XXXX' | iex`
+  (10 minutes, single use). Phones / browsers pair with `<hub>/?claim=XXXX-XXXX`.
+- **Admin PIN**: admin PowerShell, destructive actions, token rotation, signing key and hub removal ask for the 6-digit
+  PIN (again after 10 minutes per device). Scripts: header `X-Admin-Pin`. Forgotten PIN: on the leader, in an elevated
+  PowerShell, `tools\reset-admin-pin.ps1`, then set a new PIN in Settings.
+- **Rollback to 2.2**: when the watchdog rolls a node back to a pre-2.3 release it first stops the hub and puts
+  `ui_token` / `cluster_token` back into `data\config.json` and `forge.db` back into `data\` (`Restore-Pre23Layout`);
+  the next 2.3 start migrates again.
+- **Signed releases**: on the publishing machine run `tools\new-signing-key.ps1` once (RSA-3072, DPAPI-protected at
+  `%LOCALAPPDATA%\Hivemind\signing-key.dpapi`), pin the printed public key (Machines > Advanced, or
+  `PUT /api/security/signing-key`), then `tools\build-bundle.ps1 -Sign` / `tools\publish.ps1 -Sign`. Once a key is
+  pinned, hubs refuse unsigned publishes and watchdogs refuse to activate unsigned releases (`watchdog.json`
+  `signature_refused`).
+- Tests: `tests\ps\p3-security.ps1` (real filtered child processes; cross-checks the Python verifier) and
+  `tests\test_p3_security.py`.

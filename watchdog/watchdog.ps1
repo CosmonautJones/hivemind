@@ -10,6 +10,11 @@
 #      record the version in data\bad-versions.txt.
 #   4. keep the last 3 releases; data\watchdog.log (rotated at 5 MB); data\watchdog.json.
 #      Job dirs under <work_root>\jobs untouched for 14 days are deleted (at most once per hour; running jobs kept).
+#   2.3 (CONTRACT-phase3 R): the ForgeWatchdog task runs the frozen <FH>\bin\wd-launcher.ps1 (copied + task migrated
+#      here once); the agents run under <FH>\bin\agent-loop.cmd (no in-script supervisor). Release health =
+#      /healthz ok (DB write probe, free space) + eligible + the local agent on the new version (release_health_s);
+#      a 503 for low disk only is not restarted, a failed DB write probe is (max 3/h). Requirements: unchanged -> no pip; changed -> releases\<ver>\venv
+#      (promoted into <FH>\venv once the release is confirmed).
 #   2.2 (SPEC-phase2 A): download/extract any time, but ACTIVATE (pip + flip) only while holding the leader's
 #      update lease (POST /cluster/update-lease); "waiting for update lease (holder X)" otherwise. Pre-2.2 leader
 #      (404) -> old behaviour; no leader reachable for > 5 min -> proceed (lone survivor). The lease is released
@@ -26,7 +31,7 @@ param(
     [switch]$NoRun
 )
 
-$WatchdogVersion = '2.2.0'
+$WatchdogVersion = '2.3.0'
 $RequiredBundleFiles = @('hub/app.py', 'agent/forge-agent.ps1', 'watchdog/watchdog.ps1', 'watchdog/run-hub.cmd')
 
 # ======================= pure helpers (unit-tested) =======================
@@ -460,7 +465,169 @@ function Test-CleanupDue($LastRun, [double]$Now, [int]$EverySec = 3600) {
     ($Now - [double]$LastRun) -ge $EverySec
 }
 
+
+# ---- 2.3 R1: release health gate (CONTRACT-phase3.md section 5 R1) ----
+# A release on probation is healthy when /healthz answers ok, /cluster/status says eligible, and the local agent reports
+# the new bundle_version within HealthSec (release_health_s, 180). Returns @{ok; pending; reason}:
+#   pending = not judged yet (does not count as a strike): the hub is still syncing, the agent is restarting or still
+#             draining its jobs toward this version (agent draining_to), or the disk is low (not the release's fault).
+# Status $null (status call failed) keeps the 2.2 rule: healthz alone decides.
+function Get-ReleaseHealth {
+    param([bool]$HubUp, [bool]$HubOk, $Body = $null, $Status = $null, [string]$Version, [double]$ElapsedSec = 0,
+          [int]$HealthSec = 180, [bool]$AgentRequired = $true, [int]$DrainSec = 1800)
+    if (-not $HubUp) { return @{ ok = $false; pending = $false; reason = 'hub does not answer /healthz' } }
+    if (-not $HubOk) {
+        $chk = if ($Body) { $Body.checks } else { $null }
+        if ($chk -and $chk.db_write -ne $false -and $chk.disk -eq $false) {
+            return @{ ok = $false; pending = $true; reason = "low disk ($($Body.free_gb) GB free); not counted against the release" }
+        }
+        $why = if ($chk -and $chk.db_write -eq $false) { 'database write probe failed' } else { 'healthz unhealthy' }
+        return @{ ok = $false; pending = $false; reason = $why }
+    }
+    if (-not $Status) { return @{ ok = $true; pending = $false; reason = 'healthz ok (no cluster status)' } }
+    $run = [string]$Status.running_version
+    if ($run -and $Version -and $run -ne $Version) { return @{ ok = $false; pending = $false; reason = "hub runs $run, not $Version" } }
+    if ($Status.eligible -eq $false) {
+        if ($ElapsedSec -lt $HealthSec) { return @{ ok = $false; pending = $true; reason = 'hub is not eligible yet (syncing)' } }
+        return @{ ok = $false; pending = $false; reason = "hub not eligible after $HealthSec s" }
+    }
+    $la = $Status.local_agent
+    if ($AgentRequired -and $la) {
+        $bv = [string]$la.bundle_version
+        if (-not ($bv -and (Compare-SemVer $bv $Version) -ge 0)) {
+            if ([string]$la.draining_to -eq $Version -and $ElapsedSec -lt ($DrainSec + $HealthSec)) {
+                return @{ ok = $false; pending = $true; reason = "agent is draining its jobs before it restarts on $Version" }
+            }
+            if ($ElapsedSec -lt $HealthSec) { return @{ ok = $false; pending = $true; reason = "waiting for the agent to report $Version" } }
+            return @{ ok = $false; pending = $false; reason = "agent did not report $Version within $HealthSec s (reports '$bv')" }
+        }
+    }
+    @{ ok = $true; pending = $false; reason = 'healthz ok, eligible, agent on the new version' }
+}
+
+# Seconds since an ISO-8601 time ('o' format), 0 when missing / unparsable.
+function Get-ElapsedSec($Since, [double]$NowEpoch) {
+    if (-not $Since) { return 0 }
+    try { [Math]::Max(0, $NowEpoch - [double]([DateTimeOffset]::Parse([string]$Since, [Globalization.CultureInfo]::InvariantCulture)).ToUnixTimeSeconds()) } catch { 0 }
+}
+
+# ---- 2.3 R5: per-release venv ----
+# ReleaseSha = sha256 of the release's requirements.txt ('' = none); BaseSha = what <FH>\venv has (data\requirements.sha256);
+# OwnSha = releases\<ver>\venv\forge-requirements.sha256 when the release already has its own venv.
+#   none  -> the base venv fits (no pip, no venv);  keep -> its own venv already fits;  build -> python -m venv + pip.
+function Get-VenvPlan([string]$ReleaseSha, [string]$BaseSha, [string]$OwnSha) {
+    if (-not $ReleaseSha -or $ReleaseSha -eq $BaseSha) { return 'none' }
+    if ($OwnSha -and $OwnSha -eq $ReleaseSha) { return 'keep' }
+    'build'
+}
+
+# python.exe the base venv was made from (pyvenv.cfg home = ...), else the venv's own python.
+function Get-BasePython([string]$ForgeHome) {
+    $venvPy = Join-Path $ForgeHome 'venv\Scripts\python.exe'
+    $cfgFile = Join-Path $ForgeHome 'venv\pyvenv.cfg'
+    if (Test-Path -LiteralPath $cfgFile) {
+        foreach ($l in Get-Content -LiteralPath $cfgFile) {
+            if ($l -match '^\s*home\s*=\s*(.+?)\s*$') { $p = Join-Path $Matches[1] 'python.exe'; if (Test-Path -LiteralPath $p) { return $p } }
+        }
+    }
+    $venvPy
+}
+
+# ---- 2.3 R2 / R7: frozen launcher + agent loop in <FH>\bin, task specs ----
+# Version stamped in a launcher file: $LauncherVersion = N (wd-launcher.ps1) or "rem LoopVersion=N" (agent-loop.cmd).
+function Get-LauncherFileVersion([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+    $t = [IO.File]::ReadAllText($Path)
+    if ($t -match '\$LauncherVersion\s*=\s*(\d+)') { return [int]$Matches[1] }
+    if ($t -match 'LoopVersion=(\d+)') { return [int]$Matches[1] }
+    0
+}
+
+# Copies current\watchdog\wd-launcher.ps1 + agent-loop.cmd to <FH>\bin when missing or older. -> , @(file names copied)
+# <FH>\bin inherits the <FH> root ACL (Administrators + SYSTEM full, the user read + execute): never under data\.
+function Install-WdLauncher {
+    param([string]$ForgeHome, [switch]$DryRun)
+    $src = Join-Path $ForgeHome 'current\watchdog'
+    $bin = Join-Path $ForgeHome 'bin'
+    $done = New-Object System.Collections.Generic.List[string]
+    foreach ($f in 'wd-launcher.ps1', 'agent-loop.cmd') {
+        $s = Join-Path $src $f; $d = Join-Path $bin $f
+        if (-not (Test-Path -LiteralPath $s)) { continue }
+        if ((Test-Path -LiteralPath $d) -and (Get-LauncherFileVersion $s) -le (Get-LauncherFileVersion $d)) { continue }
+        $done.Add($f)
+        if ($DryRun) { continue }
+        New-Item -ItemType Directory -Force $bin | Out-Null
+        Copy-Item -LiteralPath $s -Destination "$d.tmp" -Force
+        Move-Item -LiteralPath "$d.tmp" -Destination $d -Force
+    }
+    , $done.ToArray()
+}
+
+# The four Forge tasks as 2.3 registers them. user = 'user' (S4U, the node user) | 'system';
+# trigger = 'startup' | 'minute'; restart = @{count; interval_min} (long-running tasks) | $null.
+function Get-ForgeTaskSpecs {
+    param([string]$ForgeHome)
+    $cur = Join-Path $ForgeHome 'current'; $bin = Join-Path $ForgeHome 'bin'; $data = Join-Path $ForgeHome 'data'
+    $restart = @{ count = 3; interval_min = 1 }
+    @(
+        @{ name = 'ForgeHub'; user = 'user'; command = 'cmd.exe'; arguments = "/d /c `"$cur\watchdog\run-hub.cmd`""; dir = $cur; trigger = 'startup'; restart = $restart },
+        @{ name = 'ForgeAgent'; user = 'user'; command = 'cmd.exe'; arguments = "/d /s /c `"`"$bin\agent-loop.cmd`" user`""; dir = $data; trigger = 'startup'; restart = $restart },
+        @{ name = 'ForgeSystemAgent'; user = 'system'; command = 'cmd.exe'; arguments = "/d /s /c `"`"$bin\agent-loop.cmd`" system`""; dir = $data; trigger = 'startup'; restart = $restart },
+        @{ name = 'ForgeWatchdog'; user = 'system'; command = 'powershell.exe'; arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$bin\wd-launcher.ps1`" -ForgeHome `"$ForgeHome`""; dir = $data; trigger = 'minute'; restart = $null }
+    )
+}
+
+# Should an existing task's action be moved to its 2.3 spec? 'migrate' | 'current' (already there) |
+# 'foreign' (the task runs another ForgeHome: e.g. a scratch dry run on a machine with a live fleet; never touch it).
+function Test-TaskMigration($Spec, [string]$Execute, [string]$Arguments, [string]$ForgeHome) {
+    $line = "$Execute $Arguments"
+    if ($line.IndexOf($ForgeHome.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -lt 0) { return 'foreign' }
+    if ($Execute -eq $Spec.command -and $Arguments -eq $Spec.arguments) { return 'current' }
+    $marker = if ($Spec.name -eq 'ForgeWatchdog') { 'bin\wd-launcher.ps1' } elseif ($Spec.name -like 'Forge*Agent') { 'bin\agent-loop.cmd' } else { $null }
+    if (-not $marker -or $Arguments.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'current' }
+    'migrate'
+}
+
+# ---- 2.3 R1: a hub that answers 503 ----
+# Low disk alone (db_write ok) -> leave it running: a restart frees nothing. A failed DB write probe (SQLite I/O error,
+# disk full, a wedged connection or store lock) -> restart, at most MaxPerHour times per rolling hour.
+# Restarts = epochs of earlier DB-probe restarts (State.db_restarts). Returns @{action = restart|limit|skip; restarts; reason}.
+function Get-UnhealthyHubAction {
+    param($Body = $null, [object[]]$Restarts = @(), [double]$Now = 0, [int]$MaxPerHour = 3)
+    $recent = @(@($Restarts) | Where-Object { $null -ne $_ -and "$_" -ne '' -and ($Now - [double]$_) -lt 3600 } | ForEach-Object { [double]$_ })
+    $chk = if ($Body) { $Body.checks } else { $null }
+    if (-not ($chk -and $chk.db_write -eq $false)) {
+        return @{ action = 'skip'; restarts = $recent; reason = "hub reports unhealthy (db_write=$(if ($chk) { $chk.db_write }), disk=$(if ($chk) { $chk.disk }), $(if ($Body) { $Body.free_gb }) GB free); not restarting it" }
+    }
+    if ($recent.Count -ge $MaxPerHour) {
+        return @{ action = 'limit'; restarts = $recent; reason = "database write probe failing; already restarted $($recent.Count) times in the last hour, not again" }
+    }
+    @{ action = 'restart'; restarts = @($recent + @($Now)); reason = 'database write probe failed twice' }
+}
+
+# ---- 2.3 R1: keep the update lease while the release is still on probation ----
+# The leader's lease TTL is 10 min, but a probation can stay pending (agent draining) for drain_timeout_s + 180 s.
+# Renew (re-POST for the same node + version; the leader refreshes `expires`) while pending, every EverySec.
+function Test-LeaseRenewDue {
+    param($Lease, [string]$Version, [bool]$Pending, [double]$Now, [int]$EverySec = 120)
+    if (-not $Pending -or -not $Lease -or -not $Lease.url -or [string]$Lease.version -ne $Version) { return $false }
+    $last = if ($Lease.renewed) { [double]$Lease.renewed } elseif ($Lease.at) { [double]$Lease.at } else { 0 }
+    ($Now - $last) -ge $EverySec
+}
+
+# ---- 2.3 R1: /healthz result. up = the hub answered (200 or a 503 health body); ok = 200 ----
+function ConvertFrom-HealthzReply([int]$Code, [string]$Text) {
+    $body = $null; if ($Text) { try { $body = $Text | ConvertFrom-Json } catch { $body = $null } }
+    $up = ($Code -eq 200) -or ($Code -eq 503 -and $body -and $null -ne $body.checks)
+    @{ up = [bool]$up; ok = ($Code -eq 200); code = $Code; body = $body }
+}
+
 if ($NoRun) { return }
+
+# 2.3 (CONTRACT-phase3.md section 6.4): signed bundles + secrets.json (workstream S). Missing -> 2.2 behaviour.
+$VerifyBundleScript = Join-Path $PSScriptRoot 'verify-bundle.ps1'
+$HasVerifyBundle = Test-Path -LiteralPath $VerifyBundleScript
+if ($HasVerifyBundle) { . $VerifyBundleScript }
 
 # ======================= runtime =======================
 $ErrorActionPreference = 'Continue'
@@ -490,9 +657,18 @@ function Invoke-Action([string]$What, [scriptblock]$Do) {
     try { & $Do; $true } catch { Write-WdLog "  failed: $($_.Exception.Message)"; $false }
 }
 
-function Test-Healthz {
-    try { $r = Invoke-WebRequest -Uri "$Local/healthz" -UseBasicParsing -TimeoutSec 4; return ($r.StatusCode -eq 200) } catch { $false }
+function Get-Healthz {
+    try {
+        $r = Invoke-WebRequest -Uri "$Local/healthz" -UseBasicParsing -TimeoutSec 4
+        return (ConvertFrom-HealthzReply ([int]$r.StatusCode) ([string]$r.Content))
+    } catch {
+        $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        $txt = ''; try { $txt = [string]$_.ErrorDetails.Message } catch {}
+        return (ConvertFrom-HealthzReply $code $txt)
+    }
 }
+
+function Test-Healthz { (Get-Healthz).ok }
 
 function Get-ClusterStatus([string]$Base, [string]$Token, [int]$Timeout = 3) {
     try { Invoke-RestMethod -Uri "$($Base.TrimEnd('/'))/cluster/status" -Headers @{ 'X-Cluster-Token' = $Token } -TimeoutSec $Timeout -UseBasicParsing }
@@ -633,7 +809,8 @@ function Install-Requirements([string]$ReleaseDir) {
     if (-not (Test-Path -LiteralPath $py)) { Write-WdLog "venv missing at $py; cannot pip install"; return $false }
     $script:pipOk = $false
     Invoke-Action "pip install -r $ReleaseDir\requirements.txt" {
-        $r = Invoke-Native $py "-m pip install --disable-pip-version-check -q -r `"$(Join-Path $ReleaseDir 'requirements.txt')`""
+        Write-WdHeartbeat "pip install into the base venv"
+        $r = Invoke-Native $py (Get-PipArgs $ReleaseDir) 420
         if ($r.out) { Write-WdLog "  pip: $($r.out)" }
         if ($r.code -ne 0) { throw "pip exited $($r.code)" }
         [IO.File]::WriteAllText($shaFile, $want, (New-Object Text.UTF8Encoding($false)))
@@ -641,6 +818,98 @@ function Install-Requirements([string]$ReleaseDir) {
     } | Out-Null
     if ($DryRun) { return $true }
     [bool]$script:pipOk
+}
+
+# 2.3 R5: a long venv build must not look like a hung watchdog to wd-launcher.ps1 (it runs the previous release's
+# watchdog once watchdog.json last_run is > 10 min old): refresh last_run (and say what is running) before each step.
+function Write-WdHeartbeat([string]$What) {
+    if ($DryRun) { return }
+    try {
+        $f = Join-Path $DataDir 'watchdog.json'
+        $j = ConvertTo-Hashtable (Read-JsonFile $f)
+        $j.last_run = (Get-Date).ToString('o'); $j.busy = $What; $j.busy_since = (Get-Date).ToString('o')
+        Write-JsonFile $f $j
+    } catch {}
+}
+
+function Get-PipArgs([string]$ReleaseDir) {
+    $cache = Join-Path $DataDir 'tmp\pip-cache'          # resumable: a retry reuses what was already downloaded
+    "-m pip install --disable-pip-version-check -q --timeout 60 --retries 3 --cache-dir `"$cache`" -r `"$(Join-Path $ReleaseDir 'requirements.txt')`""
+}
+
+# 2.3 R5: make <ReleaseDir> runnable. Its requirements equal the base venv's -> nothing (no pip). Otherwise build
+# <ReleaseDir>\venv (python -m venv from the base interpreter + pip install) before the flip; run-hub.cmd prefers it.
+function Install-ReleaseRequirements([string]$ReleaseDir) {
+    $want = Get-RequirementsSha $ReleaseDir
+    $shaFile = Join-Path $DataDir 'requirements.sha256'
+    $base = if (Test-Path -LiteralPath $shaFile) { (Get-Content -LiteralPath $shaFile -Raw).Trim() } else { '' }
+    $venv = Join-Path $ReleaseDir 'venv'; $ownFile = Join-Path $venv 'forge-requirements.sha256'
+    $own = if (Test-Path -LiteralPath $ownFile) { (Get-Content -LiteralPath $ownFile -Raw).Trim() } else { '' }
+    $plan = Get-VenvPlan $want $base $own
+    if ($plan -eq 'none') { Write-WdLog "requirements of $(Split-Path -Leaf $ReleaseDir) unchanged; no pip"; return $true }
+    if ($plan -eq 'keep') { Write-WdLog "release venv $venv already matches its requirements"; return $true }
+    $py = Get-BasePython $ForgeHome
+    if (-not (Test-Path -LiteralPath $py)) { Write-WdLog "no python at $py; cannot build $venv"; return $false }
+    $script:venvOk = $false
+    Invoke-Action "create $venv (requirements changed) + pip install" {
+        if (Test-Path -LiteralPath $venv) { Remove-Item -LiteralPath $venv -Recurse -Force }
+        Write-WdHeartbeat "python -m venv $venv"
+        $r = Invoke-Native $py "-m venv `"$venv`"" 180
+        if ($r.code -ne 0) { throw "venv exited $($r.code): $($r.out)" }
+        Write-WdHeartbeat "pip install for $(Split-Path -Leaf $ReleaseDir)"
+        # bounded so the whole run stays inside the task's 15 min limit and the launcher's 10 min staleness rule
+        $r = Invoke-Native (Join-Path $venv 'Scripts\python.exe') (Get-PipArgs $ReleaseDir) 420
+        if ($r.out) { Write-WdLog "  pip: $($r.out)" }
+        if ($r.code -ne 0) { throw "pip exited $($r.code)" }
+        [IO.File]::WriteAllText($ownFile, $want, (New-Object Text.UTF8Encoding($false)))
+        $script:venvOk = $true
+    } | Out-Null
+    if ($DryRun) { return $true }
+    if (-not $script:venvOk -and (Test-Path -LiteralPath $venv)) { Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue }
+    [bool]$script:venvOk
+}
+
+# After a release with its own venv is confirmed: bring the base venv up to it, so the next release with the same
+# requirements needs no venv of its own.
+function Invoke-VenvPromotion([string]$ReleaseDir) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ReleaseDir 'venv\forge-requirements.sha256'))) { return }
+    if (-not (Install-Requirements $ReleaseDir)) { Write-WdLog "could not update the base venv to $(Split-Path -Leaf $ReleaseDir)'s requirements (the release keeps its own venv)" }
+}
+
+# 2.3 R2/R7, once per node: <FH>\bin launcher files, then the task actions (only tasks that run THIS ForgeHome).
+function Invoke-LauncherMigration {
+    $copied = Install-WdLauncher -ForgeHome $ForgeHome -DryRun:$DryRun
+    foreach ($f in $copied) { $script:Actions.Add("install bin\$f"); Write-WdLog "$(if ($DryRun) { '[dry-run] ' } else { 'ACTION ' })install bin\$f" }
+    $bin = Join-Path $ForgeHome 'bin'
+    if (-not $DryRun -and -not ((Test-Path -LiteralPath (Join-Path $bin 'wd-launcher.ps1')) -and (Test-Path -LiteralPath (Join-Path $bin 'agent-loop.cmd')))) { return }
+    foreach ($spec in (Get-ForgeTaskSpecs -ForgeHome $ForgeHome)) {
+        if ($spec.name -eq 'ForgeHub') { continue }
+        $task = Get-ScheduledTask -TaskName $spec.name -ErrorAction SilentlyContinue
+        if (-not $task -or -not $task.Actions) { continue }
+        $act = @($task.Actions)[0]
+        $m = Test-TaskMigration $spec ([string]$act.Execute) ([string]$act.Arguments) $ForgeHome
+        if ($m -ne 'migrate') { continue }
+        $target = if ($spec.name -eq 'ForgeWatchdog') { 'bin\wd-launcher.ps1' } else { 'bin\agent-loop.cmd' }
+        $user = [string]$task.Principal.UserId
+        Invoke-Action "migrate $($spec.name) -> $target" { Register-ForgeTaskSpec $spec $user } | Out-Null
+    }
+}
+
+function Register-ForgeTaskSpec($Spec, [string]$User) {
+    $a = New-ScheduledTaskAction -Execute $Spec.command -Argument $Spec.arguments -WorkingDirectory $Spec.dir
+    $boot = New-ScheduledTaskTrigger -AtStartup; $boot.Delay = 'PT15S'
+    if ($Spec.trigger -eq 'minute') {
+        $rep = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+        $triggers = @($boot, $rep)
+        $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew -StartWhenAvailable
+    } else {
+        $triggers = @($boot)
+        $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -RestartCount $Spec.restart.count -RestartInterval (New-TimeSpan -Minutes $Spec.restart.interval_min) -MultipleInstances IgnoreNew -StartWhenAvailable
+    }
+    if ($Spec.user -eq 'system') { $p = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest }
+    else { $p = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel Limited }
+    Register-ScheduledTask -TaskName $Spec.name -Action $a -Trigger $triggers -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null
 }
 
 function Get-PeerStatuses($Cfg, $LocalStatus) {
@@ -672,7 +941,7 @@ function Get-PeerStatuses($Cfg, $LocalStatus) {
 }
 
 # Returns 'ok' (switched), 'fail' (backoff applies) or 'wait' (release staged, waiting for the update lease).
-function Invoke-Update($Cand, [string]$CurVer, $Cfg, [object[]]$Peers = @(), [double]$NowEpoch = 0) {
+function Invoke-Update($Cand, [string]$CurVer, $Cfg, [object[]]$Peers = @(), [double]$NowEpoch = 0, $LocalStatus = $null) {
     $ver = [string]$Cand.version
     $dl = Join-Path $DataDir 'tmp'
     $zip = Join-Path $dl "forge-$ver.zip"
@@ -690,6 +959,11 @@ function Invoke-Update($Cand, [string]$CurVer, $Cfg, [object[]]$Peers = @(), [do
       Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
     }
     if (-not $ok) { return 'fail' }
+    # ---- 2.3 S6: never activate a release whose signature does not verify against the pinned key ----
+    if ($HasVerifyBundle) {
+        $sig = Test-BundleSignature -ReleaseDir (Join-Path $ForgeHome "releases\$ver") -PubKeyXml (Get-SigningPubKey $DataDir)
+        if (-not $sig.ok) { Write-WdLog "release $ver refused: $($sig.reason)"; $script:Actions.Add("refused unsigned/bad release $ver"); $script:State.signature_refused = $ver; return 'fail' }
+    }
 
     # ---- 2.2: activation needs the fleet update lease (canary first, leader last; SPEC-phase2 A) ----
     # the leader seen in the statuses, else the local hub (a 2.2 standby proxies /cluster/update-lease to the leader; 503 = no leader)
@@ -702,10 +976,12 @@ function Invoke-Update($Cand, [string]$CurVer, $Cfg, [object[]]$Peers = @(), [do
     Write-WdLog "update to ${ver}: $($ld.reason)"
 
     $relDir = Join-Path $ForgeHome "releases\$ver"
-    if (-not (Install-Requirements $relDir)) { Write-WdLog "requirements for $ver failed; not switching"; Clear-UpdateLease $Cfg $null; return 'fail' }
+    if (-not (Install-ReleaseRequirements $relDir)) { Write-WdLog "requirements for $ver failed; not switching"; Clear-UpdateLease $Cfg $null; return 'fail' }
     $flipped = Invoke-Action "switch current -> releases\$ver" { Set-CurrentRelease $ForgeHome $ver }
     if (-not $flipped) { Clear-UpdateLease $Cfg $null; return 'fail' }
-    $script:State.probation = @{ from = $CurVer; to = $ver; fails = 0; since = (Get-Date).ToString('o') }
+    # 2.3 R1: the release must also bring the local agent onto it, if that agent was reporting before the flip
+    $agentReq = [bool]($LocalStatus -and $LocalStatus.local_agent -and $LocalStatus.local_agent.online)
+    $script:State.probation = @{ from = $CurVer; to = $ver; fails = 0; since = (Get-Date).ToString('o'); agent_required = $agentReq }
     $script:State.active_version = $ver
     Restart-Hub "updated to $ver"
     'ok'
@@ -723,7 +999,9 @@ function Invoke-Watchdog {
         $script:State = ConvertTo-Hashtable (Read-JsonFile $StatePath)
         $cfg = Read-JsonFile (Join-Path $DataDir 'config.json')
         if (-not $cfg) { Write-WdLog "no data\config.json yet; nothing to do"; return }
+        if ($HasVerifyBundle) { $cfg = Merge-WdSecrets $cfg $DataDir }   # 2.3 S2: cluster_token etc. from data\private\secrets.json
         $bad = Get-BadVersions $DataDir
+        try { Invoke-LauncherMigration } catch { Write-WdLog "launcher migration failed: $($_.Exception.Message)" }
         $curVer = Get-CurrentVersion $ForgeHome
         if (-not $curVer) { Write-WdLog "no current release under $ForgeHome; nothing to do"; return }
         $prob = $script:State.probation
@@ -742,19 +1020,43 @@ function Invoke-Watchdog {
         # ---- 1. hub health ----
         $grace = $false
         if ($script:State.last_hub_restart) { $grace = (($nowEpoch - [double]$script:State.last_hub_restart) -lt 45) }
-        $hubOk = Test-Healthz
-        if (-not $hubOk -and -not $grace) { Start-Sleep -Seconds 5; $hubOk = Test-Healthz }
+        $hz = Get-Healthz
+        if (-not $hz.up -and -not $grace) { Start-Sleep -Seconds 5; $hz = Get-Healthz }
+        elseif ($hz.up -and -not $hz.ok -and $hz.body -and $hz.body.checks -and $hz.body.checks.db_write -eq $false -and -not $grace) {
+            Start-Sleep -Seconds 5; $hz = Get-Healthz      # a failed DB write probe must fail twice before a restart
+        }
+        $hubUp = [bool]$hz.up; $hubOk = [bool]$hz.ok
         $running = $null; $st = $null
-        if ($hubOk) {
+        if ($hubUp) {
             $st = Get-ClusterStatus $Local $cfg.cluster_token
             # status.version = latest AVAILABLE bundle; running_version = what the process runs
             if ($st) { $running = if ($st.running_version) { [string]$st.running_version } else { [string]$st.version } }
         }
 
-        $dec = Get-RollbackDecision -Probation $prob -CurrentVersion $curVer -HealthOk ($hubOk -and (-not $running -or $running -eq $curVer)) -InGrace ($grace -or $justSwitched)
+        # 2.3 R1 health gate: healthz (DB write + disk) + eligible + local agent on the new version within release_health_s
+        $health = @{ ok = ($hubOk -and (-not $running -or $running -eq $curVer)); pending = $false; reason = '' }
+        if ($prob -and $prob.to -eq $curVer) {
+            if ($null -eq $prob.agent_required) {      # switched externally: required when the agent reports right now
+                $req = [bool]($st -and $st.local_agent -and $st.local_agent.online)
+                if ($prob -is [hashtable]) { $prob.agent_required = $req } else { $prob | Add-Member -NotePropertyName agent_required -NotePropertyValue $req -Force }
+            }
+            $hs = if ($cfg.release_health_s) { [int]$cfg.release_health_s } else { 180 }
+            $ds = if ($cfg.drain_timeout_s) { [int]$cfg.drain_timeout_s } else { 1800 }
+            $health = Get-ReleaseHealth -HubUp $hubUp -HubOk $hubOk -Body $hz.body -Status $st -Version $curVer -ElapsedSec (Get-ElapsedSec $prob.since $nowEpoch) `
+                -HealthSec $hs -AgentRequired ([bool]$prob.agent_required) -DrainSec $ds
+            if (-not $health.ok) { Write-WdLog "release $curVer on probation: $($health.reason)" }
+            $l = $script:State.lease
+            if (-not $DryRun -and (Test-LeaseRenewDue -Lease $l -Version $curVer -Pending ([bool]$health.pending) -Now $nowEpoch)) {
+                $rr = Request-UpdateLease ([string]$l.url) ([string]$cfg.cluster_token) (Get-WdNodeId $cfg) $curVer
+                $script:State.lease = @{ version = [string]$l.version; url = [string]$l.url; at = $l.at; renewed = $nowEpoch }
+                if ($rr.kind -ne 'granted') { Write-WdLog "could not renew the update lease for ${curVer}: $($rr.kind) $($rr.holder)$($rr.msg)" }
+            }
+        }
+        $dec = Get-RollbackDecision -Probation $prob -CurrentVersion $curVer -HealthOk $health.ok -InGrace ($grace -or $justSwitched -or $health.pending)
         switch ($dec.action) {
-            'confirm' { Write-WdLog "release $curVer confirmed healthy"; $script:State.probation = $null; try { Clear-UpdateLease $cfg $null } catch {} }
-            'wait'    { $script:State.probation.fails = $dec.fails; Write-WdLog "release $curVer unhealthy after update ($($dec.fails)/3)" }
+            'confirm' { Write-WdLog "release $curVer confirmed healthy"; $script:State.probation = $null; try { Clear-UpdateLease $cfg $null } catch {}
+                        try { Invoke-VenvPromotion (Join-Path $ForgeHome "releases\$curVer") } catch { Write-WdLog "venv promotion failed: $($_.Exception.Message)" } }
+            'wait'    { $script:State.probation.fails = $dec.fails; Write-WdLog "release $curVer unhealthy after update ($($dec.fails)/3): $($health.reason)" }
             'rollback' {
                 $from = [string]$prob.from
                 Invoke-Action "mark $curVer bad" {
@@ -765,7 +1067,15 @@ function Invoke-Watchdog {
                     if (Invoke-Action "rollback current $curVer -> $from" { Set-CurrentRelease $ForgeHome $from }) {
                         $script:State.active_version = $from
                         $curVer = $from
-                        Install-Requirements (Join-Path $ForgeHome "releases\$from") | Out-Null
+                        # 2.3 S-R7: a pre-2.3 hub reads its tokens from config.json and its DB from data\forge.db
+                        if ($HasVerifyBundle -and (Compare-SemVer $from '2.3.0') -lt 0) {
+                            Invoke-Action "restore the pre-2.3 data layout for $from (stop hub, tokens + forge.db back)" {
+                                Stop-ScheduledTask -TaskName 'ForgeHub' -ErrorAction SilentlyContinue
+                                Stop-PortListeners $Port
+                                foreach ($a in (Restore-Pre23Layout $DataDir)) { Write-WdLog "  $a" }
+                            } | Out-Null
+                        }
+                        Install-ReleaseRequirements (Join-Path $ForgeHome "releases\$from") | Out-Null
                     }
                 } else { Write-WdLog "cannot roll back: previous release '$from' not present" }
                 # 2.2: hand the lease back and tell the leader this version is bad (it marks it fleet-bad)
@@ -777,7 +1087,12 @@ function Invoke-Watchdog {
         }
 
         if (-not $grace -and $dec.action -ne 'rollback') {
-            if (-not $hubOk) { Restart-Hub 'healthz failed twice' ; $grace = $true }
+            if (-not $hubUp) { Restart-Hub 'healthz failed twice' ; $grace = $true }
+            elseif (-not $hubOk) {
+                $ua = Get-UnhealthyHubAction -Body $hz.body -Restarts @($script:State.db_restarts) -Now $nowEpoch
+                $script:State.db_restarts = @($ua.restarts)
+                if ($ua.action -eq 'restart') { Restart-Hub $ua.reason; $grace = $true } else { Write-WdLog $ua.reason }
+            }
             elseif ($running -and $running -ne $curVer) { Restart-Hub "running $running, current is $curVer"; $grace = $true }
         }
 
@@ -811,7 +1126,7 @@ function Invoke-Watchdog {
             }
             if (-not $cand) { $script:State.lease_wait = $null; $script:State.lease_no_leader_since = $null }
             if ($cand -and -not $backoff) {
-                $res = Invoke-Update $cand $curVer $cfg $peers $nowEpoch
+                $res = Invoke-Update $cand $curVer $cfg $peers $nowEpoch $st
                 if ($res -eq 'fail') { $script:State.update_fail = @{ version = $cand.version; at = $nowEpoch } }
                 elseif ($res -eq 'ok') { $script:State.update_fail = $null; $curVer = [string]$cand.version }
             }
@@ -836,11 +1151,14 @@ function Invoke-Watchdog {
         $script:State.last_action = $last
         $summary = [ordered]@{
             last_run = $now.ToString('o'); watchdog_version = $WatchdogVersion; node_id = $cfg.node_id
-            version = (Get-CurrentVersion $ForgeHome); hub_ok = [bool]$hubOk; hub_running_version = $running
+            version = (Get-CurrentVersion $ForgeHome); hub_ok = [bool]$hubOk; hub_up = [bool]$hubUp; hub_running_version = $running
+            release_health = $(if ($health.reason) { $health.reason } else { $null })
             agent_ok = [bool]$agentOk; system_agent_ok = [bool]$sysAgentOk; actions = @($script:Actions); last_action = $last
             probation = $script:State.probation; bad_versions = @($bad); peers = @($script:State.peers_seen)
             fleet_bad_versions = @($fleetBad); update_lease = $script:State.lease; lease_wait = $script:State.lease_wait
             dry_run = [bool]$DryRun
+            # 2.3 S6: newest release refused for a missing/bad signature (cleared once current reaches it)
+            signature_refused = $(if ($script:State.signature_refused -and (Compare-SemVer ([string]$script:State.signature_refused) ([string](Get-CurrentVersion $ForgeHome))) -gt 0) { [string]$script:State.signature_refused } else { $null })
         }
         if ($DryRun) { Write-Host (ConvertTo-Json -InputObject $summary -Depth 6); return }
         Write-JsonFile (Join-Path $DataDir 'watchdog.json') $summary

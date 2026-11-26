@@ -183,7 +183,10 @@ def test_bootstrap_requires_agent_token_and_returns_secrets_and_peers(hub):
     assert c.get("/cluster/bootstrap").status_code == 401
     assert c.get("/cluster/bootstrap?t=nope").status_code == 401
     b = c.get(f"/cluster/bootstrap?t={TOKENS['agent_token']}").json()
-    assert {b["ui_token"], b["agent_token"], b["cluster_token"]} == set(TOKENS.values())
+    # 2.3 S2/S3: the raw ui token is never handed out again; 2.3 S-R1: the agent token (readable by filtered jobs)
+    # no longer buys the cluster token either (an enrollment code does, see test_p3_security)
+    assert not {"ui_token", "ui_token_hash", "cluster_token", "signing_pubkey"} & set(b)
+    assert b["agent_token"] == TOKENS["agent_token"]
     assert [p["id"] for p in b["peers"]] == ["hub1"]
     assert b["bundle_version"] == "1.0.0" and len(b["bundle_sha256"]) == 64
 
@@ -207,8 +210,11 @@ def test_peer_patch_and_delete(hub):
     assert c.patch("/api/peers/box2", json={"priority": 0}, headers=UI).status_code == 422
     assert c.patch("/api/peers/ghost", json={"priority": 3}, headers=UI).status_code == 404
     assert c.patch("/api/peers/box2", json={"priority": 3}).status_code == 401
-    assert c.delete("/api/peers/hub1", headers=UI).status_code == 400
-    assert c.delete("/api/peers/box2", headers=UI).status_code == 200
+    assert c.delete("/api/peers/box2", headers=UI).json()["step_up"] == "setup"      # 2.3 S7: admin PIN first
+    c.put("/api/stepup/pin", json={"pin": "123456"}, headers=UI)
+    pin = UI | {"X-Admin-Pin": "123456"}
+    assert c.delete("/api/peers/hub1", headers=pin).status_code == 400
+    assert c.delete("/api/peers/box2", headers=pin).status_code == 200
     ids = [p["id"] for p in c.get("/api/state", headers=UI).json()["cluster"]["peers"]]
     assert ids == ["hub1"]
 

@@ -1,10 +1,11 @@
 {
-  "version": 1,
-  "note": "Single source of truth for system-lane maintenance actions. The hub validates jobs against it (hub/app.py) and the SYSTEM agent re-validates before running (agent/actions.ps1). Arg schema: type string|int, required, pattern (full match, case-sensitive), enum, min/max (int), max_len (string), default, not_in. Strings never contain control characters.",
+  "version": 2,
+  "note": "Single source of truth for allowlisted maintenance actions. The hub validates jobs against it (hub/app.py, hub/forge_upkeep.py) and the agent re-validates before running (agent/actions.ps1). lane: system (SYSTEM agent, default) | user (the node user's agent, filtered token; 2.3+). Arg schema: type string|int|bool, required, pattern (full match, case-sensitive), enum, min/max (int), max_len (string), default, not_in. Strings never contain control characters. Every action ends its output with one line '##RESULT <json>'.",
   "actions": [
     {
       "name": "winget_install",
       "description": "Install a package with winget (silent, agreements accepted).",
+      "lane": "system",
       "destructive": false,
       "args": {
         "id": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9.\\-_]*$", "max_len": 128, "label": "Package id (e.g. Git.Git)"},
@@ -14,6 +15,7 @@
     {
       "name": "winget_upgrade",
       "description": "Upgrade one winget package, or all packages when no id is given.",
+      "lane": "system",
       "destructive": false,
       "args": {
         "id": {"type": "string", "required": false, "pattern": "^[A-Za-z0-9][A-Za-z0-9.\\-_]*$", "max_len": 128, "label": "Package id (empty = all)"}
@@ -22,6 +24,7 @@
     {
       "name": "npm_global_install",
       "description": "npm install -g <package> (machine-wide when run as SYSTEM).",
+      "lane": "system",
       "destructive": false,
       "args": {
         "package": {"type": "string", "required": true, "pattern": "^(@[a-z0-9][a-z0-9\\-_.]*/)?[a-z0-9][a-z0-9\\-_.]*(@[A-Za-z0-9.\\-_]+)?$", "max_len": 214, "label": "Package (e.g. @anthropic-ai/claude-code@latest)"}
@@ -30,6 +33,7 @@
     {
       "name": "restart_task",
       "description": "Stop and start a scheduled task.",
+      "lane": "system",
       "destructive": false,
       "args": {
         "name": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9 _\\-]+$", "max_len": 128, "label": "Task name"}
@@ -38,6 +42,7 @@
     {
       "name": "restart_service",
       "description": "Restart a Windows service.",
+      "lane": "system",
       "destructive": false,
       "args": {
         "name": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9 _\\-]+$", "max_len": 128, "label": "Service name"}
@@ -46,6 +51,7 @@
     {
       "name": "reboot",
       "description": "Reboot the machine after a delay (shutdown /r).",
+      "lane": "system",
       "destructive": true,
       "args": {
         "delay_s": {"type": "int", "required": false, "min": 0, "max": 3600, "default": 60, "label": "Delay (seconds)"}
@@ -54,6 +60,7 @@
     {
       "name": "ensure_task",
       "description": "Register (or update) a scheduled task that starts at startup/logon, and start it. User tasks run as the node's configured user (S4U).",
+      "lane": "system",
       "destructive": true,
       "args": {
         "name": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9 _\\-]+$", "max_len": 128, "not_in": ["ForgeHub", "ForgeAgent", "ForgeWatchdog", "ForgeSystemAgent"], "label": "Task name"},
@@ -61,6 +68,77 @@
         "args": {"type": "string", "required": false, "max_len": 2000, "label": "Arguments"},
         "run_as": {"type": "string", "required": true, "enum": ["system", "user"], "label": "Run as"},
         "trigger": {"type": "string", "required": true, "enum": ["startup", "logon"], "label": "Trigger"}
+      }
+    },
+    {
+      "name": "update_claude",
+      "description": "Update Claude Code for the machine's user (claude update for the native install, else npm i -g @anthropic-ai/claude-code@latest).",
+      "lane": "user",
+      "destructive": false,
+      "args": {}
+    },
+    {
+      "name": "update_codex",
+      "description": "Update the Codex CLI for the machine's user (npm i -g @openai/codex@latest).",
+      "lane": "user",
+      "destructive": false,
+      "args": {}
+    },
+    {
+      "name": "update_t3",
+      "description": "Update T3 Code for the machine's user (t3 update).",
+      "lane": "user",
+      "destructive": false,
+      "args": {}
+    },
+    {
+      "name": "update_ollama",
+      "description": "Upgrade Ollama with winget (silent).",
+      "lane": "system",
+      "destructive": false,
+      "args": {}
+    },
+    {
+      "name": "git_sync",
+      "description": "git fetch --prune, then fast-forward only when the work tree is clean, the branch has an upstream and is not ahead. Never pushes.",
+      "lane": "user",
+      "destructive": false,
+      "args": {
+        "cwd": {"type": "string", "required": true, "pattern": "^[A-Za-z]:\\\\[^\"<>|?*]*$", "max_len": 260, "label": "Repository folder"}
+      }
+    },
+    {
+      "name": "ollama_pull",
+      "description": "Download an Ollama model (ollama pull).",
+      "lane": "user",
+      "destructive": false,
+      "args": {
+        "model": {"type": "string", "required": true, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/\\-]{0,99}$", "max_len": 100, "label": "Model (e.g. qwen2.5:14b)"}
+      }
+    },
+    {
+      "name": "windows_update",
+      "description": "Search, download and install Windows updates (Microsoft.Update.Session, as SYSTEM). Never reboots by itself; the hub queues a reboot when one is needed and safe.",
+      "lane": "system",
+      "destructive": false,
+      "args": {
+        "reboot": {"type": "string", "required": false, "enum": ["never"], "default": "never", "label": "Reboot"}
+      }
+    },
+    {
+      "name": "free_disk",
+      "description": "Delete temp items untouched for 7 days (Windows and every user's Temp), <work_root>\\scratch folders with no file changed in 14 days, and empty every user's recycle bin. Links (junctions, symlinks) are removed, never followed.",
+      "lane": "system",
+      "destructive": true,
+      "args": {}
+    },
+    {
+      "name": "forge_uninstall",
+      "description": "Remove Hivemind from this machine: stop and unregister the Forge tasks, remove the firewall rule, delete the Forge folder (keeps data\\ when keep_data).",
+      "lane": "system",
+      "destructive": true,
+      "args": {
+        "keep_data": {"type": "bool", "required": false, "default": false, "label": "Keep data folder"}
       }
     }
   ]

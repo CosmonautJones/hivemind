@@ -166,3 +166,18 @@ def test_project_summary_and_detail_fields(hub):
     s = next(x for x in d["sessions"] if x["session_id"] == "term")
     for k in ("tool", "session_id", "node_id", "state", "pid", "cwd", "last_activity"):
         assert k in s
+
+
+def test_p3_today_and_ask_fields_the_ui_reads(hub):
+    c, _, _ = hub
+    t = c.get("/api/today", headers=UI).json()
+    assert {"now", "status", "needs_you", "happening", "recent", "brief", "first_run"} <= set(t)
+    assert {"level", "sentence"} <= set(t["status"]) and {"items", "total"} <= set(t["needs_you"])
+    assert {"machines", "projects"} <= set(t["first_run"])
+    h = next(x for x in t["happening"] if x["kind"] == "session")
+    for k in ("kind", "id", "tool", "title", "node_id", "project_id", "since", "state"):
+        assert k in h
+    r = c.get("/api/ask?q=forge", headers=UI).json()["results"]
+    assert all({"type", "id", "title", "subtitle", "score", "target"} <= set(x) for x in r) and r[-1]["type"] == "run"
+    j = c.post("/api/jobs", headers=UI, json={"node_id": "auto", "engine": "any", "prompt": "p", "notify": True})
+    assert j.status_code == 200                                                # extra `notify` is accepted before N lands

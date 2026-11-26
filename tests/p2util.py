@@ -11,6 +11,16 @@ AGENT = {"X-Agent-Token": TOKENS["agent_token"]}
 CL = {"X-Cluster-Token": TOKENS["cluster_token"]}
 
 
+STEP_PIN = "123456"
+
+
+def admin(c):
+    """UI headers plus the per-request admin PIN (2.3 S7 step-up); sets the PIN on first use."""
+    if not c.get("/api/stepup", headers=UI).json().get("pin_set"):
+        assert c.put("/api/stepup/pin", json={"pin": STEP_PIN}, headers=UI).status_code == 200
+    return UI | {"X-Admin-Pin": STEP_PIN}
+
+
 def make_hub(tmp_path, cfg_extra=None):
     data = tmp_path / "data"
     data.mkdir()

@@ -32,6 +32,7 @@ STALE_CANCEL_TTL = 60.0                   # how long a node keeps being told to 
 ACTIVE = ("queued", "starting", "running")
 KINDS = ("code", "text")
 _HHMM = re.compile(r"^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$")
+USER_ACTION_AGENT = (2, 3, 0)          # 2.3 F2: user-lane `action` jobs need an agent >= 2.3.0
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\-]{0,99}$")
 BRIEF_NOISE = re.compile(r"^\s*(pulling |verifying |writing manifest|success\b|\[ollama\]|\[forge\])", re.I)
 
@@ -118,6 +119,7 @@ class Phase2:
         # place or hand out the same queued job, or relabel a job another node is already running.
         self.sched_lock = threading.RLock()
         self._stale: dict[str, dict[str, float]] = {}      # node -> {job id: expires}: jobs that node must kill
+        self.digest_extras: list = []      # N4: fn(now) -> str appended to the roll-up prompt (forge_alerts)
 
     # ================================================================ stale holders (fencing)
     def add_stale(self, node_id: Optional[str], jid: str, now: float) -> None:
@@ -135,7 +137,9 @@ class Phase2:
     # ================================================================ nodes / scheduler
     def nodes(self, now: float) -> dict[str, dict]:
         out = {}
-        for r in self.store.q("SELECT id,info,metrics,capacity,last_seen FROM nodes"):
+        drained = {r["node_id"] for r in self.store.q("SELECT node_id FROM settings WHERE drain=1")}
+        # 2.3 R4: nodes_live = replicated nodes row + local presence (fresh metrics / last_seen / capacity)
+        for r in self.store.q("SELECT id,info,metrics,capacity,last_seen FROM nodes_live"):
             info, m = jloads(r["info"], {}), jloads(r["metrics"], {})
             gpus = [g for g in (m.get("gpu") or []) if isinstance(g, dict)]
             caps = info.get("capabilities")
@@ -145,7 +149,8 @@ class Phase2:
                 "gpu": bool(gpus), "gpu_mem": max((g.get("mem_total_mb") or 0) for g in gpus) if gpus else 0,
                 "gpu_util": max((_num(g.get("util")) or 0) for g in gpus) if gpus else None,
                 "free_gb": m.get("work_root_free_gb"), "capacity": r["capacity"] or 0,
-                "caps": set(caps.keys() if isinstance(caps, dict) else caps) if isinstance(caps, (list, dict)) else None}
+                "caps": set(caps.keys() if isinstance(caps, dict) else caps) if isinstance(caps, (list, dict)) else None,
+                "drain": r["id"] in drained}
         return out
 
     def cooldowns(self, now: float) -> dict[str, float]:
@@ -159,6 +164,8 @@ class Phase2:
     def has_engine(n: dict, engine: str) -> bool:
         if engine == "shell":
             return True
+        if engine == "action":                  # 2.3 F2: user-lane actions need a 2.3 agent
+            return fs.parse_version(n["agent_version"]) >= USER_ACTION_AGENT
         if engine == "ollama":
             return "ollama" in n["tools"] and fs.agent_is_new(n["agent_version"])
         return engine in n["tools"]
@@ -173,6 +180,8 @@ class Phase2:
             return False
         if self.needs_new_agent(job["engine"], job["resume"]) and not fs.agent_is_new(agent_version):
             return False
+        if job["engine"] == "action" and fs.parse_version(agent_version) < USER_ACTION_AGENT:
+            return False                         # 2.3 F2 (CONTRACT-phase3.md 7.5): "needs agent 2.3"
         return True
 
     def place_jobs(self, now: float) -> None:
@@ -189,7 +198,7 @@ class Phase2:
         rows = self.store.q(
             "SELECT id,node_id,engine,req_engine,requested,kind,resume,wait_reason FROM jobs WHERE status='queued' "
             "AND COALESCE(run_as,'user')='user' AND (node_id='auto' OR engine='any' OR wait_reason IS NOT NULL "
-            f"OR resume IS NOT NULL OR engine='ollama' OR engine IN ({marks})) ORDER BY id", tuple(cds))
+            f"OR resume IS NOT NULL OR engine='ollama' OR engine='action' OR engine IN ({marks})) ORDER BY id", tuple(cds))
         if not rows:
             return
         nodes, pref = self.nodes(now), self.preference()
@@ -209,7 +218,8 @@ class Phase2:
                 queued[job["node_id"]] = queued.get(job["node_id"], 1) - 1
                 active[job["node_id"]] = active.get(job["node_id"], 1) - 1
             if auto:
-                cand = [n for n in nodes.values() if n["online"] and n["capacity"] - queued.get(n["id"], 0) > 0]
+                cand = [n for n in nodes.values() if n["online"] and not n["drain"]
+                        and n["capacity"] - queued.get(n["id"], 0) > 0]
             else:
                 cand = [nodes[job["node_id"]]] if job["node_id"] in nodes else []
             avail, best = {}, {}
@@ -249,6 +259,8 @@ class Phase2:
                     sets.append("req_engine=?"); args.append("any")
                 if self.needs_new_agent(chosen, job["resume"]) and not fs.agent_is_new(node["agent_version"]):
                     reason = "node agent is older than 2.2.0 (needed for ollama/resume jobs)"
+                if chosen == "action" and fs.parse_version(node["agent_version"]) < USER_ACTION_AGENT:
+                    reason = "needs agent 2.3"
                 if reason != job["wait_reason"]:
                     sets.append("wait_reason=?"); args.append(reason)
                 if sets:     # conditional: only a job that is still queued where we saw it
@@ -318,16 +330,17 @@ class Phase2:
                    source: str = "ui", requested: Optional[str] = None, run_as: str = "user", action: Optional[str] = None,
                    args: Optional[dict] = None, status: str = "queued", output: str = "", finished: Optional[float] = None,
                    resume: Optional[dict] = None, project_id: Optional[str] = None, model: Optional[str] = None,
-                   req_engine: Optional[str] = None, kind: Optional[str] = None) -> str:
+                   req_engine: Optional[str] = None, kind: Optional[str] = None, notify: bool = False,
+                   run_id: Optional[str] = None) -> str:
         jid, now = new_id(self.clock), self.clock()
         kind = kind if kind in KINDS else ("text" if source == "brief" else "code")
         self.store.x(
             "INSERT INTO jobs(id,node_id,engine,prompt,cwd,full_access,status,created,finished,output,source,requested,"
-            "run_as,action,args,resume,project_id,model,req_engine,kind,attempts,updated) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
+            "run_as,action,args,resume,project_id,model,req_engine,kind,attempts,notify,run_id,updated) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
             (jid, node_id, engine, prompt, cwd, int(full_access), status, now, finished, output, source, requested,
              run_as, action, json.dumps(args) if args is not None else None, json.dumps(resume) if resume else None,
-             project_id, model, req_engine, kind, now))
+             project_id, model, req_engine, kind, int(bool(notify)), run_id, now))
         return jid
 
     def resolve_resume(self, resume: dict, node_id: str, force: bool, now: float) -> tuple[str, str, Optional[str]]:
@@ -541,7 +554,8 @@ class Phase2:
                "dirty_any": any(r["dirty"] for r in repos),
                "ahead": max((r["ahead"] or 0) for r in repos) if repos else 0,
                "behind": max((r["behind"] or 0) for r in repos) if repos else 0,
-               "branches": sorted({r["branch"] for r in repos if r["branch"]} | {s["git_branch"] for s in ix["sessions"][pid] if s.get("git_branch")})}
+               "branches": sorted({r["branch"] for r in repos if r["branch"]} | {s["git_branch"] for s in ix["sessions"][pid] if s.get("git_branch")}),
+               "sync_nodes": [n for n in jloads(p.get("sync_nodes"), []) if isinstance(n, str)]}   # 2.3 F3
         if detail:
             seen, commits = set(), []
             for c in sorted((c for r in repos for c in r["commits"]), key=lambda c: c.get("ts") or 0, reverse=True):
@@ -743,6 +757,13 @@ class Phase2:
         prompt = fp.build_rollup_prompt([{"name": s["name"], "last_activity": s["last_activity"], "live": s["live_sessions"],
                                           "sessions_24h": s["sessions_24h"], "brief": (s["brief"] or {}).get("text")}
                                          for s in act], now)
+        for fn in list(self.digest_extras):            # N4: overnight alerts / finished tasks
+            try:
+                extra = fn(now)
+            except Exception:                          # a plug-in must never break the brief
+                extra = None
+            if extra:
+                prompt += "\n\n" + str(extra)
         return prompt, len(act)
 
     def brief_all(self, now: float) -> dict:
@@ -805,13 +826,13 @@ class Phase2:
 
     def transcript(self, tool: str, sid: str, since: int, now: float) -> dict:
         if tool == "forge":
-            r = self.store.q("SELECT prompt,output,status,created,finished FROM jobs WHERE id=?", (sid,))
+            r = self.store.q("SELECT id,prompt,output,status,created,finished FROM jobs WHERE id=?", (sid,))
             if not r:
                 raise HTTPException(404, "no such session")
             j = r[0]
             evs = [{"seq": 1, "ts": j["created"], "role": "user", "kind": "text", "text": fp.redact(j["prompt"], fp.EVENT_TEXT_MAX),
                     "collapsed": False}]
-            out = fp.redact(j["output"] or "")      # redact BEFORE chunking: a token across a chunk edge must not escape
+            out = fp.redact(self.store.job_output_text(sid, j["output"] or ""))   # redact BEFORE chunking (token across an edge)
             for i in range(0, len(out), fp.EVENT_TEXT_MAX):
                 evs.append({"seq": len(evs) + 1, "ts": j["finished"] or j["created"], "role": "assistant", "kind": "text",
                             "text": out[i:i + fp.EVENT_TEXT_MAX], "collapsed": False})
@@ -841,6 +862,6 @@ class Phase2:
             "AND id NOT IN (SELECT id FROM jobs ORDER BY id DESC LIMIT ?)", (now - JOB_KEEP_DAYS * 86400, JOB_KEEP_MIN))
         with self.store.tx():
             for r in old:
-                self.store.delete_row("jobs", r["id"])
+                self.store.delete_job_cascade(r["id"])       # 2.3 R4: the job's output chunks go with it
             briefs = self.prune_briefs()
         return {"jobs": len(old), "briefs": briefs}

@@ -17,7 +17,7 @@
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\agent-smoke.ps1 [-Scratch <dir>] [-AgentPort 19050]
 param([string]$Scratch = (Join-Path ([IO.Path]::GetTempPath()) "forge-agent-smoke-$([guid]::NewGuid().ToString('n').Substring(0,8))"), [int]$AgentPort = 19050)
 $ErrorActionPreference = 'Stop'
-if ($AgentPort -lt 19000 -or $AgentPort -gt 19098) { throw 'smoke test servers use ports 19000-19099 only' }
+if ($AgentPort -lt 19000 -or $AgentPort -gt 19298) { throw 'smoke test servers use ports 19000-19299 only (Phase 3 team ranges: CONTRACT-phase3 9)' }
 $OllamaPort = $AgentPort + 1
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $data = Join-Path $Scratch 'data'; $wr = Join-Path $Scratch 'work'; $log = Join-Path $Scratch 'posts.jsonl'; $olog = Join-Path $Scratch 'ollama.jsonl'
@@ -140,7 +140,7 @@ try {
         'ollama: pulled once with progress'       = (@($ologs | Where-Object { $_.path -eq '/api/pull' }).Count -eq 1 -and $ollText -match 'pulling 0123abcd 100%' -and $ollText -match 'not present; pulling')
         'ollama: generated (utf-8), done exit 0'  = ($oll -and $oll.body.status -eq 'done' -and $oll.body.exit_code -eq 0 -and $ollText -match "Brief: all good $([char]0x2713)")
         'services: metrics ok/not ok + restart'   = (@($svc | Where-Object { $_.name -eq 'fakesvc' -and $_.ok -eq $true }).Count -eq 1 -and @($svc | Where-Object { $_.name -eq 'deadsvc' -and $_.ok -eq $false }).Count -eq 1 -and $agentLog -match 'service deadsvc: unhealthy, started cmd\.exe')
-        'agent_version 2.2.0 reported'            = ($reports[0].body.agent_version -eq '2.2.0')
+        'agent_version 2.4.0 reported'            = ($reports[0].body.agent_version -eq '2.4.0')
         'reports carry agent_time + running ids'  = (@($reports | Where-Object { [double]$_.body.agent_time -lt 1e9 -or $null -eq $_.body.running }).Count -eq 0 -and @($reports | Where-Object { @($_.body.running) -contains 'job-0004' }).Count -ge 1)
         'brief: output minus hub noise = model text' = ((@($ollText -split "`r?`n" | Where-Object { $_.Trim() -and $_ -notmatch '^\s*(pulling |verifying |writing manifest|success\b|\[ollama\]|\[forge\])' }) -join '|') -eq "Brief: all good $([char]0x2713)")
         'timeout: job killed after timeout_s, failed + note' = ($to -and $to.body.status -eq 'failed' -and $toText -match 'timed out after 3 s' -and $toText -notmatch 'never')

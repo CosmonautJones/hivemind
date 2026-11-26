@@ -6,7 +6,7 @@
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tests\ps\agent-system-smoke.ps1 [-Port 19053]
 param([string]$Scratch = (Join-Path ([IO.Path]::GetTempPath()) "forge-sys-smoke-$([guid]::NewGuid().ToString('n').Substring(0,8))"), [int]$Port = 19053)
 $ErrorActionPreference = 'Stop'
-if ($Port -lt 19000 -or $Port -gt 19099) { throw 'test servers use ports 19000-19099 only' }
+if ($Port -lt 19000 -or $Port -gt 19299) { throw 'test servers use ports 19000-19299 only (Phase 3 team ranges: CONTRACT-phase3 9)' }
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $data = Join-Path $Scratch 'data'; $wr = Join-Path $Scratch 'work'; $log = Join-Path $Scratch 'posts.jsonl'
 New-Item -ItemType Directory -Force $data, $wr | Out-Null

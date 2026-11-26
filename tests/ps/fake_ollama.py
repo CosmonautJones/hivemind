@@ -1,4 +1,4 @@
-"""Fake ollama REST server for the agent smoke test. Ports 19000-19099 only.
+"""Fake ollama REST server for the agent smoke test. Ports 19000-19299 only.
 usage: python -I fake_ollama.py <port> <log_jsonl>
   GET  /api/version   {"version": "0.0.0-fake"}            (keep-alive service health)
   GET  /api/tags      no models until a pull happened, then [{name: <pulled>}]
@@ -10,7 +10,7 @@ import json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port, log = int(sys.argv[1]), sys.argv[2]
-assert 19000 <= port <= 19099
+assert 19000 <= port <= 19299 and port != 8787
 models = []
 
 

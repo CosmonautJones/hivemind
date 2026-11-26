@@ -8,9 +8,10 @@ import shutil
 import threading
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 BUNDLE_ITEMS = ("hub", "agent", "watchdog", "requirements.txt", "VERSION")
+SIG_FILE = "bundle.sig"            # S6: signature over the file manifest (forge_security.bundle_manifest), zip root
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 MAX_BUNDLE_BYTES = 200 * 1024 * 1024
 MAX_UNPACKED_BYTES = 600 * 1024 * 1024
@@ -46,7 +47,7 @@ def _skip(p: Path) -> bool:
 def build_zip(root: Path) -> bytes:
     """Deterministic zip (sorted, fixed timestamps) so every node computes the same sha256."""
     files: list[Path] = []
-    for item in BUNDLE_ITEMS:
+    for item in BUNDLE_ITEMS + (SIG_FILE,):      # bundle.sig travels with the re-zip so it still verifies
         p = root / item
         if p.is_file():
             files.append(p)
@@ -107,6 +108,8 @@ class Releases:
         self.running_version = read_version(self.release_dir)
         self._lock = threading.Lock()
         self._running_zip: Optional[tuple[bytes, str]] = None
+        # S6: verify(extracted_dir) raises BundleError for a missing/bad signature (set by forge_security.register)
+        self.verify: Optional[Callable[[Path], None]] = None
 
     def running_bundle(self) -> tuple[bytes, str]:
         with self._lock:
@@ -158,6 +161,8 @@ class Releases:
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 z.extractall(tmp)
+            if self.verify is not None:
+                self.verify(tmp)                     # pinned signing key: refuse unsigned / badly signed bundles
             digest = sha256(data)
             (tmp / "bundle.zip").write_bytes(data)
             (tmp / "bundle.sha256").write_text(digest, encoding="ascii")

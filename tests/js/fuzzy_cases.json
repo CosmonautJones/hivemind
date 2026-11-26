@@ -1,0 +1,90 @@
+{
+ "note": "shared by tests/js and tests/test_p3_ux.py: hub/forge_ui.fuzzy_score and UI.fuzzyScore must agree",
+ "cases": [
+  [
+   "forge",
+   "forge",
+   1.0
+  ],
+  [
+   "forge",
+   "Forge_Control",
+   0.95
+  ],
+  [
+   "control",
+   "forge_control",
+   0.9
+  ],
+  [
+   "ntrol",
+   "forge_control",
+   0.8
+  ],
+  [
+   "fc",
+   "forge_control",
+   0.3857
+  ],
+  [
+   "frgctl",
+   "forge_control",
+   0.4385
+  ],
+  [
+   "update claude",
+   "Update Claude Code & Codex",
+   0.95
+  ],
+  [
+   "claude update",
+   "Update Claude Code & Codex",
+   0.7
+  ],
+  [
+   "xyz",
+   "forge_control",
+   0.0
+  ],
+  [
+   "",
+   "",
+   0.0
+  ],
+  [
+   "a",
+   "banana",
+   0.8
+  ],
+  [
+   "  Restart   ",
+   "Restart machine",
+   0.95
+  ],
+  [
+   "disk",
+   "Free disk space",
+   0.9
+  ],
+  [
+   "b-cache",
+   "B-Cache",
+   1.0
+  ],
+  [
+   "cache",
+   "B-Cache",
+   0.9
+  ],
+  [
+   "zz",
+   "pizza",
+   0.8
+  ],
+  [
+   "rm",
+   "restart machine",
+   0.3667
+  ]
+ ]
+}

@@ -1,4 +1,4 @@
-"""Fake hub for the SYSTEM-lane smoke test (tests/ps/agent-system-smoke.ps1). Ports 19000-19099 only.
+"""Fake hub for the SYSTEM-lane smoke test (tests/ps/agent-system-smoke.ps1). Ports 19000-19299 only.
 usage: python -I fake_system_hub.py <port> <work_root> <log_jsonl>
 Hands the system-lane agent one job per report (while it has capacity):
   sys-act   engine action winget_install {id: Git.Git}         -> agent dry-run prints the argv, exit 0
@@ -12,7 +12,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port, work_root, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-assert 19000 <= port <= 19099
+assert 19000 <= port <= 19299 and port != 8787
 QUEUE = [
     {"id": "sys-act", "engine": "action", "run_as": "system", "action": "winget_install", "args": {"id": "Git.Git"},
      "prompt": "winget_install", "cwd": None, "full_access": False},

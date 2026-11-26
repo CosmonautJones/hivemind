@@ -1,4 +1,4 @@
-"""Tiny fake hub for the watchdog dry run (tests/ps/dry-run.ps1). Ports 19000-19099 only (never 8787).
+"""Tiny fake hub for the watchdog dry run (tests/ps/dry-run.ps1). Ports 19000-19299 only (never 8787).
 usage: python -I fake_hub.py <port> <local_version> <peer_version> <peer_sha256>
   /healthz, /cluster/status, /cluster/bootstrap  -> the "local" hub (running local_version; a pre-2.2 hub:
                                                     no /cluster/update-lease -> 404)
@@ -13,7 +13,7 @@ import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port, local_ver, peer_ver, peer_sha = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-assert 19000 <= port <= 19099
+assert 19000 <= port <= 19299 and port != 8787
 
 
 class H(BaseHTTPRequestHandler):

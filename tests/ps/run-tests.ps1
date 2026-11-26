@@ -498,6 +498,24 @@ New-Item -ItemType Directory -Force $Scratch | Out-Null
         Assert-True (-not (Get-Cmd @{ engine = 'ollama'; kind = 'text' } $o).error); Assert-True (-not (Get-Cmd @{ engine = 'ollama' } $o).error)
         Assert-Equal "engine 'ollama' runs text jobs only (job kind 'code')" (Get-Cmd @{ engine = 'ollama'; kind = 'code' } $o).error
     }
+    Test-Case 'job cmd (2.4 chat): claude --session-id for new chats, --resume wins; photos -> --add-dir / codex --image' {
+        $sid = '11111111-2222-4333-8444-555555555555'
+        Assert-Equal "$clr`"C:\t\claude.exe`" -p --session-id $sid --permission-mode acceptEdits --output-format text < `"$pf`"" (Get-Cmd @{ engine = 'claude'; session_id = $sid.ToUpper() }).inner
+        $c = Get-Cmd @{ engine = 'claude'; session_id = '99999999-2222-4333-8444-555555555555'; resume = @{ tool = 'claude'; session_id = $sid } }
+        Assert-True ($c.inner -like "* -p --resume $sid --permission-mode *") $c.inner
+        Assert-Equal 'bad session id' (Get-Cmd @{ engine = 'claude'; session_id = 'x" & calc' }).error
+        $img = @('C:\w\jobs\j1\attachments\a.png', 'C:\w\jobs\j1\attachments\b.jpg')
+        $c = Get-JobCommand -Job ([pscustomobject]@{ engine = 'claude'; session_id = $sid }) -Tools $tools -Config ([pscustomobject]@{}) -PromptFile $pf -JobDir 'C:\w\jobs\j1' -AgentDir 'C:\F\agent' -OutFile 'C:\w\jobs\j1\out.log' -Images $img
+        Assert-True ($c.inner -like "* -p --session-id $sid --add-dir `"C:\w\jobs\j1\attachments`" --permission-mode acceptEdits *") $c.inner
+        $c = Get-JobCommand -Job ([pscustomobject]@{ engine = 'codex' }) -Tools $tools -Config ([pscustomobject]@{}) -PromptFile $pf -JobDir 'C:\w\jobs\j1' -AgentDir 'C:\F\agent' -OutFile 'C:\w\jobs\j1\out.log' -Images $img
+        Assert-Equal "`"C:\t\codex.cmd`" exec --image=`"$($img[0])`" --image=`"$($img[1])`" --skip-git-repo-check --sandbox workspace-write - < `"$pf`"" $c.inner
+    }
+    Test-Case 'chat (2.4): attachment preamble + safe upload names' {
+        Assert-Equal '' (Get-AttachmentPreamble @())
+        $p = Get-AttachmentPreamble @('C:\a\x.png'); Assert-True ($p -like 'The user attached 1 image(s)*- C:\a\x.png*') $p
+        Assert-True (Test-SafeUploadName 'shot.png'); Assert-True (Test-SafeUploadName 'my-photo_1.jpg')
+        Assert-True (-not (Test-SafeUploadName '..\x.png')); Assert-True (-not (Test-SafeUploadName 'x.exe')); Assert-True (-not (Test-SafeUploadName '.png'))
+    }
     Test-Case 'safe ids: session ids / model names' {
         Assert-True (Test-SafeSessionId '0aaa1111-2222-7333-8444-555555555555'); Assert-True (-not (Test-SafeSessionId '-rf')); Assert-True (-not (Test-SafeSessionId 'a b c d e f'))
         Assert-True (Test-SafeModelName 'qwen2.5:14b'); Assert-True (Test-SafeModelName 'library/llama3.2:1b-q4'); Assert-True (-not (Test-SafeModelName 'x;y')); Assert-True (-not (Test-SafeModelName '-x'))
@@ -627,7 +645,10 @@ Write-Host 'actions'
     Test-Case 'every catalog action has a builder' {
         foreach ($a in @($cat.actions)) {
             $sample = @{ winget_install = @{ id = 'A' }; winget_upgrade = @{}; npm_global_install = @{ package = 'a' }; restart_task = @{ name = 'a' }
-                         restart_service = @{ name = 'a' }; reboot = @{}; ensure_task = @{ name = 'a'; command = 'a.exe'; run_as = 'system'; trigger = 'startup' } }[[string]$a.name]
+                         restart_service = @{ name = 'a' }; reboot = @{}; ensure_task = @{ name = 'a'; command = 'a.exe'; run_as = 'system'; trigger = 'startup' }
+                         # 2.3 workstream F
+                         update_claude = @{}; update_codex = @{}; update_t3 = @{}; update_ollama = @{}; git_sync = @{ cwd = 'C:\r' }
+                         ollama_pull = @{ model = 'm' }; windows_update = @{}; free_disk = @{}; forge_uninstall = @{ keep_data = $true } }[[string]$a.name]
             Assert-True ($null -ne $sample) "no sample for $($a.name)"
             Assert-True ((Get-Steps $a.name $sample).Count -ge 1) "no steps for $($a.name)"
         }

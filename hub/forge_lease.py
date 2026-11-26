@@ -132,7 +132,7 @@ class UpdateLease:
 
     def agent_version(self, nid: str, now: float) -> Optional[str]:
         """bundle_version reported by that machine's (user-lane) agent, None if it is not reporting."""
-        r = self.store.q("SELECT last_seen,metrics,info FROM nodes WHERE id=?", (nid,))
+        r = self.store.q("SELECT last_seen,metrics,info FROM nodes_live WHERE id=?", (nid,))     # 2.3 R4 presence
         if not r or now - (r[0]["last_seen"] or 0) >= AGENT_ONLINE_S:
             return None
         try:

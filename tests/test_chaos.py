@@ -354,3 +354,39 @@ def test_contested_leader_hands_out_and_fences_nothing_but_honours_boot(tmp_path
     status = f.client("c").get("/cluster/status", headers=Fleet.cluster).json()
     assert status["stepdown_seq"] >= 1
     assert f.client("a").get("/cluster/status", headers=Fleet.cluster).json()["merged"].get("c", 0) >= status["stepdown_seq"]
+
+
+# ---------------------------------------------------------------- 2.3 R4: job output chunks under failover / partition
+def _outputs(fleet, hub):
+    st = fleet.hubs[hub].state.store
+    return {r["id"]: st.job_output_text(r["id"]) for r in st.q("SELECT id FROM jobs")}
+
+
+def test_job_output_chunks_survive_failover_and_partition_heal(tmp_path, request):
+    """Output appended through the old leader, then through the new one while the old one is cut off, then both sides
+    after the heal: every hub ends with the same concatenated output and no chunk is lost or duplicated."""
+    f = Fleet(tmp_path, names=("a", "b", "c"), fast=True)
+    request.addfinalizer(f.close)
+    f.converge(6)
+    beat = {"node_id": "w", "capacity": 2, "metrics": {}}
+    f.client("a").post("/api/agent/report", headers=AGENT, json=beat)
+    jid = f.client("a").post("/api/jobs", json={"node_id": "w", "engine": "shell", "prompt": "p"}, headers=UI).json()["id"]
+    f.client("a").post("/api/agent/report", headers=AGENT, json=beat)
+    f.client("a").post(f"/api/agent/jobs/{jid}/update", headers=AGENT, json={"status": "running", "append": "one "})
+    f.converge(2)
+    f.kill("a")                                                       # leader dies: b takes over
+    f.converge(4)
+    assert f.leaders() == ["b"]
+    f.client("b").post("/api/agent/report", headers=AGENT, json=beat)
+    f.client("b").post(f"/api/agent/jobs/{jid}/update", headers=AGENT, json={"append": "two "})
+    f.converge(2)
+    f.net.down.discard("a")                                           # a comes back (same database) and leads again
+    f.converge(15)
+    assert f.leaders() == ["a"]
+    f.client("a").post(f"/api/agent/jobs/{jid}/update", headers=AGENT, json={"status": "done", "exit_code": 0, "append": "three"})
+    f.converge(4)
+    outs = [_outputs(f, n)[jid] for n in "abc"]
+    assert outs == ["one two three"] * 3, outs
+    seqs = {n: [r["seq"] for r in f.hubs[n].state.store.q("SELECT seq FROM job_output WHERE job_id=? ORDER BY seq", (jid,))]
+            for n in "abc"}
+    assert seqs["a"] == seqs["b"] == seqs["c"] == [1, 2, 3]
